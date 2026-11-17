@@ -16,8 +16,8 @@
 //! Register offsets and bit positions are from `ATSAME70Q21.svd`, which
 //! describes TC_CMR only in its capture-mode layout. The waveform-mode
 //! bits (WAVSEL, CPCSTOP, CPCDIS), the five clock choices, the 16-bit
-//! counter width and the counting behaviour are from the SAME70
-//! datasheet as remembered, not from a document in the repo.
+//! counter width and the counting behaviour are from chapter 50 of the
+//! SAM E70 datasheet in `reference/same70/`.
 
 use crate::peripheral::Peripheral;
 

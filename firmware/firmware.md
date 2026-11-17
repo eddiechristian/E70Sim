@@ -383,10 +383,14 @@ Building this firmware also needed several dozen ordinary integer instructions t
 
 ## To verify
 
-These are from memory, not from a document in the repo:
+Checked against the SAM E70 datasheet in `reference/same70/`:
 
-- UART0 on PA9 / PA10, peripheral function A (SAME70 datasheet, pin multiplexing table)
-- 12 MHz internal oscillator as the clock at reset (SAME70 datasheet, PMC chapter)
+- UART0 is on PA9 (URXD0) and PA10 (UTXD0), peripheral function A (pin tables in chapter 6).
+- The clock at reset is the internal RC oscillator at 12 MHz (features list, and the clock generator chapter).
+- The FPU has single and double precision (features list). The SVD's reset value for `MVFR0` (`0x10110021`) describes single precision only and is not what the emulator reports (`0x10110221`).
+
+Still from memory, not from a document in the repo:
+
 - The order in which `cortex-m-rt` prepares `.bss` and `.data` (check the version actually used)
-- That the SAME70's FPU has double precision. The emulator reports and implements it (`MVFR0` = `0x10110221`), but the SVD's reset value for `MVFR0` (`0x10110021`) describes a single-precision FPU (SAME70 datasheet, processor features)
-- The cycle costs of FPU instructions (Cortex-M7 documentation)
+- The cycle costs of instructions, including FPU instructions (Cortex-M7 documentation)
+- That writing RXEN and RXDIS to `UART_CR` together leaves the receiver disabled
