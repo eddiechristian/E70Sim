@@ -1,0 +1,5 @@
+[build]
+target = "thumbv7em-none-eabi" # Cortex-M7, soft-float (no "hf")
+
+[target.thumbv7em-none-eabi]
+rustflags = ["-C", "link-arg=-Tlink.x"] # link.x comes from cortex-m-rt

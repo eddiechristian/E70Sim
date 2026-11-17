@@ -91,8 +91,8 @@ All offsets and bit names in this table are verified against the SVD.
 
 ## Phase 3 — Compiled firmware, instruction set on demand
 
-- [ ] Write bare-metal firmware that inits UART and prints: C (`arm-none-eabi-gcc` + minimal startup) or Rust (`cortex-m-rt`, target `thumbv7em-none-eabi`)
-- [ ] Build **soft-float** (no `hf`) so the FPU is not needed yet
+- [x] Write bare-metal firmware that inits UART and prints: Rust (`cortex-m-rt`, target `thumbv7em-none-eabi`) in `firmware/hello-rs/`, described in `firmware/firmware.md`
+- [x] Build **soft-float** (no `hf`) so the FPU is not needed yet
 - [ ] Loop: run → hit unimplemented instruction → implement → repeat. Expected set (~60–80 instructions):
   - Stack/moves: `PUSH/POP`, `MOV`, `MOVW/MOVT`, `ADD/SUB` (incl. SP-relative)
   - Logic/shifts: `AND/ORR/EOR/BIC/MVN`, `LSL/LSR/ASR/ROR`

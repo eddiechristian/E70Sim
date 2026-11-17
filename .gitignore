@@ -3,3 +3,6 @@
 # Firmware build intermediates (firmware.bin is kept: the emulator loads it)
 /firmware/*.o
 /firmware/*.elf
+
+# Rust firmware build output (hello-rs.bin is kept: the emulator loads it)
+/firmware/hello-rs/target
