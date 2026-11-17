@@ -1,0 +1,5 @@
+### PMC — Power Management Controller
+*   **Base Address:** `0x400E_0600`
+*   **Why It's There:** Manages the system distribution grids, clock prescalers, and phase-locked loop (PLL) multipliers across the chip core.
+*   **The Problem:** At startup, the microchip operates on an extremely slow internal oscillator. The firmware shifts configurations to route execution through a fast external crystal oscillator. Real crystal tanks take milliseconds to safely settle and lock phase. The incoming firmware loops continuously over the Status Register (`PMC_SR`, offset `+0x68`) waiting for stabilizing bits to flip high. If they remain zero, execution freezes instantly.
+*   **Stub Logic:** Intercept reads directed at `PMC_SR` (`+0x68`) and hardcode returning these key status bits as high: `MOSCXTS` (Main Oscillator Stabilization), `LOCKA` (PLL A Lock), `MCKRDY` (Master Clock Ready), and `MOSCSELS` (Main Clock Source Selection). For configuration registers, implement basic write-storage and readback so the firmware can verify its modifications were successfully written to memory.

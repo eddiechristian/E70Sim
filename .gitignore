@@ -1,0 +1,5 @@
+/target
+
+# Firmware build intermediates (firmware.bin is kept: the emulator loads it)
+/firmware/*.o
+/firmware/*.elf
