@@ -18,6 +18,8 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "firmware/hello-rs.bin".to_string());
     bus.load_firmware_from_bin(firmware);
+    // What is typed on stdin arrives at UART0's receiver.
+    bus.set_uart0_input(peripheral::uart::stdin_bytes());
     let mut cpu = Cpu::new();
     cpu.trace = args.iter().any(|arg| arg == "--trace");
     cpu.reset(&mut bus);

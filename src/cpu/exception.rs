@@ -16,7 +16,7 @@
 //! the value of the stack that is not in use. CONTROL bit 1 (SPSEL) says
 //! which is which, and `select_stack` swaps them.
 
-use super::{CYCLES_EXCEPTION_RETURN, CYCLES_REFILL, Cpu, LR, PC, SP};
+use super::{CYCLES_EXCEPTION_RETURN, CYCLES_REFILL, Cpu, LR, PC, SP, XPSR_IT};
 use crate::bus::Bus;
 
 /// Vector Table Offset Register, in the SCB.
@@ -115,7 +115,9 @@ impl Cpu {
         // 3. Handlers always run on the main stack, in Handler mode, with
         //    the exception number in IPSR.
         self.select_stack(false);
-        self.xpsr = (self.xpsr & !XPSR_IPSR) | (number & XPSR_IPSR);
+        // The handler does not start inside the interrupted code's IT
+        // block; the saved xPSR keeps that for the return.
+        self.xpsr = (self.xpsr & !(XPSR_IPSR | XPSR_IT)) | (number & XPSR_IPSR);
 
         // 4. Load the PC from the vector table.
         let table = bus.read32(VTOR);
@@ -665,5 +667,154 @@ mod tests {
         // Exception 14 has no vector in this image: the table entry is 0.
         let (mut cpu, mut bus) = cpu_with_handler(&[], &[], &[SYSTICK]);
         cpu.exception_entry(14, &mut bus);
+    }
+
+    const UART0: u32 = 0x400E_0800;
+    const UART_CR: u32 = UART0;
+    const UART_IER: u32 = UART0 + 0x08;
+    const NVIC_ISER0: u32 = 0xE000_E100;
+    const NVIC_ISPR0: u32 = 0xE000_E200;
+    const UART0_IRQ: u32 = 7;
+    const UART0_EXCEPTION: u32 = 16 + UART0_IRQ;
+
+    /// `main_code` with a UART0 handler that reads the received byte into
+    /// R4: `ldr r0, =UART0 ; ldr r4, [r0, #0x18] ; bx lr`. The UART's
+    /// receiver is on and fed from the returned channel, but no interrupt
+    /// is enabled yet.
+    fn cpu_receiving_on_uart0(main_code: &[u16]) -> (Cpu, Bus, std::sync::mpsc::Sender<u8>) {
+        let handler = [0x4801, 0x6984, 0x4770, 0x0000, 0x0800, 0x400E];
+        let (cpu, mut bus) = cpu_with_handler(main_code, &handler, &[UART0_EXCEPTION]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        bus.set_uart0_input(receiver);
+        bus.write32(UART_CR, 1 << 4); // RXEN
+        (cpu, bus, sender)
+    }
+
+    #[test]
+    fn byte_received_on_uart0_runs_its_handler() {
+        // Main: b .
+        let (mut cpu, mut bus, sender) = cpu_receiving_on_uart0(&[0xE7FE]);
+        bus.write32(UART_IER, 1 << 0); // RXRDY
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+
+        // Nothing received: the main loop just spins.
+        for _ in 0..10 {
+            cpu.step(&mut bus);
+        }
+        assert!(!cpu.in_handler_mode());
+
+        sender.send(b'a').unwrap();
+        cpu.step(&mut bus); // the byte arrives as this instruction ends
+        assert!(!cpu.in_handler_mode());
+        cpu.step(&mut bus); // exception entry and `ldr r0, =UART0`
+        assert!(cpu.in_handler_mode());
+        assert_eq!(cpu.xpsr & 0x1FF, UART0_EXCEPTION);
+        cpu.step(&mut bus); // ldr r4, [r0, #0x18]: reads UART_RHR
+        assert_eq!(cpu.regs[4], b'a' as u32);
+        cpu.step(&mut bus); // bx lr
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[PC], MAIN);
+
+        // The byte was read, so the handler does not run again.
+        for _ in 0..10 {
+            cpu.step(&mut bus);
+            assert!(!cpu.in_handler_mode());
+        }
+    }
+
+    #[test]
+    fn bytes_received_together_each_get_their_own_handler_run() {
+        let (mut cpu, mut bus, sender) = cpu_receiving_on_uart0(&[0xE7FE]);
+        bus.write32(UART_IER, 1 << 0);
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+        for byte in *b"hi!" {
+            sender.send(byte).unwrap();
+        }
+        let mut received = Vec::new();
+        let mut was_in_handler = false;
+        for _ in 0..40 {
+            cpu.step(&mut bus);
+            // Note R4 each time a handler run finishes.
+            if was_in_handler && !cpu.in_handler_mode() {
+                received.push(cpu.regs[4] as u8);
+            }
+            was_in_handler = cpu.in_handler_mode();
+        }
+        assert_eq!(received, b"hi!");
+    }
+
+    #[test]
+    fn uart0_handler_does_not_run_unless_enabled_in_the_nvic() {
+        let (mut cpu, mut bus, sender) = cpu_receiving_on_uart0(&[0xE7FE]);
+        bus.write32(UART_IER, 1 << 0); // enabled in the UART only
+        sender.send(b'a').unwrap();
+        for _ in 0..20 {
+            cpu.step(&mut bus);
+            assert!(!cpu.in_handler_mode());
+        }
+        // Enabling it lets the waiting interrupt through.
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+        cpu.step(&mut bus);
+        assert!(cpu.in_handler_mode());
+    }
+
+    #[test]
+    fn byte_received_on_uart0_wakes_a_sleeping_cpu() {
+        // Main: wfi ; b back to the wfi.
+        let (mut cpu, mut bus, sender) = cpu_receiving_on_uart0(&[0xBF30, 0xE7FD]);
+        bus.write32(UART_IER, 1 << 0);
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+        for _ in 0..20 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[PC], MAIN + 2); // asleep after the wfi
+
+        sender.send(b'z').unwrap();
+        cpu.step(&mut bus); // still asleep; the byte arrives
+        cpu.step(&mut bus); // wakes, takes the exception
+        assert!(cpu.in_handler_mode());
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[4], b'z' as u32);
+    }
+
+    #[test]
+    fn irq_pended_by_firmware_runs_its_handler_once() {
+        let (mut cpu, mut bus, _sender) = cpu_receiving_on_uart0(&[0xE7FE]);
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+        bus.write32(NVIC_ISPR0, 1 << UART0_IRQ);
+        let mut entries = 0;
+        let mut was_in_handler = false;
+        for _ in 0..30 {
+            cpu.step(&mut bus);
+            if cpu.in_handler_mode() && !was_in_handler {
+                entries += 1;
+            }
+            was_in_handler = cpu.in_handler_mode();
+        }
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn exception_in_the_middle_of_an_it_block_resumes_it() {
+        // Main: ite eq ; moveq r0, #1 ; movne r0, #2.
+        // Handler: movs r1, #5 ; bx lr. Outside an IT block movs sets the
+        // flags, so it clears Z while the handler runs.
+        let (mut cpu, mut bus) =
+            cpu_with_handler(&[0xBF0C, 0x2001, 0x2002], &[0x2105, 0x4770], &[SYSTICK]);
+        cpu.xpsr |= 1 << 30; // Z
+        cpu.step(&mut bus); // ite eq
+        bus.pend_exception(SYSTICK);
+
+        cpu.step(&mut bus); // entry, then movs r1, #5
+        assert!(cpu.in_handler_mode());
+        assert_eq!(cpu.regs[1], 5);
+        // The handler did not inherit the IT block: movs set the flags.
+        assert_eq!(cpu.xpsr & (1 << 30), 0);
+
+        cpu.step(&mut bus); // bx lr: Z and the IT block come back
+        cpu.step(&mut bus); // moveq r0, #1
+        cpu.step(&mut bus); // movne r0, #2, skipped
+        assert_eq!(cpu.regs[0], 1);
+        assert_eq!(cpu.regs[PC], MAIN + 6);
     }
 }

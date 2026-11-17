@@ -65,6 +65,12 @@ impl Cpu {
         // SUB (register), encoding T1: 0001101 Rm Rn Rd  (A7.7.175)
         } else if instr >> 9 == 0b0001101 {
             self.sub_register(instr)
+        // IT, encoding T1: 10111111 firstcond mask, mask != 0  (A7.7.38)
+        } else if instr >> 8 == 0b10111111 && instr & 0xF != 0 {
+            self.it(instr)
+        // UXTB, encoding T1: 1011001011 Rm Rd  (A7.7.221)
+        } else if instr >> 6 == 0b1011001011 {
+            self.uxtb(instr)
         // WFI, encoding T1: 1011111100110000  (A7.7.263)
         } else if instr == 0xBF30 {
             self.wfi()
@@ -150,6 +156,37 @@ impl Cpu {
         CYCLES_MEMORY
     }
 
+    /// IT (If-Then) -- make the next one to four instructions conditional.
+    /// `firstcond` is the condition for the first of them; `mask` says how
+    /// many follow and whether each uses the same condition ("then") or
+    /// its opposite ("else"). The instruction only records this in
+    /// ITSTATE; `step` does the rest.
+    fn it(&mut self, instr: u16) -> u32 {
+        // ITSTATE = firstcond:mask, the low byte of the instruction.
+        self.set_it_state(instr as u8);
+        trace!(
+            self,
+            "  it  firstcond {:04b}, mask {:04b}",
+            (instr >> 4) & 0xF,
+            instr & 0xF
+        );
+        CYCLES_DATA
+    }
+
+    /// UXTB <Rd>, <Rm> -- copy the low byte of Rm into Rd, with the upper
+    /// 24 bits zero ("unsigned extend byte"). Flags are not changed.
+    fn uxtb(&mut self, instr: u16) -> u32 {
+        let m = ((instr >> 3) & 0x7) as usize; // bits 5-3
+        let d = (instr & 0x7) as usize; // bits 2-0
+
+        self.regs[d] = self.regs[m] & 0xFF;
+        trace!(
+            self,
+            "  uxtb r{}, r{}  -> r{} = {:#010X}", d, m, d, self.regs[d]
+        );
+        CYCLES_DATA
+    }
+
     /// MOVS <Rd>, #<imm8> -- load a constant from 0 to 255 into R0-R7,
     /// setting N and Z.
     fn mov_immediate(&mut self, instr: u16) -> u32 {
@@ -161,7 +198,9 @@ impl Cpu {
         // constant has no bit 31). C and V keep their current values.
         let c = self.xpsr & (1 << 29) != 0;
         let v = self.xpsr & (1 << 28) != 0;
-        self.set_nzcv(imm32, c, v);
+        if !self.in_it_block {
+            self.set_nzcv(imm32, c, v);
+        }
         trace!(
             self,
             "  movs r{}, #{}  -> r{} = {:#010X}", d, imm32, d, imm32
@@ -184,7 +223,9 @@ impl Cpu {
         self.regs[d] = result;
         // A shift leaves V unchanged, so pass the current V back in.
         let v = self.xpsr & (1 << 28) != 0;
-        self.set_nzcv(result, carry, v);
+        if !self.in_it_block {
+            self.set_nzcv(result, carry, v);
+        }
         trace!(
             self,
             "  lsrs r{}, r{}, #{}  -> r{} = {:#010X}", d, m, shift_n, d, result
@@ -231,7 +272,9 @@ impl Cpu {
         // Rn - Rm, computed as Rn + NOT(Rm) + 1
         let (result, carry, overflow) = add_with_carry(self.regs[n], !self.regs[m], true);
         self.regs[d] = result;
-        self.set_nzcv(result, carry, overflow);
+        if !self.in_it_block {
+            self.set_nzcv(result, carry, overflow);
+        }
         trace!(
             self,
             "  subs r{}, r{}, r{}  -> r{} = {:#010X}", d, n, m, d, result
@@ -337,7 +380,12 @@ impl Cpu {
             // UNPREDICTABLE in the architecture; a compiler never emits it.
             panic!("POP with an empty register list at {:#010X}", pc);
         }
+        self.pop_registers(registers, pc, bus)
+    }
 
+    /// The work of POP, shared by the 16-bit and 32-bit encodings: load
+    /// every register whose bit is set in `registers` from the stack.
+    pub(super) fn pop_registers(&mut self, registers: u32, pc: u32, bus: &mut Bus) -> u32 {
         // The mirror image of PUSH: read upwards from SP, so the
         // lowest-numbered register comes from the lowest address.
         let mut address = self.regs[SP];
@@ -406,7 +454,9 @@ impl Cpu {
 
         let (result, carry, overflow) = add_with_carry(self.regs[d], imm32, false);
         self.regs[d] = result;
-        self.set_nzcv(result, carry, overflow);
+        if !self.in_it_block {
+            self.set_nzcv(result, carry, overflow);
+        }
         trace!(
             self,
             "  adds r{}, #{}  -> r{} = {:#010X}", d, imm32, d, result
@@ -454,7 +504,9 @@ impl Cpu {
         self.regs[d] = result;
         // A shift leaves V unchanged, so pass the current V back in.
         let v = self.xpsr & (1 << 28) != 0;
-        self.set_nzcv(result, carry, v);
+        if !self.in_it_block {
+            self.set_nzcv(result, carry, v);
+        }
         trace!(
             self,
             "  lsls r{}, r{}, #{}  -> r{} = {:#010X}", d, m, shift_n, d, result
@@ -950,5 +1002,157 @@ mod tests {
         assert_eq!(cpu.regs[SP], 0x2045_FFF8);
         assert_eq!(bus.read32(0x2045_FFFC), 0xAAAA);
         assert_eq!(bus.read32(0x2045_FFF8), 0xBBBB);
+    }
+
+    const Z: u32 = 1 << 30;
+    const C: u32 = 1 << 29;
+
+    #[test]
+    fn ite_runs_the_then_instruction_when_the_condition_holds() {
+        // ite eq ; moveq r0, #1 ; movne r0, #2
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF0C, 0x2001, 0x2002]);
+        cpu.xpsr |= Z;
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[0], 1);
+        assert_eq!(cpu.regs[PC], 0x0040_000E);
+    }
+
+    #[test]
+    fn ite_runs_the_else_instruction_when_the_condition_fails() {
+        // ite eq ; moveq r0, #1 ; movne r0, #2
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF0C, 0x2001, 0x2002]);
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[0], 2);
+        assert_eq!(cpu.regs[PC], 0x0040_000E);
+    }
+
+    #[test]
+    fn itte_covers_three_instructions() {
+        // itte eq ; moveq r0, #1 ; moveq r1, #2 ; movne r2, #3
+        let code = [0xBF06, 0x2001, 0x2102, 0x2203];
+        let (mut cpu, mut bus) = cpu_with_code(&code);
+        cpu.xpsr |= Z;
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(&cpu.regs[0..3], [1, 2, 0]);
+
+        let (mut cpu, mut bus) = cpu_with_code(&code);
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(&cpu.regs[0..3], [0, 0, 3]);
+    }
+
+    #[test]
+    fn it_block_ends_after_its_last_instruction() {
+        // it eq ; moveq r0, #1 ; movs r1, #2 -- the last one is outside
+        // the block, so it runs although the condition fails.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF08, 0x2001, 0x2102]);
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[0], 0);
+        assert_eq!(cpu.regs[1], 2);
+        assert_eq!(cpu.it_state(), 0);
+    }
+
+    #[test]
+    fn instructions_in_an_it_block_do_not_set_the_flags() {
+        // it eq ; lsreq r1, r1, #1 -- outside a block this is lsrs, which
+        // would clear Z and set C here.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF08, 0x0849]);
+        cpu.xpsr |= Z;
+        cpu.regs[1] = 3;
+        let flags = nzcv(&cpu);
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[1], 1);
+        assert_eq!(nzcv(&cpu), flags);
+    }
+
+    #[test]
+    fn flags_are_set_again_after_the_it_block() {
+        // it eq ; moveq r0, #1 ; lsrs r1, r1, #1
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF08, 0x2001, 0x0849]);
+        cpu.xpsr |= Z;
+        cpu.regs[1] = 3;
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.xpsr & Z, 0);
+        assert_ne!(cpu.xpsr & C, 0);
+    }
+
+    #[test]
+    fn skipped_instruction_changes_nothing_and_takes_one_cycle() {
+        // itt ne ; addne r0, #1 ; addne r1, #1, with Z set: both skipped.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF1C, 0x3001, 0x3101]);
+        cpu.xpsr |= Z;
+        let flags = nzcv(&cpu);
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(&cpu.regs[0..2], [0, 0]);
+        assert_eq!(nzcv(&cpu), flags);
+        assert_eq!(cpu.regs[PC], 0x0040_000E);
+        assert_eq!(cpu.cycles, 3);
+    }
+
+    #[test]
+    fn skipped_32_bit_instruction_is_stepped_over_whole() {
+        // it ne ; movwne r0, #0x1234, with Z set.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xBF18, 0xF241, 0x2034]);
+        cpu.xpsr |= Z;
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0);
+        assert_eq!(cpu.regs[PC], 0x0040_000E);
+    }
+
+    #[test]
+    fn conditional_return_in_an_it_block() {
+        // it eq ; bxeq lr ; movs r0, #1 -- the start of hello-rs's UART0
+        // handler: return early if there is nothing to do.
+        let code = [0xBF08, 0x4770, 0x2001];
+        let (mut cpu, mut bus) = cpu_with_code(&code);
+        cpu.xpsr |= Z;
+        cpu.regs[LR] = 0x0040_0101;
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0100);
+
+        // Condition fails: carry on past the bx.
+        let (mut cpu, mut bus) = cpu_with_code(&code);
+        cpu.regs[LR] = 0x0040_0101;
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[0], 1);
+    }
+
+    #[test]
+    fn uxtb_keeps_only_the_low_byte() {
+        // uxtb r0, r3
+        let (mut cpu, mut bus) = cpu_with_code(&[0xB2D8]);
+        cpu.regs[3] = 0x1234_56F8;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0xF8);
+        assert_eq!(cpu.regs[3], 0x1234_56F8);
+    }
+
+    #[test]
+    fn uxtb_in_place_does_not_change_the_flags() {
+        // uxtb r1, r1 -- as in hello-rs's UART0 handler.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xB2C9]);
+        cpu.regs[1] = 0xFFFF_FF00;
+        let flags = nzcv(&cpu);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[1], 0);
+        assert_eq!(nzcv(&cpu), flags);
     }
 }

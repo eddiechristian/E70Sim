@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cortex-m-rt = "0.7" # vector table and startup code
+# Vector table and startup code. The "device" feature leaves the interrupt
+# part of the vector table for us to supply (see __INTERRUPTS in main.rs).
+cortex-m-rt = { version = "0.7", features = ["device"] }
 panic-halt = "1"    # on panic, loop forever
 
 [profile.release]

@@ -206,26 +206,42 @@ One caution: unimplemented instructions should keep panicking. A panic means "th
 
 The last Phase 4 item makes input work. Typed characters on the host's stdin become received bytes on UART0:
 
-1. A byte arrives from stdin. The UART stub stores it in `UART_RHR` (`+0x18`) and sets RXRDY (bit 0) in `UART_SR`.
-2. If the firmware enabled the RXRDY interrupt in `UART_IER` (`+0x08`), the stub makes IRQ 7 pending.
+1. A byte arrives from stdin. If the firmware has switched the receiver on (RXEN in `UART_CR`), the UART stores it in `UART_RHR` (`+0x18`) and sets RXRDY (bit 0) in `UART_SR`.
+2. If the firmware enabled the RXRDY interrupt in `UART_IER` (`+0x08`), the UART asks for IRQ 7, which makes it pending in the NVIC.
 3. If IRQ 7 is enabled in the NVIC, the processor takes exception 23 and runs the firmware's UART0 handler.
-4. The handler reads `UART_RHR`, which clears RXRDY.
+4. The handler reads `UART_RHR`, which clears RXRDY, so the UART stops asking.
+
+Step 4 matters. A peripheral's interrupt request is a **level**: it stays on until the cause is dealt with. A handler that returns without reading `UART_RHR` is called again at once, for ever. This is true on the real chip too, and it is the usual reason for firmware that "hangs" in an interrupt.
+
+How this is done in the emulator:
+
+- A thread reads the host's stdin and passes the bytes down a channel (`stdin_bytes` in `src/peripheral/uart.rs`). After every instruction the bus lets the UART take one byte from the channel, if `UART_RHR` is free.
+- The bus then asks the UART whether it wants its interrupt and tells the NVIC (`update_irq_lines` in `src/bus.rs`). This is the route from a peripheral to the CPU.
+- When the CPU asks the bus for the next exception, system exceptions go first, then the lowest-numbered IRQ that is pending and enabled in the NVIC.
+
+Two things differ from a real board:
+
+- **A terminal sends a line at a time.** Typed characters reach the emulator when Enter is pressed, then arrive one after another. Piped input (`printf 'abc' | cargo run`) arrives straight away.
+- **Bytes are never lost.** A real UART overwrites `UART_RHR` if the firmware is too slow, and sets the OVRE error bit. The emulator keeps the next byte back until the last one has been read, because the speed of the host and the speed of emulated time are unrelated.
+
+When a byte arrives is not tied to the emulated clock, so two runs can see it at different cycle counts. Everything else in the emulator repeats exactly.
 
 ## What the emulator needs
 
 | Piece | Where | Notes |
 |---|---|---|
 | Pending state for every exception | `Bus` (`pend_exception`, `take_pending_exception`) | Done. Active state and priorities are still to come |
-| NVIC registers | new stub at `0xE000_E100` | Enable, pending, priority |
+| NVIC registers | `src/peripheral/nvic.rs` | Done: enable and pending. Priorities are stored but not used yet |
 | SysTick registers and countdown | `src/peripheral/systick.rs` | Done. Counts emulated clock cycles |
 | `ICSR`, `SHPR`, `SHCSR` behaviour | `src/peripheral/scb.rs` | Currently store-and-readback or logged |
 | Check for a pending exception | `Cpu::step` | Done. Before fetching each instruction, and only in Thread mode until priorities exist |
 | Exception entry | `src/cpu/exception.rs` | Push the frame, set LR, load the PC |
 | Exception return | `bx_write_pc` in `src/cpu/exception.rs` | Used by `BX` and `POP`; loads into the PC will need it too |
 | MSP / PSP switching | `src/cpu/exception.rs` | Done for entry and return; writing `CONTROL` with `MSR` is still to come |
-| A way for a peripheral to raise an IRQ | `Peripheral` trait or the bus | The UART stub has no route to the CPU today |
+| A way for a peripheral to raise an IRQ | `update_irq_lines` in `src/bus.rs` | Done. The bus asks each peripheral whether it wants its interrupt and tells the NVIC |
+| UART0 receive from stdin | `src/peripheral/uart.rs` | Done |
 
-The last row is the main design question. At present a peripheral can only answer reads and writes; it cannot tell anyone that something happened. The SCB stub ran into the same limit ("logged but not carried out"). One workable shape is for the bus to own the exception state, for peripherals to set a pending bit there, and for the CPU to ask the bus once per step whether anything is waiting.
+A peripheral can only answer reads and writes; it cannot call anyone to say that something happened. So the bus does the asking: it owns the exception state, checks each peripheral's interrupt request after every instruction, and the CPU asks the bus once per step whether anything is waiting. The SCB stub still has the old limit: writes that pend an exception through `ICSR` are logged, not carried out.
 
 New instructions are needed as well, as real firmware hits them. `BX` and `WFI` exist; `CPSID` / `CPSIE`, `MRS` / `MSR` and `SVC` are still to come.
 

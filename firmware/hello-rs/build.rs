@@ -1,5 +1,5 @@
-//! Put `memory.x` where the linker can find it. `link.x` from cortex-m-rt
-//! includes it by name.
+//! Put `memory.x` and `device.x` where the linker can find them. `link.x`
+//! from cortex-m-rt includes both by name.
 
 use std::env;
 use std::fs;
@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    fs::copy("memory.x", out.join("memory.x")).unwrap();
+    for script in ["memory.x", "device.x"] {
+        fs::copy(script, out.join(script)).unwrap();
+        println!("cargo:rerun-if-changed={script}");
+    }
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=memory.x");
 }

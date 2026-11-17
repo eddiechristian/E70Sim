@@ -1,13 +1,16 @@
+use std::sync::mpsc::Receiver;
+
 use crate::peripheral::Peripheral;
 use crate::peripheral::efc::EfcStub;
 use crate::peripheral::matrix::MatrixStub;
+use crate::peripheral::nvic::Nvic;
 use crate::peripheral::pio::PioStub;
 use crate::peripheral::pmc::PmcStub;
 use crate::peripheral::rstc::RstcStub;
 use crate::peripheral::scb::ScbStub;
 use crate::peripheral::supc::SupcStub;
 use crate::peripheral::systick::SysTick;
-use crate::peripheral::uart::Uart0Stub;
+use crate::peripheral::uart::Uart0;
 use crate::peripheral::wdt::WdtStub;
 
 // Memory map (see the SVD and the SAME70 datasheet).
@@ -36,10 +39,12 @@ const SUPC_BASE: u32 = 0x400E_1810;
 const SUPC_SIZE: u32 = 0x20;
 const WDT_BASE: u32 = 0x400E_1850;
 const WDT_SIZE: u32 = 0x10;
-// System Control Block and the rest of the System Control Space above it.
-// The NVIC, between SysTick and the SCB, is not mapped yet.
+// System Control Space: SysTick, the NVIC, then the System Control Block
+// and everything above it.
 const SYSTICK_BASE: u32 = 0xE000_E010;
 const SYSTICK_SIZE: u32 = 0x10;
+const NVIC_BASE: u32 = 0xE000_E100;
+const NVIC_SIZE: u32 = 0x400;
 const SCB_BASE: u32 = 0xE000_ED00;
 const SCB_SIZE: u32 = 0x300;
 
@@ -54,10 +59,16 @@ const RSTC_END: u32 = RSTC_BASE + RSTC_SIZE - 1;
 const SUPC_END: u32 = SUPC_BASE + SUPC_SIZE - 1;
 const WDT_END: u32 = WDT_BASE + WDT_SIZE - 1;
 const SYSTICK_END: u32 = SYSTICK_BASE + SYSTICK_SIZE - 1;
+const NVIC_END: u32 = NVIC_BASE + NVIC_SIZE - 1;
 const SCB_END: u32 = SCB_BASE + SCB_SIZE - 1;
 
 /// Exception number of the SysTick exception.
 const EXCEPTION_SYSTICK: u32 = 15;
+/// Exception number of IRQ 0. IRQ n is exception 16 + n.
+const EXCEPTION_IRQ0: u32 = 16;
+
+/// UART0's interrupt number (from the SVD).
+const IRQ_UART0: u32 = 7;
 
 /// Read `size` bytes (1, 2 or 4) at `offset` as a little-endian value. A
 /// read that runs off the end of the region is logged and returns 0 instead
@@ -95,7 +106,7 @@ pub struct Bus {
     sram: Vec<u8>,
     // Peripheral stubs, each implementing the Peripheral trait.
     pmc: PmcStub,
-    uart0: Uart0Stub,
+    uart0: Uart0,
     efc: EfcStub,
     wdt: WdtStub,
     matrix: MatrixStub,
@@ -104,8 +115,10 @@ pub struct Bus {
     supc: SupcStub,
     scb: ScbStub,
     systick: SysTick,
-    /// Exceptions that have been requested and are waiting for the CPU to
-    /// take them: bit n is set while exception number n is pending.
+    nvic: Nvic,
+    /// System exceptions (numbers below 16) that have been requested and
+    /// are waiting for the CPU to take them: bit n is set while exception
+    /// number n is pending. Peripheral interrupts are kept by the NVIC.
     pending_exceptions: u128,
 }
 
@@ -115,7 +128,7 @@ impl Bus {
             flash: vec![0xFF; FLASH_SIZE as usize], // erased flash reads as 0xFF
             sram: vec![0; SRAM_SIZE as usize],
             pmc: PmcStub::new(),
-            uart0: Uart0Stub,
+            uart0: Uart0::new(),
             efc: EfcStub::new(),
             wdt: WdtStub::new(),
             matrix: MatrixStub::new(),
@@ -124,6 +137,7 @@ impl Bus {
             supc: SupcStub::new(),
             scb: ScbStub::new(),
             systick: SysTick::new(),
+            nvic: Nvic::new(),
             pending_exceptions: 0,
         }
     }
@@ -144,37 +158,57 @@ impl Bus {
         if self.systick.tick(cycles) {
             self.pend_exception(EXCEPTION_SYSTICK);
         }
+        self.uart0.poll_input();
+        self.update_irq_lines();
+    }
+
+    /// Connect UART0's receiver to a source of bytes, such as stdin.
+    pub fn set_uart0_input(&mut self, input: Receiver<u8>) {
+        self.uart0.set_input(input);
+    }
+
+    /// Pass each peripheral's interrupt request on to the NVIC.
+    fn update_irq_lines(&mut self) {
+        self.nvic
+            .set_line(IRQ_UART0, self.uart0.interrupt_requested());
     }
 
     /// Ask for exception `number` to be taken. It stays pending until the
-    /// CPU takes it.
+    /// CPU takes it. This goes round the NVIC, so it is meant for the
+    /// system exceptions; an IRQ pended this way needs no enable bit.
     pub fn pend_exception(&mut self, number: u32) {
         self.pending_exceptions |= 1 << number;
     }
 
     /// True if any exception is waiting to be taken.
-    pub fn has_pending_exception(&self) -> bool {
-        self.pending_exceptions != 0
+    pub fn has_pending_exception(&mut self) -> bool {
+        self.update_irq_lines();
+        self.pending_exceptions != 0 || self.nvic.has_pending_irq()
     }
 
     /// How many clock cycles from now the next exception will be raised,
     /// if nothing else changes. `None` if nothing is set up to raise one.
     /// A sleeping CPU uses this to skip the wait.
     pub fn cycles_until_next_exception(&self) -> Option<u32> {
-        // SysTick is the only source so far. Others will take the minimum.
+        // SysTick is the only source that works to a timetable. UART
+        // input arrives whenever the host delivers it, which cannot be
+        // predicted; it is noticed on the next tick.
         self.systick.cycles_until_exception()
     }
 
     /// Hand the CPU a pending exception to take, if there is one, and stop
     /// it being pending. With several pending, the lowest exception number
-    /// goes first; real priorities are not implemented yet.
+    /// goes first, so system exceptions come before peripheral interrupts;
+    /// real priorities are not implemented yet.
     pub fn take_pending_exception(&mut self) -> Option<u32> {
-        if self.pending_exceptions == 0 {
-            return None;
+        if self.pending_exceptions != 0 {
+            let number = self.pending_exceptions.trailing_zeros();
+            self.pending_exceptions &= !(1 << number);
+            return Some(number);
         }
-        let number = self.pending_exceptions.trailing_zeros();
-        self.pending_exceptions &= !(1 << number);
-        Some(number)
+        self.update_irq_lines();
+        let irq = self.nvic.take_pending_irq()?;
+        Some(EXCEPTION_IRQ0 + irq)
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
@@ -223,6 +257,7 @@ impl Bus {
             RSTC_BASE..=RSTC_END => self.rstc.read(addr - RSTC_BASE, size),
             SUPC_BASE..=SUPC_END => self.supc.read(addr - SUPC_BASE, size),
             SYSTICK_BASE..=SYSTICK_END => self.systick.read(addr - SYSTICK_BASE, size),
+            NVIC_BASE..=NVIC_END => self.nvic.read(addr - NVIC_BASE, size),
             SCB_BASE..=SCB_END => self.scb.read(addr - SCB_BASE, size),
             // Unmapped: log instead of panicking. The log shows which
             // peripheral the firmware wants next.
@@ -267,6 +302,7 @@ impl Bus {
             RSTC_BASE..=RSTC_END => self.rstc.write(addr - RSTC_BASE, size, value),
             SUPC_BASE..=SUPC_END => self.supc.write(addr - SUPC_BASE, size, value),
             SYSTICK_BASE..=SYSTICK_END => self.systick.write(addr - SYSTICK_BASE, size, value),
+            NVIC_BASE..=NVIC_END => self.nvic.write(addr - NVIC_BASE, size, value),
             SCB_BASE..=SCB_END => self.scb.write(addr - SCB_BASE, size, value),
             _ => {
                 eprintln!(
@@ -445,8 +481,77 @@ mod tests {
         // Byte write to SHPR3 (SysTick priority) goes through.
         bus.write8(SCB_BASE + 0x23, 0xE0);
         assert_eq!(bus.read32(SCB_BASE + 0x20), 0xE000_0000);
-        // The NVIC, just below the SCB, is still unmapped.
-        assert_eq!(bus.read32(0xE000_E100), 0);
+    }
+
+    #[test]
+    fn nvic_is_mapped_at_its_base_address() {
+        let mut bus = Bus::new();
+        bus.write32(NVIC_BASE, 1 << 7); // ISER0: enable IRQ 7
+        assert_eq!(bus.read32(NVIC_BASE), 1 << 7);
+        bus.write8(NVIC_BASE + 0x307, 0xE0); // IPR byte for IRQ 7
+        assert_eq!(bus.read32(NVIC_BASE + 0x304), 0xE000_0000);
+    }
+
+    /// A bus with UART0's receiver on and an input channel attached.
+    fn bus_with_uart_input() -> (Bus, std::sync::mpsc::Sender<u8>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut bus = Bus::new();
+        bus.set_uart0_input(receiver);
+        bus.write32(UART0_BASE, 1 << 4); // UART_CR: RXEN
+        (bus, sender)
+    }
+
+    #[test]
+    fn uart_byte_raises_irq_7_when_both_switches_are_on() {
+        let (mut bus, sender) = bus_with_uart_input();
+        bus.write32(UART0_BASE + 0x08, 1 << 0); // UART_IER: RXRDY
+        bus.write32(NVIC_BASE, 1 << IRQ_UART0); // ISER0
+        bus.tick(1);
+        assert!(!bus.has_pending_exception());
+
+        sender.send(b'x').unwrap();
+        bus.tick(1);
+        assert!(bus.has_pending_exception());
+        assert_eq!(bus.take_pending_exception(), Some(23));
+        // Still asking: the byte has not been read.
+        assert_eq!(bus.take_pending_exception(), Some(23));
+        // Reading UART_RHR withdraws the request.
+        assert_eq!(bus.read32(UART0_BASE + 0x18), b'x' as u32);
+        assert_eq!(bus.take_pending_exception(), None);
+        assert!(!bus.has_pending_exception());
+    }
+
+    #[test]
+    fn uart_byte_raises_nothing_with_either_switch_off() {
+        // Enabled in the UART but not in the NVIC.
+        let (mut bus, sender) = bus_with_uart_input();
+        bus.write32(UART0_BASE + 0x08, 1 << 0);
+        sender.send(b'x').unwrap();
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(), None);
+        // The NVIC shows it pending all the same (ISPR0).
+        assert_eq!(bus.read32(NVIC_BASE + 0x100), 1 << IRQ_UART0);
+
+        // Enabled in the NVIC but not in the UART.
+        let (mut bus, sender) = bus_with_uart_input();
+        bus.write32(NVIC_BASE, 1 << IRQ_UART0);
+        sender.send(b'x').unwrap();
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(), None);
+        // The byte can still be read by polling UART_SR.
+        assert_eq!(bus.read32(UART0_BASE + 0x14) & 1, 1);
+    }
+
+    #[test]
+    fn system_exceptions_are_taken_before_irqs() {
+        let (mut bus, sender) = bus_with_uart_input();
+        bus.write32(UART0_BASE + 0x08, 1 << 0);
+        bus.write32(NVIC_BASE, 1 << IRQ_UART0);
+        sender.send(b'x').unwrap();
+        bus.tick(1);
+        bus.pend_exception(EXCEPTION_SYSTICK);
+        assert_eq!(bus.take_pending_exception(), Some(15));
+        assert_eq!(bus.take_pending_exception(), Some(23));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 pub mod efc;
 pub mod matrix;
+pub mod nvic;
 pub mod pio;
 pub mod pmc;
 pub mod rstc;

@@ -13,6 +13,19 @@ impl Cpu {
     /// Decode and execute a 32-bit instruction. `hw1` is the halfword at
     /// `pc` and `hw2` the one at `pc + 2`. The panic at the end is the
     /// to-do list for 32-bit encodings.
+    /// POP.W <registers> -- the 32-bit POP, which can load any of R0-R12,
+    /// LR and the PC. The 16-bit one is limited to R0-R7 and the PC.
+    fn pop_wide(&mut self, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
+        // Bit n of hw2 selects register n: P (bit 15) is the PC and M
+        // (bit 14) is LR. Bit 13 would be SP, which cannot be popped.
+        let registers = hw2 as u32;
+        if registers.count_ones() < 2 || registers >> 14 == 0b11 {
+            // UNPREDICTABLE in the architecture; a compiler never emits it.
+            panic!("POP.W with a bad register list at {:#010X}", pc);
+        }
+        self.pop_registers(registers, pc, bus)
+    }
+
     pub(super) fn execute32(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
         // BL, encoding T1: 11110 S imm10 | 11 J1 1 J2 imm11  (A7.7.18)
         if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
@@ -50,6 +63,9 @@ impl Cpu {
         // (immediate) instead.
         } else if hw1 & 0xFBF0 == 0xF1B0 && hw2 & 0x8F00 == 0x0F00 {
             self.cmp_modified_immediate(hw1, hw2, pc)
+        // POP, encoding T2: 1110100010111101 | P M 0 register_list  (A7.7.99)
+        } else if hw1 == 0xE8BD && hw2 & 0x2000 == 0 {
+            self.pop_wide(hw2, pc, bus)
         // STR (immediate), encoding T3: 111110001100 Rn | Rt imm12  (A7.7.161)
         // Rn = 1111 is not a valid STR, so it is left to the panic below.
         } else if hw1 & 0xFFF0 == 0xF8C0 && hw1 & 0xF != 0xF {
@@ -655,5 +671,34 @@ mod tests {
         assert_eq!(cpu.xpsr, xpsr);
         assert_eq!(cpu.regs[SP], sp);
         assert_eq!(cpu.regs[..13], [0; 13]);
+    }
+
+    #[test]
+    fn pop_wide_loads_a_high_register_and_lr() {
+        // pop.w {r7, lr}: how hello-rs's UART0 handler restores LR.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE8BD, 0x4080]);
+        cpu.regs[SP] = 0x2045_FFF0;
+        bus.write32(0x2045_FFF0, 0x1111_1111);
+        bus.write32(0x2045_FFF4, 0xFFFF_FFF9);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[7], 0x1111_1111);
+        assert_eq!(cpu.regs[LR], 0xFFFF_FFF9);
+        assert_eq!(cpu.regs[SP], 0x2045_FFF8);
+        assert_eq!(cpu.regs[PC], 0x0040_000C);
+    }
+
+    #[test]
+    fn pop_wide_with_pc_returns_from_a_function() {
+        // pop.w {r4, r8, pc}
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE8BD, 0x8110]);
+        cpu.regs[SP] = 0x2045_FFF0;
+        bus.write32(0x2045_FFF0, 4);
+        bus.write32(0x2045_FFF4, 8);
+        bus.write32(0x2045_FFF8, 0x0040_0101);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[4], 4);
+        assert_eq!(cpu.regs[8], 8);
+        assert_eq!(cpu.regs[PC], 0x0040_0100);
+        assert_eq!(cpu.regs[SP], 0x2045_FFFC);
     }
 }

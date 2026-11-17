@@ -1,6 +1,6 @@
 # Rust firmware for the emulator
 
-This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line, then starts a 1 ms SysTick and prints a dot every 500 ms, timed by a millisecond counter that the SysTick handler keeps. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
+This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line, starts a 1 ms SysTick that keeps a millisecond counter, waits 500 ms, and from then on echoes every byte it receives on UART0 from its receive interrupt handler. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
 
 "Bare-metal" means the program runs directly on the chip with no operating system. Nothing prepares memory or calls `main` for it, so the program has to bring its own startup code.
 
@@ -12,7 +12,8 @@ This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-meta
 | Startup code | Runs at reset, prepares RAM, then calls `main` | `cortex-m-rt` crate |
 | Memory layout | Where flash and RAM are on this chip | `memory.x`, written by us |
 | Panic handler | What to do if the program panics | `panic-halt` crate |
-| `main` | Disable the watchdog, set up UART0, print | written by us |
+| Interrupt vector table | The words after the first 16: the address of every peripheral interrupt handler | `__INTERRUPTS` in `main.rs`, written by us |
+| `main` | Disable the watchdog, set up UART0, print, start SysTick, enable the receive interrupt | written by us |
 
 ## Minimal startup
 
@@ -68,7 +69,8 @@ The firmware is its own Cargo project, separate from the emulator, because it is
 firmware/hello-rs/
     Cargo.toml          dependencies: cortex-m-rt, panic-halt
     memory.x            flash and RAM layout
-    build.rs            puts memory.x where the linker looks for it
+    device.x            empty; see "UART echo" below
+    build.rs            puts memory.x and device.x where the linker looks for them
     .cargo/config.toml  build target and linker script
     build.sh            builds and writes ../hello-rs.bin
     src/main.rs
@@ -110,6 +112,14 @@ cargo run
 cargo run -- --trace
 cargo run -- firmware/firmware.bin
 ```
+
+The emulator's stdin is UART0's receive line. Type a line and press Enter and the firmware echoes it; the terminal hands input over a line at a time, so nothing arrives before Enter. Input can also be piped in:
+
+```
+printf 'hello\n' | cargo run
+```
+
+Stop the emulator with Ctrl-C.
 
 ### Disassembling
 
@@ -222,18 +232,70 @@ fn delay_ms(ms: u32) {
 
 `delay_ms` compares elapsed time (`now - start`) with the wanted delay, not the current time with a deadline. That keeps working when the 32-bit counter wraps round to 0, which happens after about 49.7 days.
 
-The main loop is then:
+`main` uses it once, between the greeting and the prompt:
 
 ```rust
-loop {
-    delay_ms(500);
-    uart_write_byte(b'.');
-}
+systick_init();
+delay_ms(500);
+uart_write_str("Type something:\n");
 ```
 
 `wait_for_interrupt` is the `WFI` instruction, written with `core::arch::asm!`. It stops the processor until the next exception. The count can only change when SysTick fires, so there is no point checking it more often than that; on a real chip sleeping in between saves power.
 
-The emulator skips the sleep: when the CPU is asleep it jumps emulated time straight to the next SysTick. So the dots appear far faster than two per second on the host, while being exactly 6,000,000 emulated cycles (500 ms at 12 MHz) apart.
+The emulator skips the sleep: when the CPU is asleep it jumps emulated time straight to the next SysTick. So the prompt appears almost at once on the host, while being 6,000,000 emulated cycles (500 ms at 12 MHz) after the timer started.
+
+## UART echo: the receive interrupt
+
+After the prompt, the firmware turns on UART0's receive interrupt and the main loop only sleeps. Each received byte runs the UART0 handler, which sends the byte back.
+
+### Set-up
+
+An interrupt has two switches, and both must be on:
+
+| Order | Register | Address | Value | Meaning |
+|---|---|---|---|---|
+| 1 | `UART_IER` | `0x400E_0808` | `1 << 0` (RXRDY) | In the UART: ask for the interrupt when a byte has been received |
+| 2 | `NVIC_ISER0` | `0xE000_E100` | `1 << 7` | In the Arm core's interrupt controller: let IRQ 7 (UART0) run its handler |
+
+The receiver itself was already switched on by RXEN in `uart_init`.
+
+### The handler
+
+```rust
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+extern "C" fn UART0() {
+    if read_reg(UART0_SR) & UART_SR_RXRDY != 0 {
+        let byte = read_reg(UART0_RHR) as u8;
+        uart_write_byte(byte);
+    }
+}
+```
+
+Reading `UART_RHR` (`0x400E_0818`) fetches the byte and clears RXRDY, which makes the UART stop asking for the interrupt. A handler that returned without reading it would be called again at once, for ever.
+
+Calling `uart_write_byte` from a handler is acceptable here because the transmitter is ready almost immediately. On a real board at 9600 baud each byte takes about 1 ms to send, so firmware that receives a lot usually stores the byte in a buffer and lets the main loop do the sending.
+
+### The interrupt vector table
+
+`#[exception]` works for `SysTick` because `cortex-m-rt` knows the 16 system exceptions, which are the same on every Cortex-M. It does not know which peripheral interrupts a particular chip has, so that part of the vector table is ours to supply:
+
+```rust
+#[unsafe(link_section = ".vector_table.interrupts")]
+#[unsafe(no_mangle)]
+#[used]
+pub static __INTERRUPTS: [unsafe extern "C" fn(); 8] = [
+    DefaultHandler, // IRQ 0
+    // ... IRQ 1 to 6 the same
+    UART0,          // IRQ 7
+];
+```
+
+- Entry n is the handler for IRQ n. `cortex-m-rt`'s linker script places the section straight after the 16 system entries, so `UART0` ends up at word 23 (`0x0040_005C`), where the processor looks for exception 16 + 7.
+- `DefaultHandler` is `cortex-m-rt`'s catch-all, an endless loop.
+- The `device` feature of `cortex-m-rt` (in `Cargo.toml`) is what tells it not to supply a table of its own. With that feature its linker script also includes a file called `device.x`, so an empty one is provided.
+
+Normally a "peripheral access crate" generated from the chip's SVD file supplies this table, with all the interrupts by name. Writing it by hand shows what such a crate does.
 
 ## What the emulator does with this
 
@@ -242,15 +304,18 @@ The emulator skips the sleep: when the CPU is asleep it jumps emulated time stra
 | Watchdog disable | Stored; the emulated watchdog never expires anyway |
 | Clock enable | Stored in `PMC_PCSR0`; the UART stub works with or without it |
 | Pin set-up | Stored; no pins exist |
-| `UART_CR`, `UART_MR`, `UART_BRGR` | Ignored by the UART stub |
+| `UART_CR` | RXEN switches the emulated receiver on; the transmitter works regardless |
+| `UART_MR`, `UART_BRGR` | Ignored |
 | `UART_SR` | Always reports TXRDY |
 | `UART_THR` | Byte goes to stdout |
 | SysTick set-up | The emulated timer starts counting clock cycles |
 | SysTick reaching zero | The handler runs and adds 1 to `TICKS`, every 12,000 emulated cycles |
 | `WFI` | The CPU sleeps; emulated time jumps to the next SysTick |
 | `delay_ms(500)` | Takes 6,000,000 emulated cycles, which the host gets through almost at once |
+| `UART_IER`, `NVIC_ISER0` | The emulated UART and NVIC pass the receive interrupt through |
+| A byte on stdin | Goes into `UART_RHR`; the UART0 handler runs and echoes it |
 
-So only step 5 is needed for UART output in the emulator. Steps 1 to 4 are there so the same firmware would work on a real board.
+So only step 5 is needed for UART output in the emulator, plus RXEN from step 4 for input. The rest is there so the same firmware would work on a real board.
 
 When the firmware uses an instruction the CPU core does not implement yet, the emulator stops with an "unknown instruction" panic that names the next one to add.
 

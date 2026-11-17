@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::helpers::condition_passed;
 
 const SP: usize = 13;
 const LR: usize = 14;
@@ -37,6 +38,21 @@ macro_rules! trace {
 // Each of these files adds methods to `Cpu`. `thumb16` and `thumb32` hold
 // the instructions, split by encoding length; `step` below picks between
 // them. `exception` holds exception entry and return.
+/// The xPSR bits that hold ITSTATE: 15-10 and 26-25.
+const XPSR_IT: u32 = (0x3F << 10) | (0x3 << 25);
+
+/// ITAdvance (A7.3.3): ITSTATE for the instruction after this one.
+fn it_advance(it_state: u8) -> u8 {
+    if it_state & 0b111 == 0 {
+        // That was the last instruction of the block.
+        0
+    } else {
+        // Keep the base condition (top 3 bits) and shift the rest up, which
+        // brings in the next instruction's then/else bit.
+        (it_state & 0xE0) | ((it_state << 1) & 0x1F)
+    }
+}
+
 mod exception;
 mod thumb16;
 mod thumb32;
@@ -49,6 +65,10 @@ pub struct Cpu {
     /// True after WFI, until an exception becomes pending. While it is
     /// set, `step` lets time pass without executing anything.
     sleeping: bool,
+    /// True while the instruction being executed is inside an IT block.
+    /// There, the 16-bit instructions that normally set the flags leave
+    /// them alone. `step` sets this before each instruction.
+    in_it_block: bool,
     regs: [u32; 16],
     xpsr: u32,
     msp: u32,
@@ -83,6 +103,7 @@ impl Cpu {
             trace: false,
             cycles: 0,
             sleeping: false,
+            in_it_block: false,
             regs: [0; 16],
             xpsr: 0,
             msp: 0,
@@ -151,6 +172,35 @@ impl Cpu {
         let pc = self.regs[PC];
         let hw1 = bus.read16(pc); // Thumb instructions are 16-bit units
 
+        // Inside an IT block the instruction only executes if the block's
+        // condition for it holds (A7.3). ITSTATE is moved on to the next
+        // instruction before this one executes, so that an exception
+        // return, which replaces the whole xPSR, is not disturbed.
+        let it_state = self.it_state();
+        self.in_it_block = it_state != 0;
+        if self.in_it_block {
+            self.set_it_state(it_advance(it_state));
+            let cond = (it_state >> 4) as u16;
+            if !condition_passed(cond, self.xpsr) {
+                // Skipped: step over it. It still takes a cycle.
+                let length = if hw1 >> 11 >= 0b11101 { 4 } else { 2 };
+                self.regs[PC] = pc.wrapping_add(length);
+                cycles += CYCLES_DATA;
+                self.cycles += cycles as u64;
+                bus.tick(cycles);
+                trace!(
+                    self,
+                    "{:#010X}: {:#06X} skipped, condition {:04b} not met\ncycles = {} (+{})\n",
+                    pc,
+                    hw1,
+                    cond,
+                    self.cycles,
+                    cycles
+                );
+                return;
+            }
+        }
+
         // A first halfword whose top 5 bits are 11101, 11110 or 11111 is the
         // start of a 32-bit instruction (A5.1). The PC is advanced past the
         // instruction before executing it, so a branch can simply overwrite
@@ -169,6 +219,21 @@ impl Cpu {
         self.cycles += cycles as u64;
         bus.tick(cycles);
         trace!(self, "{:?}\ncycles = {} (+{})\n", self, self.cycles, cycles);
+    }
+
+    /// ITSTATE, the 8 bits that track an IT block (A7.3.3): the top four
+    /// are the condition for the next instruction, the rest say how many
+    /// instructions are left. 0 outside an IT block. It is kept in two
+    /// pieces in the xPSR: bits 7-2 in xPSR bits 15-10, bits 1-0 in xPSR
+    /// bits 26-25.
+    fn it_state(&self) -> u8 {
+        ((((self.xpsr >> 10) & 0x3F) << 2) | ((self.xpsr >> 25) & 0x3)) as u8
+    }
+
+    fn set_it_state(&mut self, it_state: u8) {
+        let it_state = it_state as u32;
+        self.xpsr &= !XPSR_IT;
+        self.xpsr |= ((it_state >> 2) << 10) | ((it_state & 0x3) << 25);
     }
 
     fn set_nzcv(&mut self, result: u32, carry: bool, overflow: bool) {

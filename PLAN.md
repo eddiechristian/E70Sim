@@ -77,7 +77,7 @@ Startup code busy-waits on "ready" bits; stubs must report ready immediately.
 
 | Peripheral | Base | Stub behaviour |
 |---|---|---|
-| UART0 | `0x400E0800` | SR: TXRDY + TXEMPTY (bits 1, 9) always set; THR → stdout; RHR ← stdin (later) |
+| UART0 | `0x400E0800` | ✅ SR: TXRDY + TXEMPTY (bits 1, 9) always set; THR → stdout; RHR (`+0x18`) ← stdin with RXRDY (bit 0); IER / IDR / IMR; raises IRQ 7 |
 | PMC | `0x400E0600` | `PMC_SR` (`+0x68`): MOSCXTS, LOCKA, MCKRDY, MOSCSELS set; store other writes |
 | EFC | `0x400E0C00` | ✅ `EEFC_FSR` (`+0x08`): FRDY (bit 0) set; `EEFC_FMR` (`+0x00`) store-and-readback; `EEFC_FCR` (`+0x04`) commands logged, not executed |
 | WDT | `0x400E1850` | ✅ Never expires. `WDT_MR` (`+0x04`) resets to `0x3FFF2FFF` and is write-once, so the disable write (WDDIS, bit 15) reads back; `WDT_CR` (`+0x00`) restart is a no-op; `WDT_SR` (`+0x08`) reads 0 |
@@ -108,9 +108,10 @@ All offsets and bit names in this table are verified against the SVD.
 - [x] Exception entry: push 8-word frame; return via `EXC_RETURN` (`0xFFFFFFF1` / `9` / `D`)
 - [ ] MSP/PSP switching, PRIMASK, BASEPRI
 - [x] SysTick (`0xE000E010`), counting emulated clock cycles
-- [ ] NVIC (`0xE000E100`), exception priorities and nesting
+- [x] NVIC (`0xE000E100`): enable and pending bits
+- [ ] Exception priorities and nesting
 - [ ] HardFault with a useful dump of the faulting state
-- [ ] UART0 RX interrupt (IRQ 7) fed from stdin
+- [x] UART0 RX interrupt (IRQ 7) fed from stdin
 
 ## Phase 5 — As needed
 

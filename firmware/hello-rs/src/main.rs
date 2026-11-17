@@ -1,8 +1,9 @@
 //! Bare-metal firmware for the ATSAME70Q21: set up UART0, print a line,
-//! then start a 1 ms SysTick and print a dot every 500 ms.
+//! start a 1 ms SysTick, then echo every byte received on UART0.
 //!
-//! The SysTick exception handler only counts milliseconds. `millis` and
-//! `delay_ms` are built on that count, and the main loop uses them.
+//! The SysTick exception handler only counts milliseconds; `millis` and
+//! `delay_ms` are built on that count. The UART0 interrupt handler does
+//! the echoing, so the main loop has nothing to do but sleep.
 //!
 //! See `../firmware.md` for what each step is for. Register addresses and
 //! bit positions are from `ATSAME70Q21.svd`.
@@ -33,7 +34,9 @@ const UART0_PINS: u32 = (1 << 9) | (1 << 10);
 // UART0.
 const UART0_CR: *mut u32 = 0x400E_0800 as *mut u32;
 const UART0_MR: *mut u32 = 0x400E_0804 as *mut u32;
+const UART0_IER: *mut u32 = 0x400E_0808 as *mut u32; // interrupt enable
 const UART0_SR: *mut u32 = 0x400E_0814 as *mut u32;
+const UART0_RHR: *mut u32 = 0x400E_0818 as *mut u32; // received byte
 const UART0_THR: *mut u32 = 0x400E_081C as *mut u32;
 const UART0_BRGR: *mut u32 = 0x400E_0820 as *mut u32;
 
@@ -44,7 +47,12 @@ const UART_CR_RXDIS: u32 = 1 << 5; // disable receiver
 const UART_CR_TXEN: u32 = 1 << 6; // enable transmitter
 const UART_CR_TXDIS: u32 = 1 << 7; // disable transmitter
 const UART_MR_PAR_NO: u32 = 4 << 9; // no parity
+const UART_SR_RXRDY: u32 = 1 << 0; // a received byte is waiting in UART0_RHR
 const UART_SR_TXRDY: u32 = 1 << 1; // transmitter can take another byte
+
+// NVIC, the Arm core's interrupt controller.
+const NVIC_ISER0: *mut u32 = 0xE000_E100 as *mut u32; // enable IRQ 0 to 31
+const IRQ_UART0: u32 = 7; // interrupt number of UART0
 
 // SysTick, the Arm core's system timer.
 const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32; // control and status
@@ -118,6 +126,55 @@ fn uart_write_str(text: &str) {
     }
 }
 
+/// Have UART0 raise its interrupt whenever a byte has been received.
+/// There are two switches: one in the UART, one in the NVIC.
+fn uart_enable_rx_interrupt() {
+    write_reg(UART0_IER, UART_SR_RXRDY);
+    write_reg(NVIC_ISER0, 1 << IRQ_UART0);
+}
+
+/// Runs when UART0 has received a byte: send it straight back.
+///
+/// Reading UART0_RHR is what makes the UART stop asking for the
+/// interrupt. Without that read the handler would run again as soon as
+/// it returned, for ever.
+///
+/// `no_mangle` keeps the name `UART0` in the compiled program, and
+/// `extern "C"` makes it an ordinary function that the processor can call
+/// through the vector table.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+extern "C" fn UART0() {
+    if read_reg(UART0_SR) & UART_SR_RXRDY != 0 {
+        let byte = read_reg(UART0_RHR) as u8;
+        uart_write_byte(byte);
+    }
+}
+
+unsafe extern "C" {
+    /// `cortex-m-rt`'s handler for anything unexpected: it loops for ever.
+    fn DefaultHandler();
+}
+
+/// The interrupt part of the vector table: entry n is the handler for
+/// IRQ n. `cortex-m-rt` places this section straight after the 16 system
+/// exception entries, so entry 7 lands at word 23 (`0x0040_005C`).
+///
+/// The table stops after the last interrupt this firmware uses.
+#[unsafe(link_section = ".vector_table.interrupts")]
+#[unsafe(no_mangle)]
+#[used]
+pub static __INTERRUPTS: [unsafe extern "C" fn(); 8] = [
+    DefaultHandler, // IRQ 0
+    DefaultHandler, // IRQ 1
+    DefaultHandler, // IRQ 2
+    DefaultHandler, // IRQ 3
+    DefaultHandler, // IRQ 4
+    DefaultHandler, // IRQ 5
+    DefaultHandler, // IRQ 6
+    UART0,          // IRQ 7
+];
+
 fn systick_init() {
     // The counter runs from the reload value down to zero, so a period of
     // N cycles needs a reload value of N - 1.
@@ -174,9 +231,13 @@ fn main() -> ! {
     uart_write_str("Hello from Rust on SAME70\n");
 
     systick_init();
+    delay_ms(500);
+    uart_write_str("Type something:\n");
 
+    uart_enable_rx_interrupt();
+
+    // Everything from here on happens in the interrupt handlers.
     loop {
-        delay_ms(500);
-        uart_write_byte(b'.');
+        wait_for_interrupt();
     }
 }
