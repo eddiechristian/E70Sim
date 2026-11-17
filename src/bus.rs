@@ -1,5 +1,6 @@
 use std::sync::mpsc::Receiver;
 
+use crate::i2c::I2cDevice;
 use crate::peripheral::Peripheral;
 use crate::peripheral::dwt::Dwt;
 use crate::peripheral::efc::EfcStub;
@@ -12,6 +13,7 @@ use crate::peripheral::scb::ScbStub;
 use crate::peripheral::supc::SupcStub;
 use crate::peripheral::systick::SysTick;
 use crate::peripheral::tc::Tc;
+use crate::peripheral::twihs::Twihs;
 use crate::peripheral::uart::Uart0;
 use crate::peripheral::wdt::WdtStub;
 
@@ -30,6 +32,9 @@ const EFC_SIZE: u32 = 0x200;
 // Four Timer Counter modules, TC0 to TC3, of three channels each.
 const TC_BASES: [u32; 4] = [0x4000_C000, 0x4001_0000, 0x4001_4000, 0x4005_4000];
 const TC_SIZE: u32 = 0x100;
+// Three I2C controllers, TWIHS0 to TWIHS2.
+const TWIHS_BASES: [u32; 3] = [0x4001_8000, 0x4001_C000, 0x4006_0000];
+const TWIHS_SIZE: u32 = 0x100;
 const MATRIX_BASE: u32 = 0x4008_8000;
 const MATRIX_SIZE: u32 = 0x200;
 // Five PIO ports, PIOA to PIOE, one after another.
@@ -122,6 +127,8 @@ pub const PRIORITY_THREAD: i32 = 256;
 
 // Interrupt numbers (from the SVD).
 const IRQ_UART0: u32 = 7;
+/// One per I2C controller, TWIHS0 to TWIHS2.
+const IRQ_TWIHS: [u32; 3] = [19, 20, 41];
 /// One per PIO port, PIOA to PIOE.
 const IRQ_PIO: [u32; PIO_COUNT as usize] = [10, 11, 12, 16, 17];
 /// One per Timer Counter channel: `IRQ_TC[module][channel]`.
@@ -213,6 +220,13 @@ fn write_le(mem: &mut [u8], offset: usize, size: usize, value: u32, addr: u32) {
     }
 }
 
+/// Which I2C controller `addr` belongs to, if any.
+fn twihs_index(addr: u32) -> Option<usize> {
+    TWIHS_BASES
+        .iter()
+        .position(|&base| (base..base + TWIHS_SIZE).contains(&addr))
+}
+
 /// Which Timer Counter module `addr` belongs to, if any.
 fn tc_module(addr: u32) -> Option<usize> {
     TC_BASES
@@ -235,7 +249,8 @@ pub struct Bus {
     scb: ScbStub,
     systick: SysTick,
     nvic: Nvic,
-    tc: [Tc; 4], // TC0 to TC3
+    tc: [Tc; 4],       // TC0 to TC3
+    twihs: [Twihs; 3], // TWIHS0 to TWIHS2
     dwt: Dwt,
     /// Clock cycles since reset, as counted by `tick`.
     cycles: u64,
@@ -278,6 +293,7 @@ impl Bus {
             systick: SysTick::new(),
             nvic: Nvic::new(),
             tc: std::array::from_fn(|_| Tc::new()),
+            twihs: std::array::from_fn(|_| Twihs::new()),
             dwt: Dwt::new(),
             cycles: 0,
             pin_events: Vec::new(),
@@ -309,6 +325,9 @@ impl Bus {
             tc.tick(cycles);
         }
         self.dwt.tick(cycles, self.scb.trace_enabled());
+        for twihs in &mut self.twihs {
+            twihs.tick(cycles);
+        }
         self.uart0.poll_input();
 
         // Apply the pin changes whose time has come.
@@ -321,6 +340,15 @@ impl Bus {
             self.set_pin(event.port, event.pin, event.high);
         }
         self.update_irq_lines();
+    }
+
+    /// Plug a device into one of the I2C buses: `controller` is 0
+    /// (TWIHS0) to 2 (TWIHS2).
+    // Nothing is plugged in outside the tests until the sensor model
+    // exists (step 3 of `gyro.md`).
+    #[allow(dead_code)]
+    pub fn attach_i2c_device(&mut self, controller: usize, device: Box<dyn I2cDevice>) {
+        self.twihs[controller].attach(device);
     }
 
     /// The outside world drives a pin high or low. `port` is 0 (PIOA)
@@ -348,6 +376,10 @@ impl Bus {
         for (port, &irq) in IRQ_PIO.iter().enumerate() {
             self.nvic
                 .set_line(irq, self.pio[port].interrupt_requested());
+        }
+        for (index, &irq) in IRQ_TWIHS.iter().enumerate() {
+            self.nvic
+                .set_line(irq, self.twihs[index].interrupt_requested());
         }
         for (module, irqs) in IRQ_TC.iter().enumerate() {
             for (channel, &irq) in irqs.iter().enumerate() {
@@ -641,6 +673,10 @@ impl Bus {
                 let module = tc_module(addr).unwrap();
                 self.tc[module].read(addr - TC_BASES[module], size)
             }
+            _ if twihs_index(addr).is_some() => {
+                let index = twihs_index(addr).unwrap();
+                self.twihs[index].read(addr - TWIHS_BASES[index], size)
+            }
             // Any size of access to ICSR: pick the bytes asked for.
             ICSR..=ICSR_END => {
                 let word = self.read_icsr() >> ((addr & 3) * 8);
@@ -705,6 +741,10 @@ impl Bus {
             _ if tc_module(addr).is_some() => {
                 let module = tc_module(addr).unwrap();
                 self.tc[module].write(addr - TC_BASES[module], size, value)
+            }
+            _ if twihs_index(addr).is_some() => {
+                let index = twihs_index(addr).unwrap();
+                self.twihs[index].write(addr - TWIHS_BASES[index], size, value)
             }
             // Writing 1 acts and writing 0 does nothing, so a narrow write
             // only needs its bits moved to their place in the register.
@@ -1403,5 +1443,77 @@ mod tests {
         bus.tick(100);
         bus.tick(23);
         assert_eq!(bus.read32(DWT_CYCCNT), 123);
+    }
+
+    /// A 16-byte I2C memory at address 0x57 holding 0xA0, 0xA1, ...
+    fn test_memory() -> Box<dyn I2cDevice> {
+        let mut memory = crate::i2c::I2cMemory::new(0x57, 16);
+        for (i, byte) in memory.data_mut().iter_mut().enumerate() {
+            *byte = 0xA0 + i as u8;
+        }
+        Box::new(memory)
+    }
+
+    /// Read one register of the device at 0x57 through the controller
+    /// at `base`, as firmware would. `None` if nothing answered.
+    fn i2c_read_register(bus: &mut Bus, base: u32, register: u32) -> Option<u8> {
+        bus.write32(base, 1 << 2); // TWIHS_CR: MSEN
+        bus.write32(base + 0x04, (0x57 << 16) | (1 << 12) | (1 << 8)); // TWIHS_MMR
+        bus.write32(base + 0x0C, register); // TWIHS_IADR
+        bus.write32(base, 0b11); // TWIHS_CR: START | STOP
+        if bus.read32(base + 0x20) & (1 << 8) != 0 {
+            return None; // TWIHS_SR: NACK
+        }
+        Some(bus.read32(base + 0x30) as u8) // TWIHS_RHR
+    }
+
+    #[test]
+    fn firmware_can_read_an_i2c_device_through_twihs0() {
+        let mut bus = Bus::new();
+        bus.attach_i2c_device(0, test_memory());
+        assert_eq!(i2c_read_register(&mut bus, TWIHS_BASES[0], 3), Some(0xA3));
+    }
+
+    #[test]
+    fn each_i2c_controller_has_its_own_address_and_its_own_bus() {
+        for attached in 0..3 {
+            let mut bus = Bus::new();
+            bus.attach_i2c_device(attached, test_memory());
+            for (index, &base) in TWIHS_BASES.iter().enumerate() {
+                let expected = if index == attached { Some(0xA0) } else { None };
+                assert_eq!(
+                    i2c_read_register(&mut bus, base, 0),
+                    expected,
+                    "device on TWIHS{}, read through TWIHS{}",
+                    attached,
+                    index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn i2c_controller_with_nothing_attached_reports_no_answer() {
+        let mut bus = Bus::new();
+        assert_eq!(i2c_read_register(&mut bus, TWIHS_BASES[1], 0), None);
+    }
+
+    #[test]
+    fn each_i2c_controller_raises_its_own_irq() {
+        for (index, &irq) in IRQ_TWIHS.iter().enumerate() {
+            let mut bus = Bus::new();
+            bus.attach_i2c_device(index, test_memory());
+            let base = TWIHS_BASES[index];
+            bus.write32(base + 0x24, 1 << 1); // TWIHS_IER: RXRDY
+            bus.write32(NVIC_BASE + 4 * (irq / 32), 1 << (irq % 32));
+            assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+
+            bus.write32(base, 1 << 2); // MSEN
+            bus.write32(base + 0x04, (0x57 << 16) | (1 << 12));
+            bus.write32(base, 0b11); // START | STOP: a byte arrives
+            assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + irq));
+            bus.read32(base + 0x30); // reading it withdraws the request
+            assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+        }
     }
 }

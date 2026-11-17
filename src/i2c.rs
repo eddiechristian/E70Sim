@@ -14,7 +14,7 @@
 //!    direction.
 //!
 //! The `I2cDevice` trait is the device's half of that. The controller
-//! (the SAME70's TWIHS peripheral, step 2 of `gyro.md`) picks the device
+//! (the SAME70's TWIHS peripheral, `src/peripheral/twihs.rs`) picks the device
 //! by `address` and then calls `start`, `write` or `read` once per byte,
 //! and `stop`.
 //!
@@ -23,9 +23,6 @@
 //! bytes written go into that register and the ones after it, and bytes
 //! read come from that register onwards. `I2cMemory` below is the
 //! simplest device of that kind.
-
-// Until the TWIHS controller uses these (step 2 of `gyro.md`).
-#![allow(dead_code)]
 
 /// A device on an I2C bus.
 pub trait I2cDevice {
@@ -60,7 +57,8 @@ pub trait I2cDevice {
 /// position goes back to the first.
 ///
 /// It stands in for a real device in tests, and behaves much as a small
-/// EEPROM chip does.
+/// EEPROM chip does. Nothing outside the tests uses it yet.
+#[cfg(test)]
 pub struct I2cMemory {
     address: u8,
     data: Vec<u8>,
@@ -71,6 +69,7 @@ pub struct I2cMemory {
     expecting_register: bool,
 }
 
+#[cfg(test)]
 impl I2cMemory {
     /// A memory of `size` zero bytes at I2C address `address`. `size`
     /// must be from 1 to 256, so that one byte can name any register.
@@ -103,6 +102,7 @@ impl I2cMemory {
     }
 }
 
+#[cfg(test)]
 impl I2cDevice for I2cMemory {
     fn address(&self) -> u8 {
         self.address

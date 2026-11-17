@@ -133,7 +133,7 @@ The detailed plan, with a check of what is already in place and what is missing,
 References: `reference/bno055/BST-BNO055-DS000-18.pdf` (register map chapter 4, I2C protocol section 4.6); TWIHS registers and bitfields from the SVD.
 
 - [x] `I2cDevice` trait in `src/i2c.rs`, working in bytes on the bus: `address()`, `start()`, `write(byte) -> bool`, `read() -> u8`, `stop()`, `tick(cycles)`; with `I2cMemory`, a small test device
-- [ ] TWIHS controller as a `Peripheral` (master mode, polled), holding a list of `I2cDevice`s
+- [x] TWIHS controller as a `Peripheral` (host mode, polled or by interrupt), holding a list of `I2cDevice`s: `src/peripheral/twihs.rs`
 
   | Instance | Base | IRQ |
   |---|---|---|

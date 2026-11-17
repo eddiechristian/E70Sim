@@ -13,6 +13,7 @@ pub mod scb;
 pub mod supc;
 pub mod systick;
 pub mod tc;
+pub mod twihs;
 pub mod uart;
 pub mod wdt;
 

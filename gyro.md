@@ -156,11 +156,11 @@ Each step can be tested before the next begins.
 | # | Step | Test |
 |---|---|---|
 | 1 ✅ | `I2cDevice` trait and a trivial test device (a few bytes of memory): `src/i2c.rs` | Unit tests |
-| 2 | TWIHS, polled, both ways of reading a register, NACK for an absent address. Attach to the bus at all three bases | Unit tests driving the registers as firmware would |
+| 2 ✅ | TWIHS, both ways of reading a register, NACK for an absent address, and its interrupt: `src/peripheral/twihs.rs`. Mapped at all three bases | Unit tests driving the registers as firmware would |
 | 3 | BNO055 with identity, page, mode, reset and status registers, and constant gyro data | Unit tests against datasheet values |
 | 4 | Rust firmware `firmware/gyro-rs/`: set up TWIHS0, read `CHIP_ID`, print it | Prints `A0`. This is the `PLAN.md` "read CHIP_ID and print it" item |
 | 5 | Firmware: switch to a gyro mode, read the three axes in a loop, print them. Add the divide instructions if not already there | Printed values match the motion source. **Milestone 3** |
-| 6 | TWIHS interrupts (IRQ 19), and optionally the sensor's INT pin through a PIO interrupt | An interrupt-driven read gives the same values |
+| 6 | Firmware that reads through the TWIHS interrupt (IRQ 19; the controller side was done in step 2), and optionally the sensor's INT pin through a PIO interrupt | An interrupt-driven read gives the same values |
 | 7 | Motion pattern, then motion from a file | Readings follow the pattern over time |
 | 8 | Sensor timing behind a switch; transfer time taken from `TWIHS_CWGR` | A driver without the delays fails with the switch on |
 
