@@ -1,0 +1,17 @@
+[package]
+name = "float-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cortex-m-rt = "0.7" # vector table and startup code; turns the FPU on
+panic-halt = "1"    # on panic, loop forever
+
+[profile.release]
+opt-level = "s"   # small code: fewer distinct instructions for the emulator
+lto = true
+codegen-units = 1
+debug = true      # keep symbols in the ELF for disassembly; not in the .bin
+
+# This is a separate project from the emulator in the repo root.
+[workspace]

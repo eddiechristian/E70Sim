@@ -52,7 +52,9 @@ const CSSELR: u32 = 0x84; // Cache Size Selection
 const MPU_TYPE: u32 = 0x90; // MPU Type (read-only)
 const STIR: u32 = 0x200; // Software Triggered Interrupt (write-only)
 const MVFR0: u32 = 0x240; // Media and VFP Feature 0-2 (read-only)
+const MVFR1: u32 = 0x244;
 const MVFR2: u32 = 0x248;
+const FPCCR: u32 = 0x234; // FP Context Control
 const ICIALLU: u32 = 0x250; // first cache maintenance register (write-only)
 const BPIALL: u32 = 0x278; // last cache maintenance register (write-only)
 
@@ -64,6 +66,16 @@ const CPUID_VALUE: u32 = 0x411F_C271; // Arm Cortex-M7 r1p1
 const CLIDR_VALUE: u32 = 0x0900_0003; // level 1 instruction and data caches
 const CTR_VALUE: u32 = 0x8303_C003; // 32-byte cache lines
 const MPU_TYPE_VALUE: u32 = 0x0000_1000; // 16 MPU regions
+
+// What the FPU can do: FPv5 with 16 double-precision registers, single
+// and double precision, divide, square root and fused multiply-add.
+const MVFR0_VALUE: u32 = 0x1011_0221;
+const MVFR1_VALUE: u32 = 0x1200_0011;
+const MVFR2_VALUE: u32 = 0x0000_0040;
+
+/// FPCCR after reset: ASPEN and LSPEN set, so FPU use is tracked and the
+/// FPU registers are saved lazily on exception entry.
+const FPCCR_RESET: u32 = 0xC000_0000;
 
 // CCSIDR for each cache: 16 KB, 32-byte lines. The fields are
 // (number of sets - 1) << 13, (ways - 1) << 3 and log2(line bytes) - 4.
@@ -103,6 +115,7 @@ impl ScbStub {
             regs: [0; (BLOCK_SIZE / 4) as usize],
         };
         scb.set(CCR, CCR_ALWAYS_SET);
+        scb.set(FPCCR, FPCCR_RESET);
         scb
     }
 
@@ -164,9 +177,9 @@ impl ScbStub {
                 }
             }
             MPU_TYPE => MPU_TYPE_VALUE,
-            // The FPU is not emulated yet, so the feature registers
-            // report that there is none.
-            MVFR0..=MVFR2 => 0,
+            MVFR0 => MVFR0_VALUE,
+            MVFR1 => MVFR1_VALUE,
+            MVFR2 => MVFR2_VALUE,
             // Write-only registers read as 0.
             STIR | ICIALLU..=BPIALL => 0,
             _ => self.get(offset),

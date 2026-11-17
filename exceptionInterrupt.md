@@ -267,6 +267,7 @@ A fault is an exception caused by the program doing something wrong (ARM manual 
 | Executes `udf`, the "permanently undefined" instruction. Compilers emit it to stop on a failed check | UsageFault | UNDEFINSTR |
 | Branches to an address without bit 0 set (the Thumb bit), or has a vector table entry without it | UsageFault | INVSTATE |
 | Returns from an exception with a bad `EXC_RETURN` value, or one for the wrong mode | UsageFault | INVPC |
+| Executes an FPU instruction before switching the FPU on in `CPACR` | UsageFault | NOCP |
 | Runs off into an address where there is no memory | BusFault | IBUSERR |
 | Runs off into the peripheral or system area (`0x4000_0000` and up) | MemManage | IACCVIOL |
 | Reads or writes an unmapped address, **only with `--bus-faults`** | BusFault | PRECISERR |
@@ -402,8 +403,18 @@ Each step can be tested before the next one starts.
 5. **Faults.** HardFault with the state dump.
 6. **MSP / PSP.** Only matters once firmware uses the process stack, which mostly means an operating system.
 
+## The FPU and the exception frame
+
+Code that has used the FPU has more registers worth saving. The processor tracks this in `CONTROL` bit 2 (FPCA), which it sets the first time a context executes an FPU instruction.
+
+When an exception interrupts such code, the frame is an **extended** one: the usual 8 words, then room for S0–S15 and FPSCR, 26 words (`0x68` bytes) in all. `EXC_RETURN` records it with bit 4 clear, so the three values become `0xFFFF_FFE1`, `0xFFFF_FFE9` and `0xFFFF_FFED`.
+
+By default the FPU registers are saved **lazily**: entry only reserves the space and notes its address in `FPCAR` (`0xE000_EF38`), setting LSPACT in `FPCCR` (`0xE000_EF34`). They are written there only if the handler executes an FPU instruction itself. Most handlers never do, which makes their entry 17 memory writes cheaper. On return, the registers are read back only if they were actually saved.
+
+`firmware/float-rs/` tests this: its SysTick handler does floating-point arithmetic while the main code is in the middle of its own.
+
 ## Left out on purpose
 
 - **Tail-chaining and late arrival.** Real hardware skips the pop-then-push when one handler ends and another is waiting. The result is the same as returning and immediately re-entering, so the emulator can do it the simple way.
-- **The FPU's extended frame.** With the FPU on, entry pushes 26 words instead of 8 and `EXC_RETURN` has other values (`0xFFFF_FFE1` and so on). That belongs with the FPU in Phase 5.
+- **Fault-readiness bits for the lazy FPU save.** The extended frame itself is implemented (see below), but `FPCCR`'s MMRDY, BFRDY and MONRDY bits are not.
 - **MPU faults.** MemManage only matters once the MPU is emulated.

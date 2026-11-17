@@ -90,6 +90,8 @@ impl Cpu {
         // MOV (register), encoding T1: 01000110 D Rm Rd  (A7.7.77)
         } else if instr >> 8 == 0b01000110 {
             self.mov_register(instr, pc)
+        } else if let Some(cycles) = self.execute16_more(instr, pc, bus) {
+            cycles
         } else {
             panic!(
                 "unhandled instruction at {:#010X}: {:#06X} = {:016b}",

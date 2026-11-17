@@ -53,8 +53,10 @@ fn it_advance(it_state: u8) -> u8 {
     }
 }
 
+mod data;
 mod exception;
 mod fault;
+mod fpu;
 mod system;
 mod thumb16;
 mod thumb32;
@@ -75,6 +77,11 @@ pub struct Cpu {
     /// `fault.rs`). `step` raises it once the instruction has finished.
     fault: Option<fault::Fault>,
     regs: [u32; 16],
+    /// The FPU's registers S0-S31. D0-D15 are pairs of them (see
+    /// `fpu.rs`).
+    fp: [u32; 32],
+    /// The FPU's status and control register.
+    fpscr: u32,
     xpsr: u32,
     msp: u32,
     psp: u32,
@@ -111,6 +118,8 @@ impl Cpu {
             in_it_block: false,
             fault: None,
             regs: [0; 16],
+            fp: [0; 32],
+            fpscr: 0,
             xpsr: 0,
             msp: 0,
             psp: 0,

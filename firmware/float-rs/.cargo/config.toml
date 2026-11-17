@@ -1,0 +1,8 @@
+[build]
+target = "thumbv7em-none-eabihf" # Cortex-M7, hard-float ("hf"): uses the FPU
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",     # link.x comes from cortex-m-rt
+    "-C", "target-cpu=cortex-m7",  # allow double precision, not only single
+]

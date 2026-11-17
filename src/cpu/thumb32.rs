@@ -28,8 +28,12 @@ impl Cpu {
     }
 
     pub(super) fn execute32(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
+        // FPU instructions: 111x 11xx ... | .... 101x ...., which is the
+        // coprocessor instruction space with coprocessor 10 or 11 (A6).
+        if hw1 & 0xEC00 == 0xEC00 && hw2 & 0x0E00 == 0x0A00 {
+            self.execute_fp(hw1, hw2, pc, bus)
         // BL, encoding T1: 11110 S imm10 | 11 J1 1 J2 imm11  (A7.7.18)
-        if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
+        } else if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
             self.bl(hw1, hw2, pc)
         // UDF, encoding T2: 111101111111 imm4 | 1010 imm12  (A7.7.194)
         } else if hw1 & 0xFFF0 == 0xF7F0 && hw2 & 0xF000 == 0xA000 {
@@ -82,6 +86,8 @@ impl Cpu {
         // Rn = 1111 is not a valid STR, so it is left to the panic below.
         } else if hw1 & 0xFFF0 == 0xF8C0 && hw1 & 0xF != 0xF {
             self.str_immediate_wide(hw1, hw2, pc, bus)
+        } else if let Some(cycles) = self.execute32_more(hw1, hw2, pc, bus) {
+            cycles
         } else {
             panic!(
                 "unhandled 32-bit instruction at {:#010X}: {:#06X} {:#06X} = {:016b} {:016b}",

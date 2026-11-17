@@ -17,6 +17,7 @@
 //! which is which, and `select_stack` swaps them.
 
 use super::fault::Fault;
+use super::fpu::{FPCAR, FPCCR, FPCCR_HFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_THREAD, FPCCR_USER};
 use super::{CYCLES_EXCEPTION_RETURN, CYCLES_REFILL, Cpu, LR, PC, SP, XPSR_IT};
 use crate::bus::Bus;
 
@@ -47,12 +48,23 @@ const XPSR_T: u32 = 1 << 24; // Thumb state, always 1 on a Cortex-M
 // CONTROL bit 1 (SPSEL): 1 = Thread mode uses the process stack.
 pub(super) const CONTROL_SPSEL: u8 = 1 << 1;
 
+// CONTROL bit 2 (FPCA): the running code has used the FPU, so an
+// exception must make room to save the FPU registers too.
+pub(super) const CONTROL_FPCA: u8 = 1 << 2;
+
+// Size of the extended frame, used when the interrupted code had used
+// the FPU: the 8 words above, then S0-S15, FPSCR and one unused word.
+const FRAME_SIZE_FP: u32 = 0x68;
+const FRAME_S0: u32 = 0x20;
+const FRAME_FPSCR: u32 = 0x60;
+
 // EXC_RETURN values: what the handler's LR holds, and what it loads into
-// the PC to return. The values with bit 4 clear, used when the FPU has
-// saved state as well, are not supported.
+// the PC to return. Each also has a form with bit 4 clear (0xFFFF_FFE1,
+// E9, ED), which means the frame is an extended one.
 const EXC_RETURN_HANDLER: u32 = 0xFFFF_FFF1; // back to another handler, main stack
 const EXC_RETURN_THREAD_MSP: u32 = 0xFFFF_FFF9; // back to Thread mode, main stack
 const EXC_RETURN_THREAD_PSP: u32 = 0xFFFF_FFFD; // back to Thread mode, process stack
+const EXC_RETURN_NO_FP: u32 = 1 << 4; // the frame is the basic 8 words
 
 impl Cpu {
     /// True while an exception handler is running. The processor is in
@@ -89,8 +101,12 @@ impl Cpu {
         // 1. Push the frame onto the stack in use. The frame is aligned to
         //    8 bytes; if that took 4 bytes of padding, bit 9 of the saved
         //    xPSR records it so the return can undo it.
+        //    If the interrupted code has used the FPU, the frame also has
+        //    room for the FPU registers the handler is free to change.
+        let with_fp = self.control & CONTROL_FPCA != 0;
+        let frame_size = if with_fp { FRAME_SIZE_FP } else { FRAME_SIZE };
         let padded = self.regs[SP] & 4 != 0;
-        let frame = self.regs[SP].wrapping_sub(FRAME_SIZE) & !4;
+        let frame = self.regs[SP].wrapping_sub(frame_size) & !4;
         let saved_xpsr = if padded {
             self.xpsr | XPSR_STACK_ALIGN
         } else {
@@ -105,6 +121,35 @@ impl Cpu {
         bus.write32(frame + FRAME_RETURN_ADDRESS, return_address);
         bus.write32(frame + FRAME_XPSR, saved_xpsr);
         self.regs[SP] = frame;
+        if with_fp {
+            let fpccr = bus.read32(FPCCR);
+            if fpccr & FPCCR_LSPEN == 0 {
+                // Save the FPU registers now.
+                for i in 0..16 {
+                    bus.write32(frame + FRAME_S0 + 4 * i, self.fp[i as usize]);
+                }
+                bus.write32(frame + FRAME_FPSCR, self.fpscr);
+            } else {
+                // Lazy save (the default): only note where they belong.
+                // They are written there if and when the handler uses
+                // the FPU itself (`preserve_fp_state` in fpu.rs). Most
+                // handlers never do, which saves 17 memory writes
+                // (UpdateFPCCR, B1.5.6).
+                let mut flags = FPCCR_LSPACT;
+                if !self.is_privileged() {
+                    flags |= FPCCR_USER;
+                }
+                if !self.in_handler_mode() {
+                    flags |= FPCCR_THREAD;
+                }
+                if self.execution_priority(bus, true) > -1 {
+                    flags |= FPCCR_HFRDY;
+                }
+                let kept = fpccr & !(FPCCR_LSPACT | FPCCR_USER | FPCCR_THREAD | FPCCR_HFRDY);
+                bus.write32(FPCCR, kept | flags);
+                bus.write32(FPCAR, frame + FRAME_S0);
+            }
+        }
 
         // 2. LR tells the handler's return how to get back: to which mode
         //    and onto which stack.
@@ -115,6 +160,11 @@ impl Cpu {
         } else {
             EXC_RETURN_THREAD_MSP
         };
+        if with_fp {
+            self.regs[LR] &= !EXC_RETURN_NO_FP;
+        }
+        // The handler starts as code that has not used the FPU.
+        self.control &= !CONTROL_FPCA;
 
         // 3. Handlers always run on the main stack, in Handler mode, with
         //    the exception number in IPSR.
@@ -176,16 +226,12 @@ impl Cpu {
         // 0. Check that the return can be carried out, before changing
         //    anything. If not, it is a UsageFault (INVPC), raised by
         //    `step` against the returning instruction.
+        //    Bit 4 only says which kind of frame it is.
+        let with_fp = exc_return & EXC_RETURN_NO_FP == 0;
+        let exc_return = exc_return | EXC_RETURN_NO_FP;
         let frame = match exc_return {
             EXC_RETURN_HANDLER | EXC_RETURN_THREAD_MSP => self.main_sp(),
             EXC_RETURN_THREAD_PSP => self.process_sp(),
-            // The forms with bit 4 clear are for a frame that includes
-            // FPU registers. That is a gap in the emulator, not a bug in
-            // the firmware, so it stops instead of faulting.
-            0xFFFF_FFE1 | 0xFFFF_FFE9 | 0xFFFF_FFED => panic!(
-                "instruction at {:#010X} returned from exception {} with unsupported EXC_RETURN {:#010X}",
-                pc, returning, exc_return
-            ),
             _ => {
                 self.fault = Some(Fault::InvalidPcLoad);
                 return;
@@ -220,8 +266,28 @@ impl Cpu {
         self.regs[PC] = bus.read32(frame + FRAME_RETURN_ADDRESS) & !1;
         let saved_xpsr = bus.read32(frame + FRAME_XPSR);
 
+        //    An extended frame also gives back the FPU registers, unless
+        //    they were never saved because the handler left them alone.
+        if with_fp {
+            let fpccr = bus.read32(FPCCR);
+            if fpccr & FPCCR_LSPACT != 0 {
+                bus.write32(FPCCR, fpccr & !FPCCR_LSPACT);
+            } else {
+                for i in 0..16 {
+                    self.fp[i as usize] = bus.read32(frame + FRAME_S0 + 4 * i);
+                }
+                self.fpscr = bus.read32(frame + FRAME_FPSCR);
+            }
+            // The resumed code is "FPU-using" exactly if its frame was
+            // an extended one.
+            self.control |= CONTROL_FPCA;
+        } else {
+            self.control &= !CONTROL_FPCA;
+        }
+
         // 3. Remove the frame, and the padding if entry added any.
-        self.regs[SP] = frame.wrapping_add(FRAME_SIZE);
+        let frame_size = if with_fp { FRAME_SIZE_FP } else { FRAME_SIZE };
+        self.regs[SP] = frame.wrapping_add(frame_size);
         if saved_xpsr & XPSR_STACK_ALIGN != 0 {
             self.regs[SP] |= 4;
         }
@@ -676,14 +742,116 @@ mod tests {
         assert_eq!(cpu.regs[SP], STACK_TOP);
     }
 
+    const CPACR: u32 = 0xE000_ED88;
+    const FPCCR_ADDR: u32 = 0xE000_EF34;
+    const FPCAR_ADDR: u32 = 0xE000_EF38;
+    const FPDSCR_ADDR: u32 = 0xE000_EF3C;
+
+    /// Main: vmov.f32 s0, #1.0 ; b .
+    /// SysTick handler: `handler_code`. The FPU is switched on.
+    fn cpu_using_the_fpu(handler_code: &[u16]) -> (Cpu, Bus) {
+        let (mut cpu, mut bus) =
+            cpu_with_handler(&[0xEEB7, 0x0A00, 0xE7FE], handler_code, &[SYSTICK]);
+        bus.write32(CPACR, 0xF << 20);
+        cpu.step(&mut bus); // vmov.f32 s0, #1.0
+        (cpu, bus)
+    }
+
     #[test]
-    #[should_panic(expected = "unsupported EXC_RETURN 0xFFFFFFE9")]
-    fn fpu_exc_return_values_are_rejected() {
-        // Handler: bx lr, with LR changed to the FPU form of EXC_RETURN.
-        let (mut cpu, mut bus) = cpu_with_handler(&[], &[0x4770], &[SYSTICK]);
+    fn code_that_has_not_used_the_fpu_gets_the_basic_frame() {
+        let (mut cpu, mut bus) = cpu_with_handler(&[0xE7FE], &[0x4770], &[SYSTICK]);
+        bus.write32(CPACR, 0xF << 20); // enabled, but never used
         cpu.exception_entry(SYSTICK, &mut bus);
-        cpu.regs[LR] = 0xFFFF_FFE9;
+        assert_eq!(cpu.regs[SP], STACK_TOP - 0x20);
+        assert_eq!(cpu.regs[LR], 0xFFFF_FFF9);
+    }
+
+    #[test]
+    fn code_that_has_used_the_fpu_gets_the_extended_frame() {
+        // Handler: bx lr
+        let (mut cpu, mut bus) = cpu_using_the_fpu(&[0x4770]);
+        assert_eq!(cpu.control & CONTROL_FPCA, CONTROL_FPCA);
+        cpu.exception_entry(SYSTICK, &mut bus);
+        assert_eq!(cpu.regs[SP], STACK_TOP - 0x68);
+        assert_eq!(cpu.regs[LR], 0xFFFF_FFE9); // bit 4 clear: extended
+        assert_eq!(cpu.control & CONTROL_FPCA, 0); // the handler starts clean
+        // Lazy save: the space is reserved and its address noted, but
+        // nothing has been written there.
+        assert_ne!(bus.read32(FPCCR_ADDR) & 1, 0); // LSPACT
+        assert_eq!(bus.read32(FPCAR_ADDR), STACK_TOP - 0x68 + 0x20);
+        assert_eq!(bus.read32(STACK_TOP - 0x68 + 0x20), 0);
+
+        cpu.step(&mut bus); // bx lr: everything is back
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[SP], STACK_TOP);
+        assert_eq!(cpu.control & CONTROL_FPCA, CONTROL_FPCA);
+        assert_eq!(cpu.fp[0], 1.0f32.to_bits());
+        assert_eq!(bus.read32(FPCCR_ADDR) & 1, 0);
+    }
+
+    #[test]
+    fn handler_that_uses_the_fpu_triggers_the_lazy_save() {
+        // Handler: vmov.f32 s0, #-2.5 ; bx lr
+        let (mut cpu, mut bus) = cpu_using_the_fpu(&[0xEEB8, 0x0A04, 0x4770]);
+        cpu.fpscr = 0x2000_0000; // a flag the main code has set
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // entry, then the handler's vmov
+        // The main code's S0 and FPSCR were written to the frame just
+        // before the handler changed S0.
+        let frame = STACK_TOP - 0x68;
+        assert_eq!(bus.read32(frame + 0x20), 1.0f32.to_bits());
+        assert_eq!(bus.read32(frame + 0x60), 0x2000_0000);
+        assert_eq!(bus.read32(FPCCR_ADDR) & 1, 0); // save done
+        assert_eq!(cpu.fp[0], (-2.5f32).to_bits());
+        // The handler is now an FPU-using context itself.
+        assert_eq!(cpu.control & CONTROL_FPCA, CONTROL_FPCA);
+
+        cpu.step(&mut bus); // bx lr: the main code's values come back
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.fp[0], 1.0f32.to_bits());
+        assert_eq!(cpu.fpscr, 0x2000_0000);
+        assert_eq!(cpu.regs[SP], STACK_TOP);
+    }
+
+    #[test]
+    fn handler_starts_with_the_default_fpscr_mode_bits() {
+        // Handler: vmov.f32 s0, #-2.5 ; bx lr
+        let (mut cpu, mut bus) = cpu_using_the_fpu(&[0xEEB8, 0x0A04, 0x4770]);
+        cpu.fpscr = 3 << 22; // main code rounds toward zero
+        bus.write32(FPDSCR_ADDR, 1 << 22); // default for new contexts
+        bus.pend_exception(SYSTICK);
         cpu.step(&mut bus);
+        assert_eq!(cpu.fpscr & (3 << 22), 1 << 22);
+        cpu.step(&mut bus); // bx lr
+        assert_eq!(cpu.fpscr, 3 << 22);
+    }
+
+    #[test]
+    fn with_lazy_saving_off_the_registers_are_saved_at_entry() {
+        let (mut cpu, mut bus) = cpu_using_the_fpu(&[0x4770]);
+        bus.write32(FPCCR_ADDR, 1 << 31); // ASPEN only, LSPEN off
+        cpu.fp[15] = 0x1234_5678;
+        cpu.exception_entry(SYSTICK, &mut bus);
+        let frame = STACK_TOP - 0x68;
+        assert_eq!(bus.read32(frame + 0x20), 1.0f32.to_bits());
+        assert_eq!(bus.read32(frame + 0x20 + 4 * 15), 0x1234_5678);
+        assert_eq!(bus.read32(FPCCR_ADDR) & 1, 0);
+
+        cpu.fp[0] = 0;
+        cpu.fp[15] = 0;
+        cpu.step(&mut bus); // bx lr
+        assert_eq!(cpu.fp[0], 1.0f32.to_bits());
+        assert_eq!(cpu.fp[15], 0x1234_5678);
+    }
+
+    #[test]
+    fn extended_frame_is_aligned_like_the_basic_one() {
+        let (mut cpu, mut bus) = cpu_using_the_fpu(&[0x4770]);
+        cpu.regs[SP] = STACK_TOP - 4;
+        cpu.exception_entry(SYSTICK, &mut bus);
+        assert_eq!(cpu.regs[SP], STACK_TOP - 8 - 0x68);
+        cpu.step(&mut bus); // bx lr
+        assert_eq!(cpu.regs[SP], STACK_TOP - 4);
     }
 
     #[test]

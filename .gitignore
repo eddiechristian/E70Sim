@@ -4,5 +4,6 @@
 /firmware/*.o
 /firmware/*.elf
 
-# Rust firmware build output (hello-rs.bin is kept: the emulator loads it)
+# Rust firmware build output (the .bin files are kept: the emulator loads them)
 /firmware/hello-rs/target
+/firmware/float-rs/target

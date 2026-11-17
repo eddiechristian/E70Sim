@@ -15,7 +15,7 @@
 //! its reads return 0. Code is unprivileged only in Thread mode with
 //! CONTROL bit 0 set, which an operating system does for its tasks.
 
-use super::exception::CONTROL_SPSEL;
+use super::exception::{CONTROL_FPCA, CONTROL_SPSEL};
 use super::{CYCLES_DATA, Cpu, SP};
 use crate::bus::Bus;
 
@@ -48,7 +48,7 @@ const CYCLES_SPECIAL_REGISTER: u32 = 2;
 impl Cpu {
     /// Handlers are always privileged; Thread mode is unless CONTROL says
     /// otherwise.
-    fn is_privileged(&self) -> bool {
+    pub(super) fn is_privileged(&self) -> bool {
         self.in_handler_mode() || self.control & CONTROL_NPRIV == 0
     }
 
@@ -133,8 +133,7 @@ impl Cpu {
             SYSM_PRIMASK => self.primask as u32,
             SYSM_BASEPRI | SYSM_BASEPRI_MAX => self.basepri as u32,
             SYSM_FAULTMASK => self.faultmask as u32,
-            // Bit 2 (FPCA) belongs to the FPU, which is not emulated.
-            SYSM_CONTROL => (self.control & (CONTROL_NPRIV | CONTROL_SPSEL)) as u32,
+            SYSM_CONTROL => self.control as u32,
             _ => panic!("MRS from unknown special register {} at {:#010X}", sysm, pc),
         };
         self.regs[d] = value;
@@ -201,7 +200,9 @@ impl Cpu {
                 }
             }
             SYSM_CONTROL => {
-                self.control = (self.control & !CONTROL_NPRIV) | (value as u8 & CONTROL_NPRIV);
+                // nPRIV, and FPCA ("this context has used the FPU").
+                let writable = CONTROL_NPRIV | CONTROL_FPCA;
+                self.control = (self.control & !writable) | (value as u8 & writable);
                 // The stack can only be chosen in Thread mode; handlers
                 // always use the main stack.
                 if !self.in_handler_mode() {

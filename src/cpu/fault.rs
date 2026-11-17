@@ -8,6 +8,7 @@
 //! | Undefined instruction (`udf`) | UsageFault | UNDEFINSTR |
 //! | Executing with the Thumb bit clear | UsageFault | INVSTATE |
 //! | Bad exception return | UsageFault | INVPC |
+//! | FPU instruction with the FPU switched off | UsageFault | NOCP |
 //! | Executing from an address with no memory | BusFault | IBUSERR |
 //! | Data access to an unmapped address (only with `--bus-faults`) | BusFault | PRECISERR |
 //! | Executing from a peripheral or system address | MemManage | IACCVIOL |
@@ -38,6 +39,8 @@ pub(super) enum Fault {
     InvalidState,
     /// An exception return that cannot be carried out.
     InvalidPcLoad,
+    /// An FPU instruction while the FPU is switched off in CPACR.
+    NoCoprocessor,
     /// The PC points where there is no memory at all.
     InstructionBusError,
     /// A load or store to an address where nothing is mapped.
@@ -61,6 +64,7 @@ const CFSR_BFARVALID: u32 = 1 << 15; // BFAR holds the address
 const CFSR_UNDEFINSTR: u32 = 1 << 16;
 const CFSR_INVSTATE: u32 = 1 << 17;
 const CFSR_INVPC: u32 = 1 << 18;
+const CFSR_NOCP: u32 = 1 << 19;
 
 /// HFSR bit 30: a fault that could not use its own exception became this
 /// HardFault.
@@ -70,7 +74,10 @@ impl Fault {
     /// The exception this fault uses when that exception is enabled.
     fn exception(self) -> u32 {
         match self {
-            Fault::UndefinedInstruction | Fault::InvalidState | Fault::InvalidPcLoad => USAGE_FAULT,
+            Fault::UndefinedInstruction
+            | Fault::InvalidState
+            | Fault::InvalidPcLoad
+            | Fault::NoCoprocessor => USAGE_FAULT,
             Fault::InstructionBusError | Fault::DataBusError { .. } => BUS_FAULT,
             Fault::ExecuteNever => MEM_MANAGE,
         }
@@ -82,6 +89,7 @@ impl Fault {
             Fault::UndefinedInstruction => CFSR_UNDEFINSTR,
             Fault::InvalidState => CFSR_INVSTATE,
             Fault::InvalidPcLoad => CFSR_INVPC,
+            Fault::NoCoprocessor => CFSR_NOCP,
             Fault::InstructionBusError => CFSR_IBUSERR,
             Fault::DataBusError { .. } => CFSR_PRECISERR | CFSR_BFARVALID,
             Fault::ExecuteNever => CFSR_IACCVIOL,
@@ -98,6 +106,9 @@ impl Fault {
                  address without bit 0 set was loaded into the PC (CFSR.INVSTATE)"
                 .to_string(),
             Fault::InvalidPcLoad => "UsageFault: invalid exception return (CFSR.INVPC)".to_string(),
+            Fault::NoCoprocessor => "UsageFault: FPU instruction while the FPU is switched off; \
+                 firmware must set CPACR bits 20-23 first (CFSR.NOCP)"
+                .to_string(),
             Fault::InstructionBusError => {
                 "BusFault: no memory at the address being executed (CFSR.IBUSERR)".to_string()
             }

@@ -322,6 +322,57 @@ So only step 5 is needed for UART output in the emulator, plus RXEN from step 4 
 
 When the firmware uses an instruction the CPU core does not implement yet, the emulator stops with an "unhandled instruction" panic that names the next one to add. That is different from a fault, which is the firmware doing something illegal: the emulator then prints a dump and runs the firmware's HardFault handler, which in `hello-rs` is `cortex-m-rt`'s default endless loop.
 
+## The hard-float firmware: `float-rs`
+
+`firmware/float-rs/` is a second firmware, built to use the FPU (the floating-point unit: hardware that does arithmetic on `f32` and `f64` values). It builds to `firmware/float-rs.bin`.
+
+```
+firmware/float-rs/build.sh
+cargo run -- firmware/float-rs.bin
+```
+
+One-time set-up: `rustup target add thumbv7em-none-eabihf`.
+
+### Soft-float and hard-float
+
+| | `hello-rs` | `float-rs` |
+|---|---|---|
+| Target | `thumbv7em-none-eabi` | `thumbv7em-none-eabihf` |
+| Floating-point arithmetic | Done by library code using integer instructions | Done by FPU instructions (`vadd`, `vmul`, ...) |
+| Floating-point arguments | Passed in R0–R3 | Passed in S0–S15 / D0–D7 |
+
+`.cargo/config.toml` also sets `-C target-cpu=cortex-m7`. Without it the target assumes an FPU with single precision only, and `f64` arithmetic would still be done in software.
+
+### Turning the FPU on
+
+The FPU is off after reset, and any FPU instruction is then a UsageFault. Firmware switches it on by setting bits 20–23 of `CPACR` (`0xE000_ED88`). On a hard-float target `cortex-m-rt`'s startup code does this before `main` runs, so `float-rs` has no code for it.
+
+### What it does
+
+1. Prints the results of `f32` and `f64` arithmetic, conversions between the two and to and from integers, and comparisons. Each result is printed as the hex bit pattern of the value, because printing a decimal number needs far more code. `core::hint::black_box` hides the inputs from the compiler; otherwise it would work the answers out at build time and no FPU instruction would run.
+2. Starts SysTick with a short period and a handler that does floating-point arithmetic of its own. Meanwhile the main code repeats one calculation and checks that the answer never changes. This tests that the FPU registers are saved and restored around the handler (see "The FPU and the exception frame" in `exceptionInterrupt.md`).
+
+Expected output:
+
+```
+FPU test
+f32 add = 40700000
+...
+ticks = 000000C8
+handler total = 42C80000
+rounds > 0 = 00000001
+mismatches = 00000000
+done
+```
+
+`40700000` is the bit pattern of 3.75 (1.5 + 2.25). `mismatches = 00000000` is the line that matters in the second half. The whole output matches, bit for bit, the same program run natively on the host.
+
+### What the emulator does
+
+The FPU is in `src/cpu/fpu.rs`. The arithmetic is done with the host's own `f32` and `f64`, which follow the same standard (IEEE 754) as the chip's FPU. The file's header lists the differences: arithmetic always rounds to nearest, the exception flags in `FPSCR` are never set, and a few special modes are ignored.
+
+Building this firmware also needed several dozen ordinary integer instructions that `hello-rs` never used. They are in `src/cpu/data.rs`.
+
 ## To verify
 
 These are from memory, not from a document in the repo:
@@ -329,3 +380,5 @@ These are from memory, not from a document in the repo:
 - UART0 on PA9 / PA10, peripheral function A (SAME70 datasheet, pin multiplexing table)
 - 12 MHz internal oscillator as the clock at reset (SAME70 datasheet, PMC chapter)
 - The order in which `cortex-m-rt` prepares `.bss` and `.data` (check the version actually used)
+- That the SAME70's FPU has double precision. The emulator reports and implements it (`MVFR0` = `0x10110221`), but the SVD's reset value for `MVFR0` (`0x10110021`) describes a single-precision FPU (SAME70 datasheet, processor features)
+- The cycle costs of FPU instructions (Cortex-M7 documentation)
