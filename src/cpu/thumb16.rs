@@ -1,66 +1,67 @@
 //! 16-bit Thumb instructions.
 //!
 //! `execute16` decodes one halfword and calls the method for that
-//! instruction. Section numbers (A7.7.x) refer to the ARMv7-M Architecture
+//! instruction. Every method returns the number of clock cycles the
+//! instruction takes (see the `CYCLES_` constants in `cpu.rs`). Section numbers (A7.7.x) refer to the ARMv7-M Architecture
 //! Reference Manual.
 
-use super::{Cpu, LR, PC, SP};
+use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
 use crate::helpers::{add_with_carry, condition_passed, lsl_c};
 
 impl Cpu {
     /// Decode and execute a 16-bit instruction located at `pc`.
-    pub(super) fn execute16(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+    pub(super) fn execute16(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
         // LDR (literal), encoding T1: 01001 Rt imm8  (A7.7.44)
         if instr >> 11 == 0b01001 {
-            self.ldr_literal(instr, pc, bus);
+            self.ldr_literal(instr, pc, bus)
         // LDRB (immediate), encoding T1: 01111 imm5 Rn Rt  (A7.7.46)
         } else if instr >> 11 == 0b01111 {
-            self.ldrb_immediate(instr, bus);
+            self.ldrb_immediate(instr, bus)
         // ADD (immediate), encoding T2: 00110 Rdn imm8  (A7.7.3)
         } else if instr >> 11 == 0b00110 {
-            self.add_immediate(instr);
+            self.add_immediate(instr)
         // CMP (immediate), encoding T1: 00101 Rn imm8  (A7.7.27)
         } else if instr >> 11 == 0b00101 {
-            self.cmp_immediate(instr);
+            self.cmp_immediate(instr)
         // B<cond>, encoding T1: 1101 cond imm8  (A7.7.12)
         // cond 1110 is UDF and 1111 is SVC, so they are excluded here.
         } else if instr >> 12 == 0b1101 && (instr >> 8) & 0xF < 0b1110 {
-            self.b_conditional(instr, pc);
+            self.b_conditional(instr, pc)
         // LDR (immediate), encoding T1: 01101 imm5 Rn Rt  (A7.7.43)
         } else if instr >> 11 == 0b01101 {
-            self.ldr_immediate(instr, bus);
+            self.ldr_immediate(instr, bus)
         // LSL (immediate), encoding T1: 00000 imm5 Rm Rd  (A7.7.68)
         // imm5 == 0 is MOVS Rd, Rm instead, which is not implemented yet.
         } else if instr >> 11 == 0b00000 && (instr >> 6) & 0x1F != 0 {
-            self.lsl_immediate(instr);
+            self.lsl_immediate(instr)
         // STR (immediate), encoding T1: 01100 imm5 Rn Rt  (A7.7.161)
         } else if instr >> 11 == 0b01100 {
-            self.str_immediate(instr, bus);
+            self.str_immediate(instr, bus)
         // B (unconditional), encoding T2: 11100 imm11  (A7.7.12)
         } else if instr >> 11 == 0b11100 {
-            self.b_unconditional(instr, pc);
+            self.b_unconditional(instr, pc)
         // PUSH, encoding T1: 1011010 M register_list  (A7.7.101)
         } else if instr >> 9 == 0b1011010 {
-            self.push(instr, pc, bus);
+            self.push(instr, pc, bus)
         // STR (register), encoding T1: 0101000 Rm Rn Rt  (A7.7.162)
         } else if instr >> 9 == 0b0101000 {
-            self.str_register(instr, bus);
+            self.str_register(instr, bus)
         // CMP (register), encoding T1: 0100001010 Rm Rn  (A7.7.28)
         } else if instr >> 6 == 0b0100001010 {
-            self.cmp_register(instr);
+            self.cmp_register(instr)
         // MOV (immediate), encoding T1: 00100 Rd imm8  (A7.7.76)
         } else if instr >> 11 == 0b00100 {
-            self.mov_immediate(instr);
+            self.mov_immediate(instr)
         // POP, encoding T1: 1011110 P register_list  (A7.7.99)
         } else if instr >> 9 == 0b1011110 {
-            self.pop(instr, pc, bus);
+            self.pop(instr, pc, bus)
         // BX, encoding T1: 010001110 Rm 000  (A7.7.20)
         } else if instr & 0xFF87 == 0x4700 {
-            self.bx(instr, pc, bus);
+            self.bx(instr, pc, bus)
         // MOV (register), encoding T1: 01000110 D Rm Rd  (A7.7.77)
         } else if instr >> 8 == 0b01000110 {
-            self.mov_register(instr, pc);
+            self.mov_register(instr, pc)
         } else {
             panic!(
                 "unhandled instruction at {:#010X}: {:#06X} = {:016b}",
@@ -71,7 +72,7 @@ impl Cpu {
 
     /// LDR <Rt>, <label> -- load a word from a PC-relative literal pool.
     /// `pc` is the address of this instruction.
-    fn ldr_literal(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+    fn ldr_literal(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
         let t = ((instr >> 8) & 0x7) as usize; // bits 10-8
         let imm32 = ((instr & 0xFF) as u32) << 2; // imm8:'00'
 
@@ -84,10 +85,11 @@ impl Cpu {
             self,
             "  ldr r{}, [pc, #{}]  -> r{} = {:#010X}", t, imm32, t, self.regs[t]
         );
+        CYCLES_MEMORY
     }
 
     /// LDR <Rt>, [<Rn>, #imm] -- load a word from Rn + offset into Rt.
-    fn ldr_immediate(&mut self, instr: u16, bus: &mut Bus) {
+    fn ldr_immediate(&mut self, instr: u16, bus: &mut Bus) -> u32 {
         let imm32 = (((instr >> 6) & 0x1F) as u32) << 2; // bits 10-6, imm5:'00'
         let n = ((instr >> 3) & 0x7) as usize; // bits 5-3, base register
         let t = (instr & 0x7) as usize; // bits 2-0, destination
@@ -99,10 +101,11 @@ impl Cpu {
             self,
             "  ldr r{}, [r{}, #{}]  -> r{} = {:#010X}", t, n, imm32, t, self.regs[t]
         );
+        CYCLES_MEMORY
     }
 
     /// STR <Rt>, [<Rn>, #imm] -- store the word in Rt to Rn + offset.
-    fn str_immediate(&mut self, instr: u16, bus: &mut Bus) {
+    fn str_immediate(&mut self, instr: u16, bus: &mut Bus) -> u32 {
         let imm32 = (((instr >> 6) & 0x1F) as u32) << 2; // bits 10-6, imm5:'00'
         let n = ((instr >> 3) & 0x7) as usize; // bits 5-3, base register
         let t = (instr & 0x7) as usize; // bits 2-0, value to store
@@ -114,12 +117,13 @@ impl Cpu {
             "  str r{}, [r{}, #{}]  -> [{:#010X}] = {:#010X}", t, n, imm32, address, self.regs[t]
         );
         bus.write32(address, self.regs[t]);
+        CYCLES_MEMORY
     }
 
     /// STR <Rt>, [<Rn>, <Rm>] -- store the word in Rt to Rn + Rm. The
     /// offset comes from a register, so it can be any 32-bit value,
     /// including a negative one (the addition wraps round).
-    fn str_register(&mut self, instr: u16, bus: &mut Bus) {
+    fn str_register(&mut self, instr: u16, bus: &mut Bus) -> u32 {
         let m = ((instr >> 6) & 0x7) as usize; // bits 8-6, offset register
         let n = ((instr >> 3) & 0x7) as usize; // bits 5-3, base register
         let t = (instr & 0x7) as usize; // bits 2-0, value to store
@@ -131,11 +135,12 @@ impl Cpu {
             "  str r{}, [r{}, r{}]  -> [{:#010X}] = {:#010X}", t, n, m, address, self.regs[t]
         );
         bus.write32(address, self.regs[t]);
+        CYCLES_MEMORY
     }
 
     /// MOVS <Rd>, #<imm8> -- load a constant from 0 to 255 into R0-R7,
     /// setting N and Z.
-    fn mov_immediate(&mut self, instr: u16) {
+    fn mov_immediate(&mut self, instr: u16) -> u32 {
         let d = ((instr >> 8) & 0x7) as usize; // bits 10-8
         let imm32 = (instr & 0xFF) as u32; // bits 7-0
 
@@ -149,13 +154,14 @@ impl Cpu {
             self,
             "  movs r{}, #{}  -> r{} = {:#010X}", d, imm32, d, imm32
         );
+        CYCLES_DATA
     }
 
     /// BX <Rm> -- branch to the address in a register. `bx lr` is how a
     /// function that saved nothing on the stack returns, and in an
     /// exception handler it is the exception return.
     /// `pc` is the address of this instruction.
-    fn bx(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+    fn bx(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
         let m = ((instr >> 3) & 0xF) as usize; // bits 6-3
         if m == PC {
             // UNPREDICTABLE in the architecture; a compiler never emits it.
@@ -163,13 +169,13 @@ impl Cpu {
         }
         let target = self.regs[m];
         trace!(self, "  bx r{}  -> {:#010X}", m, target);
-        self.bx_write_pc(target, pc, bus);
+        CYCLES_DATA + self.bx_write_pc(target, pc, bus)
     }
 
     /// MOV <Rd>, <Rm> -- copy one register to another. This encoding can
     /// use all 16 registers and never changes the flags.
     /// `pc` is the address of this instruction.
-    fn mov_register(&mut self, instr: u16, pc: u32) {
+    fn mov_register(&mut self, instr: u16, pc: u32) -> u32 {
         // Rd is 4 bits: D (bit 7) is its top bit, bits 2-0 the rest.
         let d = (((instr >> 4) & 0x8) | (instr & 0x7)) as usize;
         let m = ((instr >> 3) & 0xF) as usize; // bits 6-3
@@ -189,11 +195,16 @@ impl Cpu {
             self.regs[d] = value;
         }
         trace!(self, "  mov r{}, r{}  -> r{} = {:#010X}", d, m, d, value);
+        if d == PC {
+            CYCLES_DATA + CYCLES_REFILL
+        } else {
+            CYCLES_DATA
+        }
     }
 
     /// PUSH <registers> -- store registers on the stack and move SP down.
     /// `pc` is the address of this instruction.
-    fn push(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+    fn push(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
         // Bits 7-0 select R7-R0; M (bit 8) selects LR. No other register
         // can be pushed by this encoding.
         let m = ((instr >> 8) & 1) as u32;
@@ -219,12 +230,14 @@ impl Cpu {
             self,
             "  push {{list {:#06X}}}  -> sp = {:#010X}", registers, start
         );
+        // One cycle, plus one per register stored.
+        CYCLES_DATA + registers.count_ones()
     }
 
     /// POP <registers> -- load registers from the stack and move SP up.
     /// With PC in the list this is also how a function returns.
     /// `pc` is the address of this instruction.
-    fn pop(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+    fn pop(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
         // Bits 7-0 select R7-R0; P (bit 8) selects the PC. No other
         // register can be popped by this encoding.
         let p = ((instr >> 8) & 1) as u32;
@@ -257,13 +270,17 @@ impl Cpu {
         // The PC is written last, after SP has moved: in a handler the
         // value may be EXC_RETURN, and the exception return then pops its
         // frame from the updated SP.
-        if let Some(value) = new_pc {
-            self.bx_write_pc(value, pc, bus);
-        }
+        let pc_write = match new_pc {
+            Some(value) => self.bx_write_pc(value, pc, bus),
+            None => 0,
+        };
+        // One cycle, plus one per register loaded, plus the cost of the
+        // branch or exception return if the PC was one of them.
+        CYCLES_DATA + registers.count_ones() + pc_write
     }
 
     /// B <label> -- always branch. `pc` is the address of this instruction.
-    fn b_unconditional(&mut self, instr: u16, pc: u32) {
+    fn b_unconditional(&mut self, instr: u16, pc: u32) -> u32 {
         // imm11:'0', sign-extended from 12 bits.
         let imm11 = (instr & 0x7FF) as u32;
         let imm32 = (((imm11 << 1) << 20) as i32) >> 20;
@@ -272,11 +289,12 @@ impl Cpu {
 
         self.regs[PC] = target;
         trace!(self, "  b {:#010X}", target);
+        CYCLES_DATA + CYCLES_REFILL
     }
 
     /// LDRB <Rt>, [<Rn>, #imm5] -- load one byte from Rn + offset and
     /// zero-extend it into Rt.
-    fn ldrb_immediate(&mut self, instr: u16, bus: &mut Bus) {
+    fn ldrb_immediate(&mut self, instr: u16, bus: &mut Bus) -> u32 {
         let imm32 = ((instr >> 6) & 0x1F) as u32; // bits 10-6, not scaled
         let n = ((instr >> 3) & 0x7) as usize; // bits 5-3, base register
         let t = (instr & 0x7) as usize; // bits 2-0, destination
@@ -288,9 +306,10 @@ impl Cpu {
             self,
             "  ldrb r{}, [r{}, #{}]  -> r{} = {:#04X}", t, n, imm32, t, self.regs[t]
         );
+        CYCLES_MEMORY
     }
 
-    fn add_immediate(&mut self, instr: u16) {
+    fn add_immediate(&mut self, instr: u16) -> u32 {
         let d = ((instr >> 8) & 0x7) as usize; // bits 10-8, Rdn
         let imm32 = (instr & 0xFF) as u32; // bits 7-0
 
@@ -301,11 +320,12 @@ impl Cpu {
             self,
             "  adds r{}, #{}  -> r{} = {:#010X}", d, imm32, d, result
         );
+        CYCLES_DATA
     }
 
     /// B<cond> <label> -- branch if the condition holds.
     /// `pc` is the address of this instruction.
-    fn b_conditional(&mut self, instr: u16, pc: u32) {
+    fn b_conditional(&mut self, instr: u16, pc: u32) -> u32 {
         let cond = (instr >> 8) & 0xF; // bits 11-8
         // imm8:'0', sign-extended: a signed byte offset in halfwords.
         let imm32 = ((instr & 0xFF) as u8 as i8 as i32) << 1;
@@ -323,10 +343,17 @@ impl Cpu {
             target,
             if taken { "taken" } else { "not taken" }
         );
+        // A branch that is not taken costs no more than any other
+        // simple instruction.
+        if taken {
+            CYCLES_DATA + CYCLES_REFILL
+        } else {
+            CYCLES_DATA
+        }
     }
 
     /// LSLS <Rd>, <Rm>, #<imm5> -- shift left, setting N, Z and C.
-    fn lsl_immediate(&mut self, instr: u16) {
+    fn lsl_immediate(&mut self, instr: u16) -> u32 {
         let shift_n = ((instr >> 6) & 0x1F) as u32; // bits 10-6, 1..=31 here
         let m = ((instr >> 3) & 0x7) as usize; // bits 5-3, source
         let d = (instr & 0x7) as usize; // bits 2-0, destination
@@ -341,11 +368,12 @@ impl Cpu {
             self,
             "  lsls r{}, r{}, #{}  -> r{} = {:#010X}", d, m, shift_n, d, result
         );
+        CYCLES_DATA
     }
 
     /// CMP <Rn>, <Rm> -- subtract Rm from Rn and set the flags, discarding
     /// the result. This encoding only reaches R0-R7.
-    fn cmp_register(&mut self, instr: u16) {
+    fn cmp_register(&mut self, instr: u16) -> u32 {
         let m = ((instr >> 3) & 0x7) as usize; // bits 5-3
         let n = (instr & 0x7) as usize; // bits 2-0
 
@@ -362,10 +390,11 @@ impl Cpu {
             carry as u8,
             overflow as u8
         );
+        CYCLES_DATA
     }
 
     /// CMP <Rn>, #<imm8> -- subtract and set the flags, discarding the result.
-    fn cmp_immediate(&mut self, instr: u16) {
+    fn cmp_immediate(&mut self, instr: u16) -> u32 {
         let n = ((instr >> 8) & 0x7) as usize; // bits 10-8
         let imm32 = (instr & 0xFF) as u32; // bits 7-0
 
@@ -382,6 +411,7 @@ impl Cpu {
             carry as u8,
             overflow as u8
         );
+        CYCLES_DATA
     }
 }
 

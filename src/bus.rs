@@ -6,6 +6,7 @@ use crate::peripheral::pmc::PmcStub;
 use crate::peripheral::rstc::RstcStub;
 use crate::peripheral::scb::ScbStub;
 use crate::peripheral::supc::SupcStub;
+use crate::peripheral::systick::SysTick;
 use crate::peripheral::uart::Uart0Stub;
 use crate::peripheral::wdt::WdtStub;
 
@@ -36,7 +37,9 @@ const SUPC_SIZE: u32 = 0x20;
 const WDT_BASE: u32 = 0x400E_1850;
 const WDT_SIZE: u32 = 0x10;
 // System Control Block and the rest of the System Control Space above it.
-// The NVIC and SysTick, below it, are not mapped yet.
+// The NVIC, between SysTick and the SCB, is not mapped yet.
+const SYSTICK_BASE: u32 = 0xE000_E010;
+const SYSTICK_SIZE: u32 = 0x10;
 const SCB_BASE: u32 = 0xE000_ED00;
 const SCB_SIZE: u32 = 0x300;
 
@@ -50,7 +53,11 @@ const PIO_END: u32 = PIO_BASE + PIO_SIZE * PIO_COUNT - 1;
 const RSTC_END: u32 = RSTC_BASE + RSTC_SIZE - 1;
 const SUPC_END: u32 = SUPC_BASE + SUPC_SIZE - 1;
 const WDT_END: u32 = WDT_BASE + WDT_SIZE - 1;
+const SYSTICK_END: u32 = SYSTICK_BASE + SYSTICK_SIZE - 1;
 const SCB_END: u32 = SCB_BASE + SCB_SIZE - 1;
+
+/// Exception number of the SysTick exception.
+const EXCEPTION_SYSTICK: u32 = 15;
 
 /// Read `size` bytes (1, 2 or 4) at `offset` as a little-endian value. A
 /// read that runs off the end of the region is logged and returns 0 instead
@@ -96,6 +103,10 @@ pub struct Bus {
     rstc: RstcStub,
     supc: SupcStub,
     scb: ScbStub,
+    systick: SysTick,
+    /// Exceptions that have been requested and are waiting for the CPU to
+    /// take them: bit n is set while exception number n is pending.
+    pending_exceptions: u128,
 }
 
 impl Bus {
@@ -112,6 +123,8 @@ impl Bus {
             rstc: RstcStub::new(),
             supc: SupcStub::new(),
             scb: ScbStub::new(),
+            systick: SysTick::new(),
+            pending_exceptions: 0,
         }
     }
     pub fn load_firmware_from_bin(&mut self, bin_filename: String) {
@@ -122,6 +135,33 @@ impl Bus {
     /// Copy a raw firmware image to the start of flash.
     pub fn load_firmware(&mut self, data: &[u8]) {
         self.flash[..data.len()].copy_from_slice(data);
+    }
+
+    /// Let emulated time move on by `cycles` clock cycles. The CPU calls
+    /// this after every instruction with the number of cycles it took;
+    /// that is the only clock there is.
+    pub fn tick(&mut self, cycles: u32) {
+        if self.systick.tick(cycles) {
+            self.pend_exception(EXCEPTION_SYSTICK);
+        }
+    }
+
+    /// Ask for exception `number` to be taken. It stays pending until the
+    /// CPU takes it.
+    pub fn pend_exception(&mut self, number: u32) {
+        self.pending_exceptions |= 1 << number;
+    }
+
+    /// Hand the CPU a pending exception to take, if there is one, and stop
+    /// it being pending. With several pending, the lowest exception number
+    /// goes first; real priorities are not implemented yet.
+    pub fn take_pending_exception(&mut self) -> Option<u32> {
+        if self.pending_exceptions == 0 {
+            return None;
+        }
+        let number = self.pending_exceptions.trailing_zeros();
+        self.pending_exceptions &= !(1 << number);
+        Some(number)
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
@@ -169,6 +209,7 @@ impl Bus {
             }
             RSTC_BASE..=RSTC_END => self.rstc.read(addr - RSTC_BASE, size),
             SUPC_BASE..=SUPC_END => self.supc.read(addr - SUPC_BASE, size),
+            SYSTICK_BASE..=SYSTICK_END => self.systick.read(addr - SYSTICK_BASE, size),
             SCB_BASE..=SCB_END => self.scb.read(addr - SCB_BASE, size),
             // Unmapped: log instead of panicking. The log shows which
             // peripheral the firmware wants next.
@@ -212,6 +253,7 @@ impl Bus {
             }
             RSTC_BASE..=RSTC_END => self.rstc.write(addr - RSTC_BASE, size, value),
             SUPC_BASE..=SUPC_END => self.supc.write(addr - SUPC_BASE, size, value),
+            SYSTICK_BASE..=SYSTICK_END => self.systick.write(addr - SYSTICK_BASE, size, value),
             SCB_BASE..=SCB_END => self.scb.write(addr - SCB_BASE, size, value),
             _ => {
                 eprintln!(
@@ -392,6 +434,32 @@ mod tests {
         assert_eq!(bus.read32(SCB_BASE + 0x20), 0xE000_0000);
         // The NVIC, just below the SCB, is still unmapped.
         assert_eq!(bus.read32(0xE000_E100), 0);
+    }
+
+    #[test]
+    fn systick_counts_bus_ticks_and_pends_its_exception() {
+        let mut bus = Bus::new();
+        bus.write32(SYSTICK_BASE + 0x04, 2); // SYST_RVR: reload 2
+        bus.write32(SYSTICK_BASE + 0x08, 0); // SYST_CVR: clear
+        bus.write32(SYSTICK_BASE, 0b011); // SYST_CSR: ENABLE | TICKINT
+        // Load 2, then 1, then 0: the third cycle reaches zero.
+        bus.tick(2);
+        assert_eq!(bus.take_pending_exception(), None);
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(), Some(15));
+        // Taking it stops it being pending.
+        assert_eq!(bus.take_pending_exception(), None);
+    }
+
+    #[test]
+    fn pending_exceptions_are_taken_lowest_number_first() {
+        let mut bus = Bus::new();
+        bus.pend_exception(23);
+        bus.pend_exception(15);
+        bus.pend_exception(23); // pending twice is still pending once
+        assert_eq!(bus.take_pending_exception(), Some(15));
+        assert_eq!(bus.take_pending_exception(), Some(23));
+        assert_eq!(bus.take_pending_exception(), None);
     }
 
     #[test]

@@ -105,9 +105,10 @@ All offsets and bit names in this table are verified against the SVD.
 
 ## Phase 4 — Exceptions and interrupts (ARM ARM B1, B3)
 
-- [ ] Exception entry: push 8-word frame; return via `EXC_RETURN` (`0xFFFFFFF1` / `9` / `D`)
+- [x] Exception entry: push 8-word frame; return via `EXC_RETURN` (`0xFFFFFFF1` / `9` / `D`)
 - [ ] MSP/PSP switching, PRIMASK, BASEPRI
-- [ ] NVIC (`0xE000E100`), SysTick (`0xE000E010`)
+- [x] SysTick (`0xE000E010`), counting emulated clock cycles
+- [ ] NVIC (`0xE000E100`), exception priorities and nesting
 - [ ] HardFault with a useful dump of the faulting state
 - [ ] UART0 RX interrupt (IRQ 7) fed from stdin
 
@@ -116,7 +117,8 @@ All offsets and bit names in this table are verified against the SVD.
 - [ ] FPU (ARM ARM A6) for hard-float firmware
 - [ ] GDB remote stub (`target remote`)
 - [ ] TC timers, PIO interrupts, other peripherals
-- [ ] Cycle counting / `DWT_CYCCNT`
+- [x] Cycle counting: every instruction reports an estimated cost in clock cycles (see `exceptionInterrupt.md`)
+- [ ] `DWT_CYCCNT` register, reading the cycle count
 
 ## Phase 6 — I2C gyro add-on card (BNO055 Xplained Pro)
 

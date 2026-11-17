@@ -1,6 +1,6 @@
 # Rust firmware for the emulator
 
-This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
+This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line, then starts the SysTick timer and prints a dot from its exception handler on every tick. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
 
 "Bare-metal" means the program runs directly on the chip with no operating system. Nothing prepares memory or calls `main` for it, so the program has to bring its own startup code.
 
@@ -176,6 +176,31 @@ For each byte:
 
 This is the same loop as `hello.s`.
 
+## SysTick
+
+After printing its line, the firmware starts the Arm core's system timer and leaves `main` in an empty loop. From then on all the work happens in the SysTick exception handler, which interrupts that loop. `exceptionInterrupt.md` in the repo root explains exceptions and how the emulator counts time.
+
+### Set-up
+
+| Order | Register | Address | Value | Meaning |
+|---|---|---|---|---|
+| 1 | `SYST_RVR` | `0xE000_E014` | `999` | Reload value: a period of 1,000 clock cycles |
+| 2 | `SYST_CVR` | `0xE000_E018` | `0` | Any write clears the counter, so the first period is a full one |
+| 3 | `SYST_CSR` | `0xE000_E010` | `0b111` | ENABLE, TICKINT (raise the exception at zero), CLKSOURCE (processor clock) |
+
+The period is short on purpose, so that output appears at once in the emulator. A real 1 ms tick at 12 MHz would use a reload value of 11,999.
+
+### The handler
+
+```rust
+#[exception]
+fn SysTick() {
+    uart_write_byte(b'.');
+}
+```
+
+`#[exception]` comes from `cortex-m-rt`. It puts the function's address in the vector table at word 15 (`0x0040_003C`), the entry for the SysTick exception. The function itself is ordinary code: the processor saves and restores the interrupted registers around it.
+
 ## What the emulator does with this
 
 | Step | Emulator behaviour |
@@ -186,10 +211,12 @@ This is the same loop as `hello.s`.
 | `UART_CR`, `UART_MR`, `UART_BRGR` | Ignored by the UART stub |
 | `UART_SR` | Always reports TXRDY |
 | `UART_THR` | Byte goes to stdout |
+| SysTick set-up | The emulated timer starts counting clock cycles |
+| SysTick reaching zero | The handler runs and a dot is printed, every 1,000 emulated cycles |
 
-So only step 5 is needed for output in the emulator. Steps 1 to 4 are there so the same firmware would work on a real board.
+So only step 5 is needed for UART output in the emulator. Steps 1 to 4 are there so the same firmware would work on a real board.
 
-Runs are expected to stop with an "unknown instruction" panic until the CPU core catches up. The compiler emits instructions the core does not implement yet, and each panic names the next one to add. The first is the `BL` at `0x0040_0400`, the very first instruction of the startup code.
+The firmware as it stands runs to the end with the instructions the CPU core has. When it grows, the compiler will emit instructions the core does not implement yet; the emulator then stops with an "unknown instruction" panic that names the next one to add.
 
 ## To verify
 

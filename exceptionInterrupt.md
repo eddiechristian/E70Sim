@@ -160,7 +160,35 @@ SysTick is a 24-bit countdown timer built into the core, at `0xE000_E010` (ARM m
 
 While enabled it counts down once per clock cycle. On reaching zero it reloads from `SYST_RVR`, sets COUNTFLAG, and, if TICKINT is set, makes exception 15 pending.
 
-The emulator has no clock yet. The simplest stand-in is to count down once per emulated instruction. Real timing (cycle counting) is a Phase 5 item.
+### How the emulator counts time: clock cycles
+
+A real SysTick counts clock cycles. The emulator has no oscillator, so it keeps a count of **emulated clock cycles** instead. Every instruction reports how many cycles it took, `Cpu::step` adds that to a running total and passes it to `Bus::tick`, and SysTick moves by that amount.
+
+So a tick lands every N + 1 emulated cycles (N being the reload value), whatever mix of instructions ran in between. Firmware that sets up a 1 ms tick for a 12 MHz clock writes a reload value of 11,999 and gets its handler every 12,000 cycles, which is what its author meant.
+
+The costs are in `src/cpu.rs`:
+
+| What | Cycles | Constant |
+|---|---|---|
+| Arithmetic, logic, moves, shifts, compares | 1 | `CYCLES_DATA` |
+| One load or store | 2 | `CYCLES_MEMORY` |
+| `PUSH` / `POP` | 1 + one per register | |
+| Anything that changes the PC (taken branch, `BL`, `BX`, `POP` with PC, `MOV pc`) | 2 extra | `CYCLES_REFILL` |
+| Conditional branch not taken | 1 | |
+| Exception entry | 12 | `CYCLES_EXCEPTION_ENTRY` |
+| Exception return | 10 extra, in place of the 2 | `CYCLES_EXCEPTION_RETURN` |
+
+Every new instruction has to return its cost; the compiler enforces that, because the instruction methods return `u32`.
+
+Three things to keep in mind:
+
+- **The costs are estimates.** They follow the timings Arm publishes for the Cortex-M4. The Cortex-M7 runs two instructions at once where it can, predicts branches and has caches, so the true cost of an instruction depends on its neighbours and on history, and Arm publishes no simple table for it. Ratios between pieces of code come out roughly right; absolute numbers do not match the real chip.
+- **It is emulated time, not real time.** A "1 second" delay takes however long the host needs to emulate that many cycles. Pacing the emulator against the host's clock, so that 1 ms takes 1 ms, would build on the cycle count but is not implemented.
+- **It is exactly repeatable.** The same firmware takes its SysTick exception at the same instruction on every run.
+
+The running total is also what `DWT_CYCCNT` (the core's cycle counter register, a Phase 5 item) will report. With `--trace`, each step prints the total and the cycles that step took.
+
+The CLKSOURCE bit of `SYST_CSR` is ignored. On the real chip it selects between the processor clock and a slower reference clock.
 
 ## Faults
 
@@ -187,11 +215,11 @@ The last Phase 4 item makes input work. Typed characters on the host's stdin bec
 
 | Piece | Where | Notes |
 |---|---|---|
-| Pending and active state for every exception | new | Shared by the CPU and the registers below |
+| Pending state for every exception | `Bus` (`pend_exception`, `take_pending_exception`) | Done. Active state and priorities are still to come |
 | NVIC registers | new stub at `0xE000_E100` | Enable, pending, priority |
-| SysTick registers and countdown | new stub at `0xE000_E010` | Counted per instruction for now |
+| SysTick registers and countdown | `src/peripheral/systick.rs` | Done. Counts emulated clock cycles |
 | `ICSR`, `SHPR`, `SHCSR` behaviour | `src/peripheral/scb.rs` | Currently store-and-readback or logged |
-| Check for a pending exception | `Cpu::step` | Before fetching each instruction |
+| Check for a pending exception | `Cpu::step` | Done. Before fetching each instruction, and only in Thread mode until priorities exist |
 | Exception entry | `src/cpu/exception.rs` | Push the frame, set LR, load the PC |
 | Exception return | `bx_write_pc` in `src/cpu/exception.rs` | Used by `BX` and `POP`; loads into the PC will need it too |
 | MSP / PSP switching | `src/cpu/exception.rs` | Done for entry and return; writing `CONTROL` with `MSR` is still to come |

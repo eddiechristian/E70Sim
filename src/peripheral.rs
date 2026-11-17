@@ -9,6 +9,7 @@ pub mod pmc;
 pub mod rstc;
 pub mod scb;
 pub mod supc;
+pub mod systick;
 pub mod uart;
 pub mod wdt;
 

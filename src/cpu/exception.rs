@@ -6,15 +6,17 @@
 //! interrupted code carries on. See `exceptionInterrupt.md` in the repo
 //! root for the background.
 //!
-//! Nothing decides *when* to take an exception yet: there is no pending
-//! state and no priority. `exception_entry` has to be called directly.
+//! `Cpu::step` decides *when*: it calls `exception_entry` if the bus has
+//! an exception pending and no handler is running, and charges the clock
+//! cycles that entry takes. There are no
+//! priorities yet, so one handler never interrupts another.
 //!
 //! Stack pointers: `regs[SP]` is always the stack in use. Of `msp` and
 //! `psp`, the field for the stack in use is stale, and the other holds
 //! the value of the stack that is not in use. CONTROL bit 1 (SPSEL) says
 //! which is which, and `select_stack` swaps them.
 
-use super::{Cpu, LR, PC, SP};
+use super::{CYCLES_EXCEPTION_RETURN, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
 
 /// Vector Table Offset Register, in the SCB.
@@ -142,10 +144,14 @@ impl Cpu {
     /// four bits are all 1 is not an address but EXC_RETURN, and ends the
     /// exception. `pc` is the address of the instruction doing the write,
     /// for error messages.
-    pub(super) fn bx_write_pc(&mut self, value: u32, pc: u32, bus: &mut Bus) {
+    ///
+    /// Returns the clock cycles the write costs on top of the instruction
+    /// itself: a pipeline refill for a branch, or the whole unstacking
+    /// sequence for an exception return.
+    pub(super) fn bx_write_pc(&mut self, value: u32, pc: u32, bus: &mut Bus) -> u32 {
         if self.in_handler_mode() && value >> 28 == 0xF {
             self.exception_return(value, pc, bus);
-            return;
+            return CYCLES_EXCEPTION_RETURN;
         }
         // An address must have bit 0 set to mark it as Thumb code. The
         // real chip raises a UsageFault on the next instruction if it is
@@ -157,6 +163,7 @@ impl Cpu {
             );
         }
         self.regs[PC] = value & !1;
+        CYCLES_REFILL
     }
 
     /// Return from the current exception: pop the frame and resume the
@@ -429,6 +436,97 @@ mod tests {
         assert!(!cpu.in_handler_mode());
         assert_eq!(cpu.regs[SP], STACK_TOP);
         assert_eq!(cpu.regs[PC], MAIN);
+    }
+
+    const SYST_CSR: u32 = 0xE000_E010;
+    const SYST_RVR: u32 = 0xE000_E014;
+    const SYST_CVR: u32 = 0xE000_E018;
+
+    /// Main: an endless loop (`b .`). SysTick handler: `adds r4, #1 ;
+    /// bx lr`, so R4 counts how many times the handler has run. R4 is not
+    /// one of the registers the exception frame restores.
+    fn cpu_counting_systicks() -> (Cpu, Bus) {
+        cpu_with_handler(&[0xE7FE], &[0x3401, 0x4770], &[SYSTICK])
+    }
+
+    #[test]
+    fn systick_runs_its_handler_while_the_main_loop_spins() {
+        let (mut cpu, mut bus) = cpu_counting_systicks();
+        // `b .` costs 3 cycles, so a 30-cycle period is 10 trips round
+        // the main loop.
+        bus.write32(SYST_RVR, 29);
+        bus.write32(SYST_CVR, 0);
+        bus.write32(SYST_CSR, 0b011); // ENABLE | TICKINT
+
+        // The timer reaches zero as the tenth instruction finishes, but
+        // the handler has not started.
+        for _ in 0..10 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.cycles, 30);
+        assert_eq!(cpu.regs[4], 0);
+        assert!(!cpu.in_handler_mode());
+
+        // The next step takes the exception (12 cycles) and runs
+        // `adds r4, #1` (1 cycle).
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cycles, 43);
+        assert_eq!(cpu.regs[4], 1);
+        assert!(cpu.in_handler_mode());
+
+        // `bx lr` returns to the main loop (1 + 10 cycles).
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cycles, 54);
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[PC], MAIN);
+        assert_eq!(cpu.regs[SP], STACK_TOP);
+
+        // Over a long run the handler fires once per 30 cycles, whatever
+        // mix of instructions those cycles were spent on. The last period
+        // may have ended without its handler having started yet.
+        for _ in 0..1000 {
+            cpu.step(&mut bus);
+        }
+        let periods = (cpu.cycles / 30) as u32;
+        assert!(
+            cpu.regs[4] == periods || cpu.regs[4] + 1 == periods,
+            "handler ran {} times in {} periods",
+            cpu.regs[4],
+            periods
+        );
+    }
+
+    #[test]
+    fn systick_without_tickint_never_runs_the_handler() {
+        let (mut cpu, mut bus) = cpu_counting_systicks();
+        bus.write32(SYST_RVR, 29);
+        bus.write32(SYST_CVR, 0);
+        bus.write32(SYST_CSR, 0b001); // ENABLE only
+        for _ in 0..100 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[4], 0);
+        // The timer still ran: COUNTFLAG (bit 16) is set.
+        assert_ne!(bus.read32(SYST_CSR) & (1 << 16), 0);
+    }
+
+    #[test]
+    fn exception_pending_during_a_handler_waits_for_it_to_finish() {
+        let (mut cpu, mut bus) = cpu_counting_systicks();
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // entry, then adds r4, #1
+        assert_eq!(cpu.regs[4], 1);
+
+        // A second request arrives while the handler is still running.
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // bx lr: the first handler finishes normally
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[SP], STACK_TOP);
+
+        // Only now is the second one taken.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[4], 2);
+        assert!(cpu.in_handler_mode());
     }
 
     #[test]

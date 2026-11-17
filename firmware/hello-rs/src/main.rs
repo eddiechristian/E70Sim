@@ -1,4 +1,6 @@
-//! Bare-metal firmware for the ATSAME70Q21: set up UART0 and print a line.
+//! Bare-metal firmware for the ATSAME70Q21: set up UART0, print a line,
+//! then start the SysTick timer and print a dot from its exception handler
+//! on every tick.
 //!
 //! See `../firmware.md` for what each step is for. Register addresses and
 //! bit positions are from `ATSAME70Q21.svd`.
@@ -8,7 +10,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use cortex_m_rt::entry;
+use cortex_m_rt::{entry, exception};
 use panic_halt as _; // on panic, loop forever
 
 // Watchdog Timer.
@@ -40,6 +42,20 @@ const UART_CR_TXEN: u32 = 1 << 6; // enable transmitter
 const UART_CR_TXDIS: u32 = 1 << 7; // disable transmitter
 const UART_MR_PAR_NO: u32 = 4 << 9; // no parity
 const UART_SR_TXRDY: u32 = 1 << 1; // transmitter can take another byte
+
+// SysTick, the Arm core's system timer.
+const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32; // control and status
+const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32; // reload value
+const SYST_CVR: *mut u32 = 0xE000_E018 as *mut u32; // current value
+
+const SYST_CSR_ENABLE: u32 = 1 << 0; // counter runs
+const SYST_CSR_TICKINT: u32 = 1 << 1; // reaching zero raises the exception
+const SYST_CSR_CLKSOURCE: u32 = 1 << 2; // count the processor clock
+
+/// Clock cycles between SysTick exceptions. Kept short so that output
+/// appears quickly in the emulator; a real 1 ms tick at 12 MHz would be
+/// 12_000.
+const TICK_CYCLES: u32 = 1_000;
 
 // The chip starts on its internal 12 MHz oscillator.
 const CLOCK_HZ: u32 = 12_000_000;
@@ -92,6 +108,25 @@ fn uart_write_str(text: &str) {
     }
 }
 
+fn systick_init() {
+    // The counter runs from the reload value down to zero, so a period of
+    // N cycles needs a reload value of N - 1.
+    write_reg(SYST_RVR, TICK_CYCLES - 1);
+    // Writing any value clears the counter, so the first period is a full one.
+    write_reg(SYST_CVR, 0);
+    write_reg(
+        SYST_CSR,
+        SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE,
+    );
+}
+
+/// Runs every time SysTick reaches zero. `cortex-m-rt` puts this function
+/// in the vector table as the handler for exception 15.
+#[exception]
+fn SysTick() {
+    uart_write_byte(b'.');
+}
+
 #[entry]
 fn main() -> ! {
     // The watchdog is running at reset and would reset the chip after
@@ -101,5 +136,9 @@ fn main() -> ! {
     uart_init();
     uart_write_str("Hello from Rust on SAME70\n");
 
+    systick_init();
+
+    // Nothing left to do here: from now on the only work is done by the
+    // SysTick handler, which interrupts this loop.
     loop {}
 }

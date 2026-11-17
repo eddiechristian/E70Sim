@@ -1,10 +1,11 @@
 //! 32-bit Thumb instructions (Thumb-2).
 //!
 //! `execute32` decodes the two halfwords of an instruction and calls the
-//! method for it. Section numbers (A7.7.x) refer to the ARMv7-M
+//! method for it. Every method returns the number of clock cycles the
+//! instruction takes (see the `CYCLES_` constants in `cpu.rs`). Section numbers (A7.7.x) refer to the ARMv7-M
 //! Architecture Reference Manual.
 
-use super::{Cpu, LR, PC, SP};
+use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
 use crate::helpers::thumb_expand_imm_c;
 
@@ -12,23 +13,23 @@ impl Cpu {
     /// Decode and execute a 32-bit instruction. `hw1` is the halfword at
     /// `pc` and `hw2` the one at `pc + 2`. The panic at the end is the
     /// to-do list for 32-bit encodings.
-    pub(super) fn execute32(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) {
+    pub(super) fn execute32(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
         // BL, encoding T1: 11110 S imm10 | 11 J1 1 J2 imm11  (A7.7.18)
         if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
-            self.bl(hw1, hw2, pc);
+            self.bl(hw1, hw2, pc)
         // MOV (immediate), encoding T3 (MOVW):
         // 11110 i 100100 imm4 | 0 imm3 Rd imm8  (A7.7.76)
         } else if hw1 & 0xFBF0 == 0xF240 && hw2 & 0x8000 == 0 {
-            self.movw(hw1, hw2, pc);
+            self.movw(hw1, hw2, pc)
         // MOVT, encoding T1: 11110 i 101100 imm4 | 0 imm3 Rd imm8  (A7.7.79)
         } else if hw1 & 0xFBF0 == 0xF2C0 && hw2 & 0x8000 == 0 {
-            self.movt(hw1, hw2, pc);
+            self.movt(hw1, hw2, pc)
         // MOV (immediate), encoding T2 (MOV.W):
         // 11110 i 00010 S 1111 | 0 imm3 Rd imm8  (A7.7.76)
         // With anything other than 1111 in the low four bits of hw1 this
         // is ORR (immediate) instead.
         } else if hw1 & 0xFBEF == 0xF04F && hw2 & 0x8000 == 0 {
-            self.mov_modified_immediate(hw1, hw2, pc);
+            self.mov_modified_immediate(hw1, hw2, pc)
         // LDRB (register), encoding T2:
         // 111110000001 Rn | Rt 000000 imm2 Rm  (A7.7.48)
         // Rn = 1111 is LDRB (literal) and Rt = 1111 is PLD, so both are
@@ -38,15 +39,15 @@ impl Cpu {
             && hw1 & 0xF != 0xF
             && hw2 >> 12 != 0xF
         {
-            self.ldrb_register_wide(hw1, hw2, pc, bus);
+            self.ldrb_register_wide(hw1, hw2, pc, bus)
         // BIC (immediate), encoding T1:
         // 11110 i 00001 S Rn | 0 imm3 Rd imm8  (A7.7.15)
         } else if hw1 & 0xFBE0 == 0xF020 && hw2 & 0x8000 == 0 {
-            self.bic_immediate(hw1, hw2, pc);
+            self.bic_immediate(hw1, hw2, pc)
         // STR (immediate), encoding T3: 111110001100 Rn | Rt imm12  (A7.7.161)
         // Rn = 1111 is not a valid STR, so it is left to the panic below.
         } else if hw1 & 0xFFF0 == 0xF8C0 && hw1 & 0xF != 0xF {
-            self.str_immediate_wide(hw1, hw2, pc, bus);
+            self.str_immediate_wide(hw1, hw2, pc, bus)
         } else {
             panic!(
                 "unhandled 32-bit instruction at {:#010X}: {:#06X} {:#06X} = {:016b} {:016b}",
@@ -58,7 +59,7 @@ impl Cpu {
     /// LDRB.W <Rt>, [<Rn>, <Rm>, LSL #<imm2>] -- load one byte from
     /// Rn + (Rm shifted left by 0 to 3) and zero-extend it into Rt.
     /// `pc` is the address of this instruction.
-    fn ldrb_register_wide(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) {
+    fn ldrb_register_wide(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
         let n = (hw1 & 0xF) as usize; // base register
         let t = ((hw2 >> 12) & 0xF) as usize; // destination
         let shift_n = ((hw2 >> 4) & 0x3) as u32; // imm2
@@ -82,13 +83,14 @@ impl Cpu {
             t,
             self.regs[t]
         );
+        CYCLES_MEMORY
     }
 
     /// BIC <Rd>, <Rn>, #<const> / BICS -- "bit clear": Rd = Rn AND NOT
     /// const. Every bit that is 1 in the constant is cleared; the rest of
     /// Rn is copied unchanged. The constant is a modified immediate, as
     /// for MOV.W. `pc` is the address of this instruction.
-    fn bic_immediate(&mut self, hw1: u16, hw2: u16, pc: u32) {
+    fn bic_immediate(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
         let n = (hw1 & 0xF) as usize;
         let d = ((hw2 >> 8) & 0xF) as usize;
         if d == SP || d == PC || n == SP || n == PC {
@@ -124,13 +126,14 @@ impl Cpu {
             d,
             result
         );
+        CYCLES_DATA
     }
 
     /// STR.W <Rt>, [<Rn>, #<imm12>] -- store the word in Rt to Rn + offset.
     /// The 32-bit form of STR: any register, and an offset from 0 to 4095
     /// that need not be a multiple of 4. `pc` is the address of this
     /// instruction.
-    fn str_immediate_wide(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) {
+    fn str_immediate_wide(&mut self, hw1: u16, hw2: u16, pc: u32, bus: &mut Bus) -> u32 {
         let n = (hw1 & 0xF) as usize; // base register
         let t = ((hw2 >> 12) & 0xF) as usize; // value to store
         let imm32 = (hw2 & 0xFFF) as u32;
@@ -146,12 +149,13 @@ impl Cpu {
             "  str.w r{}, [r{}, #{}]  -> [{:#010X}] = {:#010X}", t, n, imm32, address, self.regs[t]
         );
         bus.write32(address, self.regs[t]);
+        CYCLES_MEMORY
     }
 
     /// MOVW <Rd>, #<imm16> -- load a constant from 0 to 65535 into any
     /// register, clearing the upper half. Never changes the flags.
     /// `pc` is the address of this instruction.
-    fn movw(&mut self, hw1: u16, hw2: u16, pc: u32) {
+    fn movw(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
         let d = ((hw2 >> 8) & 0xF) as usize;
         if d == SP || d == PC {
             // UNPREDICTABLE in the architecture; a compiler never emits it.
@@ -170,13 +174,14 @@ impl Cpu {
             self,
             "  movw r{}, #{:#06X}  -> r{} = {:#010X}", d, imm32, d, imm32
         );
+        CYCLES_DATA
     }
 
     /// MOVT <Rd>, #<imm16> -- write a constant into the upper half of a
     /// register, keeping the lower half. Paired with MOVW to build any
     /// 32-bit value. Never changes the flags.
     /// `pc` is the address of this instruction.
-    fn movt(&mut self, hw1: u16, hw2: u16, pc: u32) {
+    fn movt(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
         let d = ((hw2 >> 8) & 0xF) as usize;
         if d == SP || d == PC {
             // UNPREDICTABLE in the architecture; a compiler never emits it.
@@ -195,6 +200,7 @@ impl Cpu {
             self,
             "  movt r{}, #{:#06X}  -> r{} = {:#010X}", d, imm16, d, self.regs[d]
         );
+        CYCLES_DATA
     }
 
     /// MOV.W <Rd>, #<const> / MOVS.W <Rd>, #<const> -- load a "modified
@@ -202,7 +208,7 @@ impl Cpu {
     /// value either rotated to any position in the word or repeated across
     /// its bytes, which covers values such as 0x8000 that MOVS and its
     /// 0-255 range cannot reach. `pc` is the address of this instruction.
-    fn mov_modified_immediate(&mut self, hw1: u16, hw2: u16, pc: u32) {
+    fn mov_modified_immediate(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
         let d = ((hw2 >> 8) & 0xF) as usize;
         if d == SP || d == PC {
             // UNPREDICTABLE in the architecture; a compiler never emits it.
@@ -235,11 +241,12 @@ impl Cpu {
             d,
             imm32
         );
+        CYCLES_DATA
     }
 
     /// BL <label> -- call a function: save the return address in LR, then
     /// branch. `pc` is the address of this instruction.
-    fn bl(&mut self, hw1: u16, hw2: u16, pc: u32) {
+    fn bl(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
         let s = ((hw1 >> 10) & 1) as u32; // sign bit
         let imm10 = (hw1 & 0x3FF) as u32;
         let j1 = ((hw2 >> 13) & 1) as u32;
@@ -268,6 +275,7 @@ impl Cpu {
             self,
             "  bl {:#010X}  -> lr = {:#010X}", target, self.regs[LR]
         );
+        CYCLES_DATA + CYCLES_REFILL
     }
 }
 
