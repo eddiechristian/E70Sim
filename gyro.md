@@ -86,6 +86,8 @@ pub trait I2cDevice {
     fn write(&mut self, byte: u8) -> bool;
     /// The controller asks for a byte.
     fn read(&mut self) -> u8;
+    /// The transfer ends (the STOP condition).
+    fn stop(&mut self) {}
     /// Let emulated time pass, for devices whose behaviour depends on it.
     fn tick(&mut self, cycles: u32) {}
 }
@@ -153,7 +155,7 @@ Each step can be tested before the next begins.
 
 | # | Step | Test |
 |---|---|---|
-| 1 | `I2cDevice` trait and a trivial test device (a few bytes of memory) | Unit tests |
+| 1 ✅ | `I2cDevice` trait and a trivial test device (a few bytes of memory): `src/i2c.rs` | Unit tests |
 | 2 | TWIHS, polled, both ways of reading a register, NACK for an absent address. Attach to the bus at all three bases | Unit tests driving the registers as firmware would |
 | 3 | BNO055 with identity, page, mode, reset and status registers, and constant gyro data | Unit tests against datasheet values |
 | 4 | Rust firmware `firmware/gyro-rs/`: set up TWIHS0, read `CHIP_ID`, print it | Prints `A0`. This is the `PLAN.md` "read CHIP_ID and print it" item |

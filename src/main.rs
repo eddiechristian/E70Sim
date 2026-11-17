@@ -1,6 +1,7 @@
 pub mod bus;
 pub mod cpu;
 pub mod helpers;
+pub mod i2c;
 pub mod peripheral;
 
 use bus::Bus;
