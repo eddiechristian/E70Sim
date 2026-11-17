@@ -1,13 +1,13 @@
-use crate::efc::EfcStub;
-use crate::matrix::MatrixStub;
 use crate::peripheral::Peripheral;
-use crate::pio::PioStub;
-use crate::pmc::PmcStub;
-use crate::rstc::RstcStub;
-use crate::scb::ScbStub;
-use crate::supc::SupcStub;
-use crate::uart::Uart0Stub;
-use crate::wdt::WdtStub;
+use crate::peripheral::efc::EfcStub;
+use crate::peripheral::matrix::MatrixStub;
+use crate::peripheral::pio::PioStub;
+use crate::peripheral::pmc::PmcStub;
+use crate::peripheral::rstc::RstcStub;
+use crate::peripheral::scb::ScbStub;
+use crate::peripheral::supc::SupcStub;
+use crate::peripheral::uart::Uart0Stub;
+use crate::peripheral::wdt::WdtStub;
 
 // Memory map (see the SVD and the SAME70 datasheet).
 const BOOT_ALIAS_END: u32 = 0x001F_FFFF; // flash is also visible at 0x0

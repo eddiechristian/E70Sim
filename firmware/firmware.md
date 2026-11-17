@@ -103,11 +103,12 @@ The script runs `cargo build --release`, which produces an ELF file: the program
 
 ### Running
 
-From the repo root, pass the image to the emulator. Without an argument it loads `firmware/firmware.bin`, the assembly version.
+From the repo root. Without an argument the emulator loads `firmware/hello-rs.bin`; pass a path to load another image, such as the assembly version.
 
 ```
-cargo run -- firmware/hello-rs.bin
-cargo run -- --trace firmware/hello-rs.bin
+cargo run
+cargo run -- --trace
+cargo run -- firmware/firmware.bin
 ```
 
 ### Disassembling

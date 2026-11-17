@@ -1,16 +1,7 @@
 pub mod bus;
 pub mod cpu;
-pub mod efc;
 pub mod helpers;
-pub mod matrix;
 pub mod peripheral;
-pub mod pio;
-pub mod pmc;
-pub mod rstc;
-pub mod scb;
-pub mod supc;
-pub mod uart;
-pub mod wdt;
 
 use bus::Bus;
 use cpu::Cpu;
