@@ -55,6 +55,9 @@ impl Cpu {
         // POP, encoding T1: 1011110 P register_list  (A7.7.99)
         } else if instr >> 9 == 0b1011110 {
             self.pop(instr, pc, bus);
+        // BX, encoding T1: 010001110 Rm 000  (A7.7.20)
+        } else if instr & 0xFF87 == 0x4700 {
+            self.bx(instr, pc, bus);
         // MOV (register), encoding T1: 01000110 D Rm Rd  (A7.7.77)
         } else if instr >> 8 == 0b01000110 {
             self.mov_register(instr, pc);
@@ -148,6 +151,21 @@ impl Cpu {
         );
     }
 
+    /// BX <Rm> -- branch to the address in a register. `bx lr` is how a
+    /// function that saved nothing on the stack returns, and in an
+    /// exception handler it is the exception return.
+    /// `pc` is the address of this instruction.
+    fn bx(&mut self, instr: u16, pc: u32, bus: &mut Bus) {
+        let m = ((instr >> 3) & 0xF) as usize; // bits 6-3
+        if m == PC {
+            // UNPREDICTABLE in the architecture; a compiler never emits it.
+            panic!("BX PC at {:#010X}", pc);
+        }
+        let target = self.regs[m];
+        trace!(self, "  bx r{}  -> {:#010X}", m, target);
+        self.bx_write_pc(target, pc, bus);
+    }
+
     /// MOV <Rd>, <Rm> -- copy one register to another. This encoding can
     /// use all 16 registers and never changes the flags.
     /// `pc` is the address of this instruction.
@@ -219,22 +237,13 @@ impl Cpu {
         // The mirror image of PUSH: read upwards from SP, so the
         // lowest-numbered register comes from the lowest address.
         let mut address = self.regs[SP];
+        let mut new_pc = None;
         for i in 0..=PC {
             if registers & (1 << i) != 0 {
                 let value = bus.read32(address);
                 address = address.wrapping_add(4);
                 if i == PC {
-                    // A loaded PC value must have bit 0 set to mark it as
-                    // Thumb code. The real chip raises a UsageFault on the
-                    // next instruction if it is clear; exceptions are not
-                    // implemented, so stop here instead.
-                    if value & 1 == 0 {
-                        panic!(
-                            "POP at {:#010X} loaded PC value {:#010X} without the Thumb bit",
-                            pc, value
-                        );
-                    }
-                    self.regs[PC] = value & !1;
+                    new_pc = Some(value);
                 } else {
                     self.regs[i] = value;
                 }
@@ -245,6 +254,12 @@ impl Cpu {
             self,
             "  pop {{list {:#06X}}}  -> sp = {:#010X}", registers, address
         );
+        // The PC is written last, after SP has moved: in a handler the
+        // value may be EXC_RETURN, and the exception return then pops its
+        // frame from the updated SP.
+        if let Some(value) = new_pc {
+            self.bx_write_pc(value, pc, bus);
+        }
     }
 
     /// B <label> -- always branch. `pc` is the address of this instruction.
@@ -493,6 +508,42 @@ mod tests {
         cpu.xpsr &= !(0b11 << 28);
         cpu.step(&mut bus);
         assert_eq!(cpu.xpsr & (0b11 << 28), 0);
+    }
+
+    #[test]
+    fn bx_lr_returns_to_the_caller() {
+        // bx lr
+        let (mut cpu, mut bus) = cpu_with_code(&[0x4770]);
+        cpu.regs[LR] = 0x0040_0405; // as left by BL, Thumb bit set
+        let xpsr = cpu.xpsr;
+        cpu.step(&mut bus);
+        // The Thumb bit is dropped from the address that is executed.
+        assert_eq!(cpu.regs[PC], 0x0040_0404);
+        assert_eq!(cpu.regs[LR], 0x0040_0405);
+        assert_eq!(cpu.xpsr, xpsr);
+    }
+
+    #[test]
+    fn bx_can_branch_through_any_register() {
+        // bx r3
+        let (mut cpu, mut bus) = cpu_with_code(&[0x4718]);
+        cpu.regs[3] = 0x0040_0101;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0100);
+
+        // bx r12
+        let (mut cpu, mut bus) = cpu_with_code(&[0x4760]);
+        cpu.regs[12] = 0x0040_0201;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0200);
+    }
+
+    #[test]
+    #[should_panic(expected = "without the Thumb bit")]
+    fn bx_to_an_address_without_the_thumb_bit_stops() {
+        let (mut cpu, mut bus) = cpu_with_code(&[0x4770]); // bx lr
+        cpu.regs[LR] = 0x0040_0404; // bit 0 clear
+        cpu.step(&mut bus);
     }
 
     #[test]

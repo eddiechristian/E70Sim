@@ -13,8 +13,10 @@ macro_rules! trace {
     };
 }
 
-// The instruction implementations, split by encoding length. Both files
-// add methods to `Cpu`; `step` below picks between them.
+// Each of these files adds methods to `Cpu`. `thumb16` and `thumb32` hold
+// the instructions, split by encoding length; `step` below picks between
+// them. `exception` holds exception entry and return.
+mod exception;
 mod thumb16;
 mod thumb32;
 
