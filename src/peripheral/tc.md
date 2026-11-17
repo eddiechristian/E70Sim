@@ -1,0 +1,8 @@
+### TC0–TC3 — Timer Counter
+*   **Base Addresses:** `0x4000_C000` (TC0), `0x4001_0000` (TC1), `0x4001_4000` (TC2), `0x4005_4000` (TC3). Each module has three channels, `0x40` apart.
+*   **Interrupts:** One IRQ per channel: 23–25 (TC0), 26–28 (TC1), 47–49 (TC2), 50–52 (TC3).
+*   **Why It's There:** The chip's general-purpose hardware timers. Firmware uses a channel for a regular interrupt when SysTick is taken or a second time base is needed.
+*   **The Problem:** Firmware that starts a channel and waits for its interrupt, or polls `TC_SR` for a compare flag, would wait forever.
+*   **Logic:** A channel counts once its clock is enabled (`CLKEN` in `TC_CCR`, `+0x00`) and it is triggered (`SWTRG`). `TC_CMR` (`+0x04`) picks the clock: the full clock, 1/8, 1/32, 1/128 of it, or the 32.768 kHz slow clock. The 16-bit count (`TC_CV`, `+0x10`) is compared with `TC_RA`, `TC_RB` and `TC_RC` (`+0x14` to `+0x1C`); matches and overflow set bits in `TC_SR` (`+0x20`), which reading clears. With the "restart at RC" bit set in `TC_CMR` the count returns to 0 at each RC match, giving one event every RC counts. `TC_IER` / `TC_IDR` / `TC_IMR` (`+0x24` to `+0x2C`) choose which status bits ask for the interrupt; the request lasts until `TC_SR` is read. `TC_BCR` (`+0xC0`) triggers all three channels at once.
+*   **Not Modelled:** Anything involving pins: waveform (PWM) output, capturing an input signal, external clocks and triggers, up-down counting. The peripheral clock enable in the PMC is not required.
+*   **From Memory:** The SVD describes `TC_CMR` only in capture mode. The waveform-mode bits, the clock choices, the 16-bit counter width and the counting rules are from the datasheet as remembered.

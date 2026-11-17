@@ -114,6 +114,14 @@ cargo run -- --bus-faults
 cargo run -- firmware/firmware.bin
 ```
 
+`--pin=` drives an input pin from outside, at a moment given in emulated clock cycles since reset. This is how a button press is simulated. It can be given several times:
+
+```
+cargo run -- --pin=PA11=0@12000000 --pin=PA11=1@13000000
+```
+
+That pulls PA11 low one second after reset (12,000,000 cycles at 12 MHz) and lets it go high again a twelfth of a second later. Pins read high until driven. Neither firmware here uses a pin interrupt yet.
+
 `--bus-faults` makes a read or write of an unmapped address a BusFault, as on the real chip, instead of a warning. When firmware faults, the emulator prints a dump of the registers; `exceptionInterrupt.md` explains it.
 
 The emulator's stdin is UART0's receive line. Type a line and press Enter and the firmware echoes it; the terminal hands input over a line at a time, so nothing arrives before Enter. Input can also be piped in:

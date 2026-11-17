@@ -40,6 +40,7 @@ const AIRCR: u32 = 0x0C; // Application Interrupt and Reset Control
 const CCR: u32 = 0x14; // Configuration and Control
 const SHCSR: u32 = 0x24; // System Handler Control and State
 const BFAR: u32 = 0x38; // BusFault Address
+const DEMCR: u32 = 0xFC; // Debug Exception and Monitor Control
 const SHPR1: u32 = 0x18; // System Handler Priority 1-3: one byte each
 const SHPR3: u32 = 0x20; //   for exceptions 4 to 15
 const CFSR: u32 = 0x28; // Configurable Fault Status
@@ -124,6 +125,12 @@ impl ScbStub {
     pub fn system_priority(&self, number: u32) -> u8 {
         let byte = number - 4;
         (self.get(SHPR1 + (byte & !3)) >> (8 * (byte & 3))) as u8
+    }
+
+    /// TRCENA (bit 24 of DEMCR): the master switch for the DWT, which
+    /// has the cycle counter.
+    pub fn trace_enabled(&self) -> bool {
+        self.get(DEMCR) & (1 << 24) != 0
     }
 
     /// SHCSR, whose bits 16 to 18 enable MemManage, BusFault and

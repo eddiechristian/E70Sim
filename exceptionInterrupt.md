@@ -403,6 +403,17 @@ Each step can be tested before the next one starts.
 5. **Faults.** HardFault with the state dump.
 6. **MSP / PSP.** Only matters once firmware uses the process stack, which mostly means an operating system.
 
+## More interrupt sources: timers and pins
+
+Two more peripherals can raise interrupts, in the same way as UART0: the peripheral asks, the bus tells the NVIC, and the firmware's handler must deal with the cause or be called again at once.
+
+| Source | IRQ | Asks while | Handler stops it by |
+|---|---|---|---|
+| Timer Counter channel (TC0–TC3, three channels each) | 23–28, 47–52 | A status bit enabled in `TC_IMR` is set, usually "count reached RC" | Reading `TC_SR` |
+| PIO port (PIOA–PIOE) | 10, 11, 12, 16, 17 | A pin enabled in `PIO_IMR` has changed | Reading `PIO_ISR` |
+
+A sleeping CPU skips straight to the next timer event, as it does for SysTick, and to the next pin change scheduled with `--pin=` (see `firmware/firmware.md`).
+
 ## The FPU and the exception frame
 
 Code that has used the FPU has more registers worth saving. The processor tracks this in `CONTROL` bit 2 (FPCA), which it sets the first time a context executes an FPU instruction.

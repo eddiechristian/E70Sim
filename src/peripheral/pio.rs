@@ -12,9 +12,16 @@
 //! the second clears them. Those groups are all handled by one table.
 //!
 //! Pin levels (PIO_PDSR): an output pin reads back what was driven onto it;
-//! an input pin reads 1, as if pulled up with nothing pressing it.
+//! any other pin reads what the outside world drives, which is 1 (as if
+//! pulled up with nothing pressing it) until `set_input` says otherwise.
+//! The emulator's `--pin=` option is what calls `set_input`.
 //!
-//! Not modelled: interrupts (PIO_ISR always reads 0), write protection
+//! Interrupts: a change on a pin sets its bit in PIO_ISR, and the port
+//! asks for its interrupt while a bit set there is also enabled in
+//! PIO_IMR. Reading PIO_ISR clears it. With PIO_AIMMR a pin can be
+//! limited to one edge, or to a level (see `detect_edges`).
+//!
+//! Not modelled: the input glitch filter and debouncing, write protection
 //! (PIO_WPMR stores WPEN but protects nothing), pin locking, parallel
 //! capture, and per-port reset values (every register starts at 0).
 //!
@@ -73,16 +80,80 @@ const WPMR_WPKEY_PASSWD: u32 = 0x50_494F; // "PIO" in ASCII
 /// Size of the register block, from the SVD address block.
 const BLOCK_SIZE: u32 = 0x168;
 
+const PIO_IMR: u32 = 0x48; // Interrupt Mask
+const PIO_AIMMR: u32 = 0xB8; // Additional Interrupt Modes Mask
+const PIO_ELSR: u32 = 0xC8; // Edge/Level Status (1 = level)
+const PIO_FRLHSR: u32 = 0xD8; // Fall/Rise - Low/High Status (1 = rising or high)
+
 pub struct PioStub {
     /// One slot per 32-bit register, indexed by offset / 4.
     regs: [u32; (BLOCK_SIZE / 4) as usize],
+    /// The level the outside world puts on each pin: bit n is pin n.
+    /// It shows on the pins that are not outputs. All high after reset,
+    /// as if every pin had a pull-up and nothing connected.
+    inputs: u32,
+    /// PIO_ISR: pins on which an interrupt condition has been seen since
+    /// the register was last read.
+    interrupt_status: u32,
 }
 
 impl PioStub {
     pub fn new() -> Self {
         PioStub {
             regs: [0; (BLOCK_SIZE / 4) as usize],
+            inputs: 0xFFFF_FFFF,
+            interrupt_status: 0,
         }
+    }
+
+    /// The level on every pin (PIO_PDSR): an output pin shows what the
+    /// firmware drives, any other pin what the outside world drives.
+    fn pin_levels(&self) -> u32 {
+        let outputs = self.get(PIO_OSR);
+        (self.get(PIO_ODSR) & outputs) | (self.inputs & !outputs)
+    }
+
+    /// Pins set up for a level interrupt whose level is present now.
+    /// Unlike an edge, a level keeps the interrupt condition true for as
+    /// long as it lasts.
+    fn active_levels(&self) -> u32 {
+        let wanted = self.get(PIO_FRLHSR); // 1 = high level, 0 = low level
+        self.get(PIO_AIMMR) & self.get(PIO_ELSR) & !(self.pin_levels() ^ wanted)
+    }
+
+    /// Note the edges between two sets of pin levels in PIO_ISR.
+    ///
+    /// By default any change counts. A pin with its bit set in
+    /// PIO_AIMMR ("additional interrupt modes") is pickier: PIO_ELSR
+    /// says edge or level, and PIO_FRLHSR which edge or which level.
+    fn detect_edges(&mut self, before: u32, after: u32) {
+        let changed = before ^ after;
+        let additional = self.get(PIO_AIMMR);
+        let edge_mode = additional & !self.get(PIO_ELSR);
+        let rising_wanted = self.get(PIO_FRLHSR);
+        let rising = changed & after;
+        let falling = changed & !after;
+        self.interrupt_status |= changed & !additional;
+        self.interrupt_status |=
+            edge_mode & ((rising & rising_wanted) | (falling & !rising_wanted));
+    }
+
+    /// The outside world drives pin `pin` (0 to 31) high or low.
+    pub fn set_input(&mut self, pin: u32, high: bool) {
+        let before = self.pin_levels();
+        if high {
+            self.inputs |= 1 << pin;
+        } else {
+            self.inputs &= !(1 << pin);
+        }
+        self.detect_edges(before, self.pin_levels());
+    }
+
+    /// True while the port is asking for its interrupt: an interrupt
+    /// condition has been seen, or is present, on a pin enabled in
+    /// PIO_IMR.
+    pub fn interrupt_requested(&self) -> bool {
+        (self.interrupt_status | self.active_levels()) & self.get(PIO_IMR) != 0
     }
 
     fn get(&self, offset: u32) -> u32 {
@@ -110,13 +181,17 @@ impl Peripheral for PioStub {
             return 0;
         }
         match offset {
-            PIO_PDSR => {
-                let outputs = self.get(PIO_OSR);
-                (self.get(PIO_ODSR) & outputs) | !outputs
+            PIO_PDSR => self.pin_levels(),
+            PIO_ISR => {
+                // Reading clears it; a level that is still present shows
+                // again at once.
+                let value = self.interrupt_status | self.active_levels();
+                self.interrupt_status = 0;
+                value
             }
-            // No interrupts, no locked pins, no protection violations and
-            // no parallel capture data.
-            PIO_ISR | PIO_LOCKSR | PIO_WPSR | PIO_PCISR | PIO_PCRHR => 0,
+            // No locked pins, no protection violations and no parallel
+            // capture data.
+            PIO_LOCKSR | PIO_WPSR | PIO_PCISR | PIO_PCRHR => 0,
             // Triplet status registers and plain configuration registers
             // (ABCDSR, SCDR, WPMR, SCHMITT, DRIVER, PCMR) read what is stored.
             _ => self.get(offset),
@@ -128,6 +203,17 @@ impl Peripheral for PioStub {
         if offset >= BLOCK_SIZE {
             return;
         }
+        // A write can change what is on the pins (an output driven the
+        // other way, a pin turned into an output), and that is an edge
+        // like any other.
+        let before = self.pin_levels();
+        self.write_register(offset, value);
+        self.detect_edges(before, self.pin_levels());
+    }
+}
+
+impl PioStub {
+    fn write_register(&mut self, offset: u32, value: u32) {
         for t in &TRIPLETS {
             if offset == t.set {
                 self.set(t.status, self.get(t.status) | value);
@@ -260,10 +346,110 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_status_is_always_clear() {
+    fn interrupt_status_is_read_only() {
         let mut pio = PioStub::new();
         pio.write(PIO_ISR, 4, 0xFFFF_FFFF);
         assert_eq!(pio.read(PIO_ISR, 4), 0);
+    }
+
+    const PIO_IER: u32 = 0x40;
+    const PIO_IDR: u32 = 0x44;
+    const PIO_AIMER: u32 = 0xB0;
+    const PIO_FELLSR: u32 = 0xD0;
+    const PIO_REHLSR: u32 = 0xD4;
+    const BUTTON: u32 = 1 << 11; // a button on pin 11
+
+    #[test]
+    fn outside_world_drives_the_pins_that_are_not_outputs() {
+        let mut pio = PioStub::new();
+        pio.set_input(11, false);
+        assert_eq!(pio.read(PIO_PDSR, 4), !BUTTON);
+        pio.set_input(11, true);
+        assert_eq!(pio.read(PIO_PDSR, 4), 0xFFFF_FFFF);
+        // An output pin shows what the firmware drives instead.
+        pio.write(PIO_OER, 4, BUTTON);
+        pio.write(PIO_SODR, 4, BUTTON);
+        pio.set_input(11, false);
+        assert_ne!(pio.read(PIO_PDSR, 4) & BUTTON, 0);
+    }
+
+    #[test]
+    fn any_change_on_a_pin_is_noted_until_the_status_is_read() {
+        let mut pio = PioStub::new();
+        pio.set_input(11, false);
+        assert_eq!(pio.read(PIO_ISR, 4), BUTTON);
+        assert_eq!(pio.read(PIO_ISR, 4), 0); // cleared by the read
+        pio.set_input(11, true); // the other edge counts too
+        assert_eq!(pio.read(PIO_ISR, 4), BUTTON);
+        pio.set_input(11, true); // no change
+        assert_eq!(pio.read(PIO_ISR, 4), 0);
+    }
+
+    #[test]
+    fn interrupt_is_requested_only_for_enabled_pins() {
+        let mut pio = PioStub::new();
+        pio.set_input(11, false);
+        assert!(!pio.interrupt_requested());
+        pio.write(PIO_IER, 4, BUTTON);
+        assert!(pio.interrupt_requested()); // the change was remembered
+        pio.read(PIO_ISR, 4);
+        assert!(!pio.interrupt_requested());
+
+        pio.set_input(3, false); // a pin that is not enabled
+        assert!(!pio.interrupt_requested());
+        pio.write(PIO_IDR, 4, BUTTON);
+        pio.set_input(11, true);
+        assert!(!pio.interrupt_requested());
+    }
+
+    #[test]
+    fn one_edge_can_be_selected() {
+        // Falling edge only (a button that pulls the pin low).
+        let mut pio = PioStub::new();
+        pio.write(PIO_AIMER, 4, BUTTON);
+        pio.write(PIO_ESR, 4, BUTTON);
+        pio.write(PIO_FELLSR, 4, BUTTON);
+        pio.set_input(11, false);
+        assert_eq!(pio.read(PIO_ISR, 4), BUTTON);
+        pio.set_input(11, true); // released: not the edge asked for
+        assert_eq!(pio.read(PIO_ISR, 4), 0);
+
+        // Rising edge only.
+        let mut pio = PioStub::new();
+        pio.write(PIO_AIMER, 4, BUTTON);
+        pio.write(PIO_ESR, 4, BUTTON);
+        pio.write(PIO_REHLSR, 4, BUTTON);
+        pio.set_input(11, false);
+        assert_eq!(pio.read(PIO_ISR, 4), 0);
+        pio.set_input(11, true);
+        assert_eq!(pio.read(PIO_ISR, 4), BUTTON);
+    }
+
+    #[test]
+    fn level_interrupt_lasts_as_long_as_the_level() {
+        let mut pio = PioStub::new();
+        pio.write(PIO_AIMER, 4, BUTTON);
+        pio.write(PIO_LSR, 4, BUTTON);
+        pio.write(PIO_FELLSR, 4, BUTTON); // low level
+        pio.write(PIO_IER, 4, BUTTON);
+        assert!(!pio.interrupt_requested()); // the pin is high
+        pio.set_input(11, false);
+        assert!(pio.interrupt_requested());
+        // Reading the status does not make a level go away.
+        assert_eq!(pio.read(PIO_ISR, 4), BUTTON);
+        assert!(pio.interrupt_requested());
+        pio.set_input(11, true);
+        assert!(!pio.interrupt_requested());
+    }
+
+    #[test]
+    fn output_driven_by_firmware_is_an_edge_too() {
+        let mut pio = PioStub::new();
+        pio.write(PIO_SODR, 4, 1);
+        pio.write(PIO_OER, 4, 1); // output, driven high: no change
+        assert_eq!(pio.read(PIO_ISR, 4), 0);
+        pio.write(PIO_CODR, 4, 1); // driven low
+        assert_eq!(pio.read(PIO_ISR, 4), 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::sync::mpsc::Receiver;
 
 use crate::peripheral::Peripheral;
+use crate::peripheral::dwt::Dwt;
 use crate::peripheral::efc::EfcStub;
 use crate::peripheral::matrix::MatrixStub;
 use crate::peripheral::nvic::Nvic;
@@ -10,6 +11,7 @@ use crate::peripheral::rstc::RstcStub;
 use crate::peripheral::scb::ScbStub;
 use crate::peripheral::supc::SupcStub;
 use crate::peripheral::systick::SysTick;
+use crate::peripheral::tc::Tc;
 use crate::peripheral::uart::Uart0;
 use crate::peripheral::wdt::WdtStub;
 
@@ -25,6 +27,9 @@ const UART0_BASE: u32 = 0x400E_0800;
 const UART0_SIZE: u32 = 0x200;
 const EFC_BASE: u32 = 0x400E_0C00;
 const EFC_SIZE: u32 = 0x200;
+// Four Timer Counter modules, TC0 to TC3, of three channels each.
+const TC_BASES: [u32; 4] = [0x4000_C000, 0x4001_0000, 0x4001_4000, 0x4005_4000];
+const TC_SIZE: u32 = 0x100;
 const MATRIX_BASE: u32 = 0x4008_8000;
 const MATRIX_SIZE: u32 = 0x200;
 // Five PIO ports, PIOA to PIOE, one after another.
@@ -39,6 +44,10 @@ const SUPC_BASE: u32 = 0x400E_1810;
 const SUPC_SIZE: u32 = 0x20;
 const WDT_BASE: u32 = 0x400E_1850;
 const WDT_SIZE: u32 = 0x10;
+// The DWT, debugging hardware that includes the cycle counter.
+const DWT_BASE: u32 = 0xE000_1000;
+const DWT_SIZE: u32 = 0x1000;
+const DWT_END: u32 = DWT_BASE + DWT_SIZE - 1;
 // System Control Space: SysTick, the NVIC, then the System Control Block
 // and everything above it.
 const SYSTICK_BASE: u32 = 0xE000_E010;
@@ -111,8 +120,67 @@ const SHCSR_USGFAULTENA: u32 = 1 << 18;
 /// can interrupt it.
 pub const PRIORITY_THREAD: i32 = 256;
 
-/// UART0's interrupt number (from the SVD).
+// Interrupt numbers (from the SVD).
 const IRQ_UART0: u32 = 7;
+/// One per PIO port, PIOA to PIOE.
+const IRQ_PIO: [u32; PIO_COUNT as usize] = [10, 11, 12, 16, 17];
+/// One per Timer Counter channel: `IRQ_TC[module][channel]`.
+const IRQ_TC: [[u32; 3]; 4] = [[23, 24, 25], [26, 27, 28], [47, 48, 49], [50, 51, 52]];
+
+/// A change to an input pin, due at a given moment: what the `--pin=`
+/// option sets up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PinEvent {
+    /// When, in clock cycles since reset.
+    pub cycle: u64,
+    /// PIO port, 0 (PIOA) to 4 (PIOE).
+    pub port: usize,
+    /// Pin within the port, 0 to 31.
+    pub pin: u32,
+    /// The level the pin is driven to.
+    pub high: bool,
+}
+
+impl PinEvent {
+    /// Parse the text of a `--pin=` option: port and pin, level, and the
+    /// cycle to apply it at, for example `PA11=0@5000000` for "drive
+    /// PA11 low at cycle 5,000,000". Underscores in the number are
+    /// ignored.
+    pub fn parse(text: &str) -> Result<PinEvent, String> {
+        let error = || {
+            format!(
+                "bad pin event '{}': expected something like PA11=0@5000000",
+                text
+            )
+        };
+        let (name, rest) = text.split_once('=').ok_or_else(error)?;
+        let (level, cycle) = rest.split_once('@').ok_or_else(error)?;
+        let mut letters = name.chars();
+        if letters.next() != Some('P') {
+            return Err(error());
+        }
+        let port = match letters.next() {
+            Some(letter @ 'A'..='E') => letter as usize - 'A' as usize,
+            _ => return Err(error()),
+        };
+        let pin: u32 = letters.as_str().parse().map_err(|_| error())?;
+        if pin > 31 {
+            return Err(error());
+        }
+        let high = match level {
+            "0" => false,
+            "1" => true,
+            _ => return Err(error()),
+        };
+        let cycle = cycle.replace('_', "").parse().map_err(|_| error())?;
+        Ok(PinEvent {
+            cycle,
+            port,
+            pin,
+            high,
+        })
+    }
+}
 
 /// Read `size` bytes (1, 2 or 4) at `offset` as a little-endian value. A
 /// read that runs off the end of the region is logged and returns 0 instead
@@ -145,6 +213,13 @@ fn write_le(mem: &mut [u8], offset: usize, size: usize, value: u32, addr: u32) {
     }
 }
 
+/// Which Timer Counter module `addr` belongs to, if any.
+fn tc_module(addr: u32) -> Option<usize> {
+    TC_BASES
+        .iter()
+        .position(|&base| (base..base + TC_SIZE).contains(&addr))
+}
+
 pub struct Bus {
     flash: Vec<u8>,
     sram: Vec<u8>,
@@ -160,6 +235,12 @@ pub struct Bus {
     scb: ScbStub,
     systick: SysTick,
     nvic: Nvic,
+    tc: [Tc; 4], // TC0 to TC3
+    dwt: Dwt,
+    /// Clock cycles since reset, as counted by `tick`.
+    cycles: u64,
+    /// Changes to input pins still to come, latest first.
+    pin_events: Vec<PinEvent>,
     /// System exceptions (numbers below 16) that have been requested and
     /// are waiting for the CPU to take them: bit n is set while exception
     /// number n is pending. Peripheral interrupts are kept by the NVIC.
@@ -196,6 +277,10 @@ impl Bus {
             scb: ScbStub::new(),
             systick: SysTick::new(),
             nvic: Nvic::new(),
+            tc: std::array::from_fn(|_| Tc::new()),
+            dwt: Dwt::new(),
+            cycles: 0,
+            pin_events: Vec::new(),
             pending_exceptions: 0,
             active_exceptions: 0,
             current_exception: 0,
@@ -220,8 +305,35 @@ impl Bus {
         if self.systick.tick(cycles) {
             self.pend_exception(EXCEPTION_SYSTICK);
         }
+        for tc in &mut self.tc {
+            tc.tick(cycles);
+        }
+        self.dwt.tick(cycles, self.scb.trace_enabled());
         self.uart0.poll_input();
+
+        // Apply the pin changes whose time has come.
+        self.cycles += cycles as u64;
+        while let Some(event) = self.pin_events.last().copied() {
+            if event.cycle > self.cycles {
+                break;
+            }
+            self.pin_events.pop();
+            self.set_pin(event.port, event.pin, event.high);
+        }
         self.update_irq_lines();
+    }
+
+    /// The outside world drives a pin high or low. `port` is 0 (PIOA)
+    /// to 4 (PIOE) and `pin` 0 to 31.
+    pub fn set_pin(&mut self, port: usize, pin: u32, high: bool) {
+        self.pio[port].set_input(pin, high);
+    }
+
+    /// Arrange for a pin to change at a later moment.
+    pub fn schedule_pin_event(&mut self, event: PinEvent) {
+        self.pin_events.push(event);
+        // Latest first, so the next one due is at the end.
+        self.pin_events.sort_by(|a, b| b.cycle.cmp(&a.cycle));
     }
 
     /// Connect UART0's receiver to a source of bytes, such as stdin.
@@ -233,6 +345,16 @@ impl Bus {
     fn update_irq_lines(&mut self) {
         self.nvic
             .set_line(IRQ_UART0, self.uart0.interrupt_requested());
+        for (port, &irq) in IRQ_PIO.iter().enumerate() {
+            self.nvic
+                .set_line(irq, self.pio[port].interrupt_requested());
+        }
+        for (module, irqs) in IRQ_TC.iter().enumerate() {
+            for (channel, &irq) in irqs.iter().enumerate() {
+                self.nvic
+                    .set_line(irq, self.tc[module].interrupt_requested(channel));
+            }
+        }
     }
 
     /// Ask for exception `number` to be taken. It stays pending until the
@@ -432,10 +554,21 @@ impl Bus {
     /// if nothing else changes. `None` if nothing is set up to raise one.
     /// A sleeping CPU uses this to skip the wait.
     pub fn cycles_until_next_exception(&self) -> Option<u32> {
-        // SysTick is the only source that works to a timetable. UART
-        // input arrives whenever the host delivers it, which cannot be
+        // The sources that work to a timetable: SysTick, the Timer
+        // Counters, and pin changes that have been scheduled. UART input
+        // arrives whenever the host delivers it, which cannot be
         // predicted; it is noticed on the next tick.
-        self.systick.cycles_until_exception()
+        let timers = self.tc.iter().filter_map(Tc::cycles_until_interrupt);
+        let pin = self.pin_events.last().map(|event| {
+            let wait = event.cycle.saturating_sub(self.cycles).max(1);
+            u32::try_from(wait).unwrap_or(u32::MAX)
+        });
+        self.systick
+            .cycles_until_exception()
+            .into_iter()
+            .chain(timers)
+            .chain(pin)
+            .min()
     }
 
     /// Hand the CPU a pending exception to take, if one is urgent enough
@@ -503,6 +636,11 @@ impl Bus {
             SUPC_BASE..=SUPC_END => self.supc.read(addr - SUPC_BASE, size),
             SYSTICK_BASE..=SYSTICK_END => self.systick.read(addr - SYSTICK_BASE, size),
             NVIC_BASE..=NVIC_END => self.nvic.read(addr - NVIC_BASE, size),
+            DWT_BASE..=DWT_END => self.dwt.read(addr - DWT_BASE, size),
+            _ if tc_module(addr).is_some() => {
+                let module = tc_module(addr).unwrap();
+                self.tc[module].read(addr - TC_BASES[module], size)
+            }
             // Any size of access to ICSR: pick the bytes asked for.
             ICSR..=ICSR_END => {
                 let word = self.read_icsr() >> ((addr & 3) * 8);
@@ -563,6 +701,11 @@ impl Bus {
             SUPC_BASE..=SUPC_END => self.supc.write(addr - SUPC_BASE, size, value),
             SYSTICK_BASE..=SYSTICK_END => self.systick.write(addr - SYSTICK_BASE, size, value),
             NVIC_BASE..=NVIC_END => self.nvic.write(addr - NVIC_BASE, size, value),
+            DWT_BASE..=DWT_END => self.dwt.write(addr - DWT_BASE, size, value),
+            _ if tc_module(addr).is_some() => {
+                let module = tc_module(addr).unwrap();
+                self.tc[module].write(addr - TC_BASES[module], size, value)
+            }
             // Writing 1 acts and writing 0 does nothing, so a narrow write
             // only needs its bits moved to their place in the register.
             ICSR..=ICSR_END => self.write_icsr(value << ((addr & 3) * 8)),
@@ -1111,5 +1254,154 @@ mod tests {
         // UsageFault has priority 0 by default: it cannot interrupt code
         // already running at 0.
         assert!(!bus.fault_exception_usable(6, 0));
+    }
+
+    const TC0: u32 = TC_BASES[0];
+    const TC_CMR_INTERVAL: u32 = (1 << 15) | (1 << 14); // waveform, restart at RC, PCK6
+
+    /// Start channel `channel` of TC `module` as an interval timer with
+    /// its RC interrupt on, and enable that IRQ in the NVIC.
+    fn start_timer(bus: &mut Bus, module: usize, channel: u32, period: u32) {
+        let base = TC_BASES[module] + 0x40 * channel;
+        bus.write32(base + 0x04, TC_CMR_INTERVAL);
+        bus.write32(base + 0x1C, period); // TC_RC
+        bus.write32(base + 0x24, 1 << 4); // TC_IER: CPCS
+        bus.write32(base, 0b101); // TC_CCR: CLKEN | SWTRG
+        let irq = IRQ_TC[module][channel as usize];
+        bus.write32(NVIC_BASE + 4 * (irq / 32), 1 << (irq % 32));
+    }
+
+    #[test]
+    fn timer_counter_raises_its_own_irq() {
+        let mut bus = Bus::new();
+        start_timer(&mut bus, 0, 0, 100);
+        bus.tick(99);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + 23));
+        // Reading TC_SR withdraws the request.
+        bus.read32(TC0 + 0x20);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn every_timer_channel_has_its_own_address_and_irq() {
+        for (module, irqs) in IRQ_TC.iter().enumerate() {
+            for (channel, &irq) in irqs.iter().enumerate() {
+                let mut bus = Bus::new();
+                start_timer(&mut bus, module, channel as u32, 10);
+                bus.tick(10);
+                assert_eq!(
+                    bus.take_pending_exception(PRIORITY_THREAD),
+                    Some(16 + irq),
+                    "TC{} channel {}",
+                    module,
+                    channel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_exception_time_is_the_earliest_of_the_timers() {
+        let mut bus = Bus::new();
+        bus.write32(SYSTICK_BASE + 0x04, 999); // SysTick: period 1000
+        bus.write32(SYSTICK_BASE + 0x08, 0);
+        bus.write32(SYSTICK_BASE, 0b011);
+        assert_eq!(bus.cycles_until_next_exception(), Some(1000));
+        start_timer(&mut bus, 1, 2, 300);
+        assert_eq!(bus.cycles_until_next_exception(), Some(300));
+        bus.tick(250);
+        assert_eq!(bus.cycles_until_next_exception(), Some(50));
+        // A pin change due sooner comes first.
+        bus.schedule_pin_event(PinEvent::parse("PA11=0@270").unwrap());
+        assert_eq!(bus.cycles_until_next_exception(), Some(20));
+    }
+
+    #[test]
+    fn pin_change_raises_the_ports_irq() {
+        let mut bus = Bus::new();
+        const PIOA: u32 = 0x400E_0E00;
+        bus.write32(PIOA + 0x40, 1 << 11); // PIO_IER
+        bus.write32(NVIC_BASE, 1 << 10); // ISER0: PIOA is IRQ 10
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+
+        bus.set_pin(0, 11, false);
+        assert_eq!(bus.read32(PIOA + 0x3C) & (1 << 11), 0); // PIO_PDSR
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + 10));
+        // Reading PIO_ISR withdraws the request.
+        assert_eq!(bus.read32(PIOA + 0x4C), 1 << 11);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn each_port_has_its_own_irq() {
+        for (port, &irq) in IRQ_PIO.iter().enumerate() {
+            let mut bus = Bus::new();
+            let base = PIO_BASE + PIO_SIZE * port as u32;
+            bus.write32(base + 0x40, 1); // PIO_IER, pin 0
+            bus.write32(NVIC_BASE, 1 << irq);
+            bus.set_pin(port, 0, false);
+            assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + irq));
+        }
+    }
+
+    #[test]
+    fn scheduled_pin_events_happen_at_their_cycle_in_order() {
+        let mut bus = Bus::new();
+        const PIOB_PDSR: u32 = 0x400E_1000 + 0x3C;
+        // Given out of order.
+        bus.schedule_pin_event(PinEvent::parse("PB3=1@200").unwrap());
+        bus.schedule_pin_event(PinEvent::parse("PB3=0@100").unwrap());
+        bus.tick(99);
+        assert_ne!(bus.read32(PIOB_PDSR) & (1 << 3), 0);
+        bus.tick(1);
+        assert_eq!(bus.read32(PIOB_PDSR) & (1 << 3), 0);
+        bus.tick(150); // passes cycle 200 in the middle of a step
+        assert_ne!(bus.read32(PIOB_PDSR) & (1 << 3), 0);
+        assert_eq!(bus.cycles_until_next_exception(), None);
+    }
+
+    #[test]
+    fn pin_event_text_is_parsed() {
+        assert_eq!(
+            PinEvent::parse("PA11=0@5_000_000"),
+            Ok(PinEvent {
+                cycle: 5_000_000,
+                port: 0,
+                pin: 11,
+                high: false
+            })
+        );
+        assert_eq!(
+            PinEvent::parse("PE31=1@0"),
+            Ok(PinEvent {
+                cycle: 0,
+                port: 4,
+                pin: 31,
+                high: true
+            })
+        );
+        for bad in [
+            "PA11", "PA11=0", "PF1=0@5", "PA32=0@5", "PA1=2@5", "A1=0@5", "PA1=0@x",
+        ] {
+            assert!(PinEvent::parse(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn cycle_counter_counts_once_both_enables_are_set() {
+        let mut bus = Bus::new();
+        const DEMCR: u32 = 0xE000_EDFC;
+        const DWT_CTRL: u32 = DWT_BASE;
+        const DWT_CYCCNT: u32 = DWT_BASE + 4;
+        bus.tick(100);
+        assert_eq!(bus.read32(DWT_CYCCNT), 0);
+        bus.write32(DEMCR, 1 << 24); // TRCENA
+        bus.write32(DWT_CTRL, 1); // CYCCNTENA
+        bus.tick(100);
+        bus.tick(23);
+        assert_eq!(bus.read32(DWT_CYCCNT), 123);
     }
 }

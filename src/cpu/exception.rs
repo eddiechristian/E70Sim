@@ -1302,4 +1302,111 @@ mod tests {
         cpu.step(&mut bus); // bx lr
         assert_eq!(bus.read32(ICSR) & 0x1FF, 0);
     }
+
+    const TC0: u32 = 0x4000_C000;
+    const TC0_IRQ: u32 = 23; // channel 0 of TC0
+
+    /// `main_code`, with a handler for TC0 channel 0 that reads TC_SR
+    /// (which withdraws the interrupt request) and counts in R5:
+    /// `ldr r0, =TC0 ; ldr r4, [r0, #0x20] ; adds r5, #1 ; bx lr`.
+    /// The channel runs as an interval timer of `period` clock cycles.
+    fn cpu_with_timer(main_code: &[u16], period: u32) -> (Cpu, Bus) {
+        let handler = [0x4801, 0x6A04, 0x3501, 0x4770, 0xC000, 0x4000];
+        let (cpu, mut bus) = cpu_with_handler(main_code, &handler, &[16 + TC0_IRQ]);
+        bus.write32(TC0 + 0x04, (1 << 15) | (1 << 14)); // TC_CMR: waveform, restart at RC
+        bus.write32(TC0 + 0x1C, period); // TC_RC
+        bus.write32(TC0 + 0x24, 1 << 4); // TC_IER: CPCS
+        bus.write32(TC0, 0b101); // TC_CCR: CLKEN | SWTRG
+        bus.write32(NVIC_ISER0, 1 << TC0_IRQ);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn timer_counter_interrupt_runs_its_handler_every_period() {
+        // Main: b . (3 cycles a time)
+        let (mut cpu, mut bus) = cpu_with_timer(&[0xE7FE], 300);
+        for _ in 0..100 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.cycles, 300);
+        assert_eq!(cpu.regs[5], 0);
+        for _ in 0..4 {
+            cpu.step(&mut bus); // entry and the four handler instructions
+        }
+        assert_eq!(cpu.regs[5], 1);
+        assert_eq!(cpu.regs[4], (1 << 4) | (1 << 16)); // TC_SR: CPCS and CLKSTA
+        assert!(!cpu.in_handler_mode());
+        // The handler read TC_SR, so it is not called again until the
+        // next period.
+        for _ in 0..50 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[5], 1);
+        while cpu.cycles < 3000 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[5], 9); // 10 periods, the last handler not run yet
+    }
+
+    #[test]
+    fn sleeping_cpu_wakes_exactly_when_the_timer_counter_fires() {
+        // Main: wfi ; b back to the wfi.
+        let (mut cpu, mut bus) = cpu_with_timer(&[0xBF30, 0xE7FD], 50_000);
+        cpu.step(&mut bus); // wfi
+        cpu.step(&mut bus); // one step skips the whole wait
+        assert_eq!(cpu.cycles, 50_000);
+        cpu.step(&mut bus); // wakes: entry and the handler's first instruction
+        assert!(cpu.in_handler_mode());
+        assert_eq!(cpu.xpsr & XPSR_IPSR, 16 + TC0_IRQ);
+    }
+
+    #[test]
+    fn scheduled_pin_change_runs_the_ports_handler() {
+        const PIOA: u32 = 0x400E_0E00;
+        const PIOA_IRQ: u32 = 10;
+        // Main: wfi ; b back. Handler: read PIO_ISR into R4.
+        //   ldr r0, =PIOA ; ldr r4, [r0, #0x4c] ; adds r5, #1 ; bx lr
+        let handler = [0x4801, 0x6CC4, 0x3501, 0x4770, 0x0E00, 0x400E];
+        let (mut cpu, mut bus) = cpu_with_handler(&[0xBF30, 0xE7FD], &handler, &[16 + PIOA_IRQ]);
+        bus.write32(PIOA + 0x40, 1 << 11); // PIO_IER: pin 11
+        bus.write32(NVIC_ISER0, 1 << PIOA_IRQ);
+        // A button on PA11 is pressed at cycle 10,000 and let go later.
+        bus.schedule_pin_event(crate::bus::PinEvent::parse("PA11=0@10000").unwrap());
+        bus.schedule_pin_event(crate::bus::PinEvent::parse("PA11=1@30000").unwrap());
+
+        cpu.step(&mut bus); // wfi
+        cpu.step(&mut bus); // skips to the press
+        assert_eq!(cpu.cycles, 10_000);
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[5], 1);
+        assert_eq!(cpu.regs[4], 1 << 11); // PIO_ISR named the pin
+        assert_eq!(bus.read32(PIOA + 0x3C) & (1 << 11), 0); // PIO_PDSR: low
+
+        // The release is a change too, so the handler runs again.
+        while cpu.regs[5] < 2 {
+            cpu.step(&mut bus);
+        }
+        assert!(cpu.cycles >= 30_000);
+        assert_ne!(bus.read32(PIOA + 0x3C) & (1 << 11), 0);
+    }
+
+    #[test]
+    fn firmware_can_time_its_own_code_with_the_cycle_counter() {
+        // ldr r0, =DWT_CYCCNT ; ldr r1, [r0] ; nop ; nop ; nop ;
+        // ldr r2, [r0]
+        let main = [
+            0x4802, 0x6801, 0xBF00, 0xBF00, 0xBF00, 0x6802, 0x1004, 0xE000,
+        ];
+        let (mut cpu, mut bus) = cpu_with_handler(&main, &[], &[]);
+        bus.write32(0xE000_EDFC, 1 << 24); // DEMCR: TRCENA
+        bus.write32(0xE000_1000, 1); // DWT_CTRL: CYCCNTENA
+        for _ in 0..6 {
+            cpu.step(&mut bus);
+        }
+        // Between the two reads: the first load (2 cycles) and three
+        // nops (1 each).
+        assert_eq!(cpu.regs[2] - cpu.regs[1], 5);
+    }
 }

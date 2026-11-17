@@ -83,7 +83,7 @@ Startup code busy-waits on "ready" bits; stubs must report ready immediately.
 | WDT | `0x400E1850` | ✅ Never expires. `WDT_MR` (`+0x04`) resets to `0x3FFF2FFF` and is write-once, so the disable write (WDDIS, bit 15) reads back; `WDT_CR` (`+0x00`) restart is a no-op; `WDT_SR` (`+0x08`) reads 0 |
 | SUPC | `0x400E1810` | ✅ Store-and-readback; `SUPC_CR` (`+0x00`) XTALSEL sets OSCSEL (bit 7) in `SUPC_SR` (`+0x14`) at once |
 | RSTC | `0x400E1800` | ✅ `RSTC_SR` (`+0x04`) reports a power-up reset with NRST high; `RSTC_MR` (`+0x08`) store-and-readback; software reset logged, not carried out |
-| PIOA–PIOE | `0x400E0E00` + `0x200` per port | ✅ Enable / disable / status register groups; outputs read back in `PIO_PDSR` (`+0x3C`), inputs read 1; no interrupts |
+| PIOA–PIOE | `0x400E0E00` + `0x200` per port | ✅ Enable / disable / status register groups; outputs read back in `PIO_PDSR` (`+0x3C`), inputs read 1 unless driven with `--pin=`; pin-change interrupts |
 | MATRIX | `0x40088000` | ✅ Store-and-readback (including `CCFG_SYSIO`, `+0x114`) |
 | SCB | `0xE000ED00` | ✅ Store-and-readback: VTOR, CPACR, CCR, SHPR, MPU; fixed CPUID and cache ID registers; cache maintenance writes ignored; exception and reset requests logged, not carried out |
 
@@ -117,9 +117,10 @@ All offsets and bit names in this table are verified against the SVD.
 
 - [x] FPU (ARM ARM A6) for hard-float firmware: S/D registers, FPSCR, CPACR enable, extended exception frame with lazy saving, and the instructions `firmware/float-rs/` uses. Of the FPv5 additions, `VSEL` and `VMAXNM` / `VMINNM` are done; `VRINT*` and `VCVTA` / `N` / `P` / `M` are still to come
 - [ ] GDB remote stub (`target remote`)
-- [ ] TC timers, PIO interrupts, other peripherals
+- [x] TC timers (interval timing and compare interrupts; no pin functions) and PIO pin-change interrupts, with input pins driven by `--pin=`
+- [ ] Other peripherals, as firmware needs them
 - [x] Cycle counting: every instruction reports an estimated cost in clock cycles (see `exceptionInterrupt.md`)
-- [ ] `DWT_CYCCNT` register, reading the cycle count
+- [x] `DWT_CYCCNT` register, reading the cycle count
 
 ## Phase 6 — I2C gyro add-on card (BNO055 Xplained Pro)
 

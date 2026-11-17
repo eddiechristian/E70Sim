@@ -2,6 +2,7 @@
 //! file per peripheral in `src/peripheral/`. The bus maps each stub to its
 //! address range.
 
+pub mod dwt;
 pub mod efc;
 pub mod matrix;
 pub mod nvic;
@@ -11,6 +12,7 @@ pub mod rstc;
 pub mod scb;
 pub mod supc;
 pub mod systick;
+pub mod tc;
 pub mod uart;
 pub mod wdt;
 
