@@ -47,6 +47,20 @@ pub trait I2cDevice {
     /// Let emulated time pass, for devices whose behaviour depends on
     /// it. Most do not.
     fn tick(&mut self, _cycles: u32) {}
+
+    /// The level of the device's interrupt output pin: a separate wire
+    /// from the I2C bus, which some devices use to get the processor's
+    /// attention. `None` if the device has no such pin.
+    fn interrupt_line(&self) -> Option<bool> {
+        None
+    }
+
+    /// How many clock cycles from now the device will next do something
+    /// on its own, such as take a measurement, or `None` if it only
+    /// ever reacts. A sleeping CPU uses this to skip the wait.
+    fn cycles_until_event(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A small memory on the I2C bus: `size` bytes, each one a "register".

@@ -134,6 +134,24 @@ impl Twihs {
         }
     }
 
+    /// The interrupt output of the attached device at `address`, if
+    /// there is such a device and it has one.
+    pub fn device_interrupt_line(&self, address: u8) -> Option<bool> {
+        self.devices
+            .iter()
+            .find(|d| d.address() == address)
+            .and_then(|d| d.interrupt_line())
+    }
+
+    /// How many clock cycles from now an attached device will next do
+    /// something on its own.
+    pub fn cycles_until_device_event(&self) -> Option<u32> {
+        self.devices
+            .iter()
+            .filter_map(|d| d.cycles_until_event())
+            .min()
+    }
+
     /// True while the controller is asking for its interrupt: a status
     /// bit that is set is also enabled in TWIHS_IMR.
     pub fn interrupt_requested(&self) -> bool {

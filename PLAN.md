@@ -8,6 +8,7 @@ Reference docs (repo root):
 - `ATSAME70Q21.svd` — peripheral base addresses, register offsets, bitfields, IRQ numbers.
 - `reference/same70/SAM-E70S70V70V71-Family-Data-Sheet-DS60001527F.pdf` — the chip's datasheet (1942 pages): how each peripheral behaves, pin functions, clocks. Chapter 32 PIO, 43 TWIHS, 47 UART, 50 TC.
 - `reference/same70/SAM-E70-Xplained-Ultra-User-Guide-70005389A.pdf` — the SAM E70 Xplained Ultra board's user guide (58 pages): what each header pin and on-board part is wired to. The schematics start on page 28; the EXT1 / EXT2 headers are on page 33.
+- `reference/bno055/BNO055-Xplained-Pro-design-documentation.pdf` — the BNO055 card's schematic (page 1): which header pin each sensor signal is on.
 - `DDI0403E_e_armv7m_arm.pdf` — ARMv7-M ARM. Key chapters: A2 (programmers' model), A5 (Thumb encoding tables), A6 (FP encoding), A7 (instruction details + pseudocode), B1 (exception model), B3 (system address map / SCS).
 
 ---
@@ -161,7 +162,7 @@ References: `reference/bno055/BST-BNO055-DS000-18.pdf` (register map chapter 4, 
 To verify before or during implementation:
 - Which TWIHS instance the EXT1/EXT2 header pins use on the SAM E70 Xplained Ultra: TWIHS0 on PA3 / PA4, from the schematic on page 33 of the board's user guide in `reference/same70/`
 - TWIHS transfer sequencing (when TXRDY/RXRDY/TXCOMP set and clear): now available in chapter 43 of the SAM E70 datasheet in `reference/same70/`
-- RGB LED wiring on the card (PIO pins)
+- RGB LED wiring on the card: red on EXT pin 8 (PC30), green on pin 6 (PB2), blue on pin 7 (PA0), from the card's schematic in `reference/bno055/`
 
 ### ✅ Milestone 3: firmware reads gyro values over I2C and prints them over UART
 

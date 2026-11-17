@@ -176,6 +176,9 @@ impl Cpu {
         // and its priority is the one to beat.
         bus.activate_exception(number);
         bus.set_current_exception(number);
+        // Whatever exclusive access the interrupted code had begun, it
+        // must start again.
+        self.exclusive = false;
 
         // 4. Load the PC from the vector table.
         let table = bus.read32(VTOR);
@@ -246,6 +249,7 @@ impl Cpu {
         }
 
         bus.deactivate_exception(returning);
+        self.exclusive = false;
         // FAULTMASK does not outlive the handler that set it, except
         // for NMI's (B5.2.1).
         if returning != EXCEPTION_NMI {
@@ -1408,5 +1412,25 @@ mod tests {
         // Between the two reads: the first load (2 cycles) and three
         // nops (1 each).
         assert_eq!(cpu.regs[2] - cpu.regs[1], 5);
+    }
+
+    #[test]
+    fn exception_between_exclusive_load_and_store_makes_the_store_fail() {
+        // Main: ldrex r0, [r1] ; strex r2, r0, [r1] ; b .
+        // SysTick handler: bx lr.
+        let (mut cpu, mut bus) = cpu_with_handler(
+            &[0xE851, 0x0F00, 0xE841, 0x0200, 0xE7FE],
+            &[0x4770],
+            &[SYSTICK],
+        );
+        cpu.regs[1] = 0x2040_0000;
+        cpu.step(&mut bus); // ldrex
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // the handler runs and returns
+        assert!(!cpu.in_handler_mode());
+        cpu.regs[0] = 7;
+        cpu.step(&mut bus); // strex: the mark is gone
+        assert_eq!(cpu.regs[2], 1);
+        assert_eq!(bus.read32(0x2040_0000), 0);
     }
 }

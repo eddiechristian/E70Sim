@@ -148,6 +148,37 @@ pub struct PinEvent {
     pub high: bool,
 }
 
+/// Parse a pin's name, such as `PA11` or `PD28`, into its port (0 for
+/// PIOA to 4 for PIOE) and its number within the port (0 to 31).
+pub fn parse_pin_name(name: &str) -> Result<(usize, u32), String> {
+    let error = || format!("bad pin name '{}': expected something like PA11", name);
+    let mut letters = name.chars();
+    if letters.next() != Some('P') {
+        return Err(error());
+    }
+    let port = match letters.next() {
+        Some(letter @ 'A'..='E') => letter as usize - 'A' as usize,
+        _ => return Err(error()),
+    };
+    let pin: u32 = letters.as_str().parse().map_err(|_| error())?;
+    if pin > 31 {
+        return Err(error());
+    }
+    Ok((port, pin))
+}
+
+/// A wire from an I2C device's interrupt output to an input pin.
+struct InterruptWire {
+    /// Which I2C controller's bus the device is on, and its address.
+    controller: usize,
+    address: u8,
+    /// The pin the wire goes to.
+    port: usize,
+    pin: u32,
+    /// The level last put on the pin.
+    level: bool,
+}
+
 impl PinEvent {
     /// Parse the text of a `--pin=` option: port and pin, level, and the
     /// cycle to apply it at, for example `PA11=0@5000000` for "drive
@@ -162,18 +193,7 @@ impl PinEvent {
         };
         let (name, rest) = text.split_once('=').ok_or_else(error)?;
         let (level, cycle) = rest.split_once('@').ok_or_else(error)?;
-        let mut letters = name.chars();
-        if letters.next() != Some('P') {
-            return Err(error());
-        }
-        let port = match letters.next() {
-            Some(letter @ 'A'..='E') => letter as usize - 'A' as usize,
-            _ => return Err(error()),
-        };
-        let pin: u32 = letters.as_str().parse().map_err(|_| error())?;
-        if pin > 31 {
-            return Err(error());
-        }
+        let (port, pin) = parse_pin_name(name).map_err(|_| error())?;
         let high = match level {
             "0" => false,
             "1" => true,
@@ -256,6 +276,8 @@ pub struct Bus {
     cycles: u64,
     /// Changes to input pins still to come, latest first.
     pin_events: Vec<PinEvent>,
+    /// Interrupt outputs of I2C devices that are wired to input pins.
+    interrupt_wires: Vec<InterruptWire>,
     /// System exceptions (numbers below 16) that have been requested and
     /// are waiting for the CPU to take them: bit n is set while exception
     /// number n is pending. Peripheral interrupts are kept by the NVIC.
@@ -297,6 +319,7 @@ impl Bus {
             dwt: Dwt::new(),
             cycles: 0,
             pin_events: Vec::new(),
+            interrupt_wires: Vec::new(),
             pending_exceptions: 0,
             active_exceptions: 0,
             current_exception: 0,
@@ -339,6 +362,7 @@ impl Bus {
             self.pin_events.pop();
             self.set_pin(event.port, event.pin, event.high);
         }
+        self.update_interrupt_wires();
         self.update_irq_lines();
     }
 
@@ -346,6 +370,37 @@ impl Bus {
     /// (TWIHS0) to 2 (TWIHS2).
     pub fn attach_i2c_device(&mut self, controller: usize, device: Box<dyn I2cDevice>) {
         self.twihs[controller].attach(device);
+    }
+
+    /// Wire the interrupt output of the I2C device at `address` on
+    /// controller `controller`'s bus to an input pin. From then on the
+    /// pin follows the device's output.
+    pub fn connect_i2c_interrupt(&mut self, controller: usize, address: u8, port: usize, pin: u32) {
+        // An unconnected pin reads high.
+        self.interrupt_wires.push(InterruptWire {
+            controller,
+            address,
+            port,
+            pin,
+            level: true,
+        });
+        self.update_interrupt_wires();
+    }
+
+    /// Put each wired device's interrupt output on its pin, if it has
+    /// changed.
+    fn update_interrupt_wires(&mut self) {
+        for i in 0..self.interrupt_wires.len() {
+            let wire = &self.interrupt_wires[i];
+            let level = self.twihs[wire.controller].device_interrupt_line(wire.address);
+            if let Some(level) = level
+                && level != wire.level
+            {
+                let (port, pin) = (wire.port, wire.pin);
+                self.interrupt_wires[i].level = level;
+                self.set_pin(port, pin, level);
+            }
+        }
     }
 
     /// The outside world drives a pin high or low. `port` is 0 (PIOA)
@@ -587,7 +642,17 @@ impl Bus {
         // Counters, and pin changes that have been scheduled. UART input
         // arrives whenever the host delivers it, which cannot be
         // predicted; it is noticed on the next tick.
-        let timers = self.tc.iter().filter_map(Tc::cycles_until_interrupt);
+        // Also the next moment an I2C device does something on its own,
+        // which may change its interrupt output.
+        let devices = self
+            .twihs
+            .iter()
+            .filter_map(Twihs::cycles_until_device_event);
+        let timers = self
+            .tc
+            .iter()
+            .filter_map(Tc::cycles_until_interrupt)
+            .chain(devices);
         let pin = self.pin_events.last().map(|event| {
             let wait = event.cycle.saturating_sub(self.cycles).max(1);
             u32::try_from(wait).unwrap_or(u32::MAX)
@@ -1511,6 +1576,75 @@ mod tests {
             assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + irq));
             bus.read32(base + 0x30); // reading it withdraws the request
             assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+        }
+    }
+
+    /// An I2C device that is nothing but an interrupt output, which the
+    /// test sets through a shared flag.
+    struct Alarm(std::rc::Rc<std::cell::Cell<bool>>);
+    impl I2cDevice for Alarm {
+        fn address(&self) -> u8 {
+            0x29
+        }
+        fn start(&mut self) {}
+        fn write(&mut self, _byte: u8) -> bool {
+            true
+        }
+        fn read(&mut self) -> u8 {
+            0
+        }
+        fn interrupt_line(&self) -> Option<bool> {
+            Some(self.0.get())
+        }
+    }
+
+    #[test]
+    fn device_interrupt_output_drives_the_pin_it_is_wired_to() {
+        const PIOD: u32 = 0x400E_1400;
+        let line = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut bus = Bus::new();
+        bus.attach_i2c_device(0, Box::new(Alarm(line.clone())));
+        bus.connect_i2c_interrupt(0, 0x29, 3, 28); // to PD28
+        // The device holds the line low from the start.
+        assert_eq!(bus.read32(PIOD + 0x3C) & (1 << 28), 0); // PIO_PDSR
+        bus.read32(PIOD + 0x4C); // PIO_ISR: forget that first edge
+
+        // Rising edge only, with the interrupt on.
+        bus.write32(PIOD + 0xB0, 1 << 28); // PIO_AIMER
+        bus.write32(PIOD + 0xC0, 1 << 28); // PIO_ESR
+        bus.write32(PIOD + 0xD4, 1 << 28); // PIO_REHLSR
+        bus.write32(PIOD + 0x40, 1 << 28); // PIO_IER
+        bus.write32(NVIC_BASE, 1 << 16); // PIOD is IRQ 16
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+
+        line.set(true);
+        bus.tick(1);
+        assert_ne!(bus.read32(PIOD + 0x3C) & (1 << 28), 0);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(16 + 16));
+        assert_eq!(bus.read32(PIOD + 0x4C), 1 << 28);
+
+        // Lowering it again is not the edge asked for.
+        line.set(false);
+        bus.tick(1);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn unwired_device_interrupt_output_changes_no_pin() {
+        let line = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut bus = Bus::new();
+        bus.attach_i2c_device(0, Box::new(Alarm(line)));
+        bus.tick(1);
+        assert_eq!(bus.read32(0x400E_1400 + 0x3C), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn pin_names_are_parsed() {
+        assert_eq!(parse_pin_name("PD28"), Ok((3, 28)));
+        assert_eq!(parse_pin_name("PA0"), Ok((0, 0)));
+        for bad in ["D28", "PF1", "PA32", "PA", "PAx"] {
+            assert!(parse_pin_name(bad).is_err(), "{}", bad);
         }
     }
 }

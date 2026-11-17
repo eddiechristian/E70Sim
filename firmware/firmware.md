@@ -400,6 +400,7 @@ What it does, in order:
 3. **Resets the sensor and switches the gyro on** (register `OPR_MODE` to GYROONLY), waiting the times the sensor's datasheet asks for: 650 ms and 7 ms, using `delay_ms`.
 4. **Reads six bytes five times**, 100 ms apart, waiting for each byte in a loop, and prints X, Y and Z.
 5. **Reads them once more by interrupt**: the TWIHS0 handler (IRQ 19) collects the bytes while `main` sleeps in `WFI`.
+6. **Watches for fast turning** for three seconds: the sensor is told to raise its INT line, wired to PD28, when any axis exceeds 50 degrees per second, and a PIOD handler (IRQ 16) notes each time it does. Try `--gyro=100,0,0` or `--gyro=pattern` to see it fire.
 
 Two details of the I2C code are worth knowing:
 

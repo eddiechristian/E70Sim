@@ -181,9 +181,65 @@ impl Cpu {
         // The 12-bit constant field i:imm3:imm8.
         let imm12 = ((hw1 & 0x400) << 1) | ((hw2 >> 4) & 0x700) | (hw2 & 0xFF);
 
+        // Exclusive access: how code changes a value in memory without
+        // an interrupt handler being able to change it in between
+        // (A3.4). LDREX loads the value and leaves a mark. STREX stores
+        // the new value only if the mark is still there, and says
+        // whether it did: 0 in Rd for stored, 1 for not. Taking or
+        // returning from an exception removes the mark, so if a handler
+        // ran in between, the store does not happen and the code tries
+        // again. Rust's atomic `swap` and `fetch_add` compile to this.
+        //
+        // LDREX:  111010000101 Rn | Rt 1111 imm8        (A7.7.52)
+        // STREX:  111010000100 Rn | Rt Rd imm8          (A7.7.167)
+        // LDREXB / LDREXH: 111010001101 Rn | Rt 1111 010 H 1111
+        // STREXB / STREXH: 111010001100 Rn | Rt 1111 010 H Rd
+        //                                   (A7.7.53, A7.7.54, A7.7.168, A7.7.169)
+        if (hw1 & 0xFFE0 == 0xE840 || (hw1 & 0xFFE0 == 0xE8C0 && hw2 & 0x0FE0 == 0x0F40)) && n != PC
+        {
+            let word = hw1 & 0x0080 == 0;
+            let load = hw1 & (1 << 4) != 0;
+            // Only the word form has an offset; the byte and halfword
+            // forms say which they are in bit 4 of the second half.
+            let address = if word {
+                self.regs[n].wrapping_add((hw2 & 0xFF) << 2)
+            } else {
+                self.regs[n]
+            };
+            let halfword = hw2 & (1 << 4) != 0;
+            if load {
+                self.regs[t] = match (word, halfword) {
+                    (true, _) => bus.read32(address),
+                    (false, true) => bus.read16(address) as u32,
+                    (false, false) => bus.read8(address) as u32,
+                };
+                self.exclusive = true;
+                trace!(self, "  ldrex r{}, [{:#010X}]", t, address);
+            } else {
+                // Where the result goes: bits 11-8 in the word form,
+                // bits 3-0 in the others.
+                let result = if word { d } else { m };
+                if self.exclusive {
+                    match (word, halfword) {
+                        (true, _) => bus.write32(address, self.regs[t]),
+                        (false, true) => bus.write16(address, self.regs[t] as u16),
+                        (false, false) => bus.write8(address, self.regs[t] as u8),
+                    }
+                }
+                self.regs[result] = !self.exclusive as u32;
+                self.exclusive = false;
+                trace!(self, "  strex r{}, r{}, [{:#010X}]", result, t, address);
+            }
+            Some(CYCLES_MEMORY)
+        // CLREX: 1111001110111111 | 1000111100101111  (A7.7.23)
+        // Remove the exclusive access mark.
+        } else if hw1 == 0xF3BF && hw2 == 0x8F2F {
+            self.exclusive = false;
+            trace!(self, "  clrex");
+            Some(CYCLES_DATA)
         // Data processing with a "modified immediate" constant:
         // 11110 i 0 op S Rn | 0 imm3 Rd imm8  (A5.3.1)
-        if hw1 & 0xFA00 == 0xF000 && hw2 & 0x8000 == 0 {
+        } else if hw1 & 0xFA00 == 0xF000 && hw2 & 0x8000 == 0 {
             let op = (hw1 >> 5) & 0xF;
             let (imm32, carry) = thumb_expand_imm_c(imm12, self.carry());
             let name = self.data_processing(op, setflags, n, d, imm32, carry)?;
@@ -394,6 +450,23 @@ impl Cpu {
                 trace!(self, "  store r{}, [{:#010X}]", t, address);
             }
             Some(CYCLES_MEMORY)
+        // SXTH, UXTH, SXTB, UXTB, 32-bit forms that reach any register:
+        // 11111010 0 op 1111 | 1111 Rd 10 rotate Rm
+        // (A7.7.184, A7.7.223, A7.7.182, A7.7.221). Widen a halfword or
+        // a byte to 32 bits, copying the sign bit (S) or filling with
+        // zeros (U). The value can first be rotated right by 8, 16 or
+        // 24 bits to pick a different byte.
+        } else if hw1 & 0xFF8F == 0xFA0F && hw2 & 0xF0C0 == 0xF080 {
+            let value = self.regs[m].rotate_right(8 * ((hw2 >> 4) & 3));
+            self.regs[d] = match (hw1 >> 4) & 0x7 {
+                0b000 => value as i16 as u32,
+                0b001 => value & 0xFFFF,
+                0b100 => value as i8 as u32,
+                0b101 => value & 0xFF,
+                _ => return None,
+            };
+            trace!(self, "  extend r{}, r{}  -> {:#010X}", d, m, self.regs[d]);
+            Some(CYCLES_DATA)
         // LDR Rt, [PC, #+/-imm12]: a constant from a literal pool.
         // 11111000 U 1011111 | Rt imm12  (A7.7.44 T2)
         } else if hw1 & 0xFF7F == 0xF85F && t != PC {
@@ -1466,5 +1539,90 @@ mod tests {
             r0_after(&[0xFB91, 0xF0F2], 0, 0x8000_0000, -1i32 as u32),
             0x8000_0000
         );
+    }
+
+    #[test]
+    fn wide_extends_reach_any_register_and_can_rotate_first() {
+        // uxtb.w lr, r0
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFA5F, 0xFE80]);
+        cpu.regs[0] = 0x1234_56F8;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[LR], 0xF8);
+        // sxth.w r8, r9
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFA0F, 0xF889]);
+        cpu.regs[9] = 0x0001_8000;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[8], 0xFFFF_8000);
+        // uxth.w r0, r1, ror #8: the middle two bytes
+        assert_eq!(r0_after(&[0xFA1F, 0xF091], 0, 0x1234_5678, 0), 0x3456);
+    }
+
+    #[test]
+    fn exclusive_store_succeeds_after_an_exclusive_load() {
+        const ADDRESS: u32 = 0x2040_0000;
+        // ldrex r0, [r1, #8] ; strex r2, r0, [r1, #8]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE851, 0x0F02, 0xE841, 0x0202]);
+        cpu.regs[1] = ADDRESS;
+        cpu.regs[2] = 0xFFFF_FFFF;
+        bus.write32(ADDRESS + 8, 41);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 41);
+        cpu.regs[0] += 1;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 0); // 0 means it was stored
+        assert_eq!(bus.read32(ADDRESS + 8), 42);
+    }
+
+    #[test]
+    fn exclusive_store_without_a_load_does_nothing_and_says_so() {
+        // strex r2, r0, [r1, #8]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE841, 0x0202]);
+        cpu.regs[0] = 99;
+        cpu.regs[1] = 0x2040_0000;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 1); // 1 means not stored
+        assert_eq!(bus.read32(0x2040_0008), 0);
+    }
+
+    #[test]
+    fn exclusive_mark_is_used_up_by_one_store() {
+        // ldrexb r0, [r1] ; strexb r2, r0, [r1] ; strexb r2, r0, [r1]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE8D1, 0x0F4F, 0xE8C1, 0x0F42, 0xE8C1, 0x0F42]);
+        cpu.regs[1] = 0x2040_0000;
+        for expected in [None, Some(0), Some(1)] {
+            cpu.step(&mut bus);
+            if let Some(result) = expected {
+                assert_eq!(cpu.regs[2], result);
+            }
+        }
+    }
+
+    #[test]
+    fn clrex_removes_the_mark() {
+        // ldrexh r0, [r1] ; clrex ; strexh r2, r0, [r1]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE8D1, 0x0F5F, 0xF3BF, 0x8F2F, 0xE8C1, 0x0F52]);
+        cpu.regs[1] = 0x2040_0000;
+        cpu.regs[0] = 0;
+        bus.write32(0x2040_0000, 0xAAAA_BBBB);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0xBBBB); // a halfword load
+        cpu.regs[0] = 0x1234;
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 1);
+        assert_eq!(bus.read32(0x2040_0000), 0xAAAA_BBBB); // untouched
+    }
+
+    #[test]
+    fn byte_and_halfword_exclusive_stores_write_only_their_size() {
+        // ldrexb r0, [r1] ; strexb r2, r0, [r1]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE8D1, 0x0F4F, 0xE8C1, 0x0F42]);
+        cpu.regs[1] = 0x2040_0000;
+        bus.write32(0x2040_0000, 0xFFFF_FF01);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0x01);
+        cpu.regs[0] = 0x1234_5600;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x2040_0000), 0xFFFF_FF00);
     }
 }

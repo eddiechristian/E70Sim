@@ -44,13 +44,17 @@ The board is the **SAM E70 Xplained Ultra**. Its user guide is `reference/same70
 
 The guide's text says only that the "system I2C" is I2C0, shared by the debugger, EXT1, EXT2 and the mikroBUS socket (section 2). The pin-by-pin wiring is in the schematic on page 33:
 
-| EXT1 pin | Role | SAM E70 pin | Function |
+| EXT1 pin | Role on the header | SAM E70 pin | What the BNO055 card connects there |
 |---|---|---|---|
-| 11 | I2C data | PA3 | TWD0, so TWIHS0 |
-| 12 | I2C clock | PA4 | TWCK0 |
-| 9 | Interrupt / GPIO | PD28 | WKUP5. A candidate for the sensor's INT line |
-| 5, 6 | GPIO | PB3, PB2 | Candidates for the sensor's reset line |
-| 10 | SPI select / GPIO | PC17 | Another candidate |
+| 11 | I2C data | PA3 (TWD0) | The sensor's SDA |
+| 12 | I2C clock | PA4 (TWCK0) | The sensor's SCL |
+| 9 | Interrupt / GPIO | PD28 | The sensor's INT output |
+| 15 | SPI select | PD25 | The sensor's reset input (nRESET) |
+| 5 | GPIO | PB3 | The sensor's address select (COM3): high for `0x29`, low for `0x28` |
+| 10 | SPI select / GPIO | PC17 | The sensor's boot-loader pin |
+| 6, 7, 8 | GPIO, PWM | PB2, PA0, PC30 | The card's RGB LED: green, blue, red |
+
+The last column is from the card's own schematic, `reference/bno055/BNO055-Xplained-Pro-design-documentation.pdf` (page 1).
 
 So the firmware uses **TWIHS0** (base `0x4001_8000`, IRQ 19) on PA3 and PA4, peripheral function A.
 
@@ -66,7 +70,7 @@ None of these blocks a start. The first should be dealt with during the work.
 | Gap | Why it matters | What to do |
 |---|---|---|
 | **Divide and multiply instructions** (`UDIV`, `SDIV`, 32-bit `MUL`, `UMULL`) | Printing a number in decimal needs division, and a gyro reading is only readable in decimal. The emulator has no divide yet, and one existing test asserts that `UDIV` is unhandled | Add them when the firmware hits them, as usual. Small |
-| **A device cannot drive a pin** | The sensor has an interrupt output (INT) and a reset input (nRESET). Today only the `--pin=` option changes an input pin, and nothing is told when firmware changes an output pin | Only needed for step 6 below. Give the bus a way to connect a device's output to a PIO input |
+| **A pin cannot drive a device** | The sensor has a reset input (nRESET, on PD25). Nothing is told when firmware changes an output pin, so pulling that line low does not reset the sensor model. (The other direction, the sensor's INT output driving a pin, is done) | Give the bus a way to pass an output pin's level to a device. The firmware resets the sensor through `SYS_TRIGGER` instead |
 | **The assembly test in `PLAN.md` cannot be built here** | `arm-none-eabi` binutils are not installed, so no new `.s` file can be assembled | Write the test firmware in Rust instead |
 | **Other compiled-code instructions** | A real driver is more code than `hello-rs`, and will hit instructions not implemented yet (`TBB`, bit-field operations, and so on) | On demand |
 
@@ -160,7 +164,7 @@ Each step can be tested before the next begins.
 | 3 ✅ | BNO055 with identity, page, mode, reset and status registers, and gyro data: `src/bno055.rs`, attached to TWIHS0 in `main.rs` | Unit tests against datasheet values |
 | 4 ✅ | Rust firmware `firmware/gyro-rs/`: set up TWIHS0, read `CHIP_ID`, print it | Prints `A0`. This is the `PLAN.md` "read CHIP_ID and print it" item |
 | 5 ✅ | Firmware: switch to a gyro mode, read the three axes in a loop, print them in decimal. Multiply and divide instructions added | Printed values match the motion source. **Milestone 3** |
-| 6 ✅ | Firmware that reads through the TWIHS interrupt (IRQ 19; the controller side was done in step 2). The optional part, the sensor's INT pin through a PIO interrupt, is not done | An interrupt-driven read gives the same values |
+| 6 ✅ | Firmware that reads through the TWIHS interrupt (IRQ 19; the controller side was done in step 2), and the sensor's INT pin through a PIO interrupt on PD28 | An interrupt-driven read gives the same values; fast turning raises the INT line and the firmware reports it |
 | 7 ✅ | Motion pattern and motion from a file, chosen with `--gyro=` | Readings follow the pattern over time |
 | 8 | Sensor timing behind a switch; transfer time taken from `TWIHS_CWGR` | A driver without the delays fails with the switch on |
 
@@ -191,6 +195,28 @@ The sensor is always attached to TWIHS0. `--gyro=` chooses how the imaginary boa
 | `--gyro=pattern` | Each axis swings back and forth: X to ±90 once a second, Y to ±45 every two seconds, Z to ±10 every four seconds |
 | `--gyro=file:PATH` | Samples from a text file: one per line, `seconds x y z`, separated by spaces or commas; `#` starts a comment. A sample holds until the next one's time |
 
+The firmware ends by watching for fast turning for three seconds. It sets the sensor's "any motion" interrupt to 50 degrees per second and reports each time the sensor raises its INT line:
+
+```
+$ cargo run -- --gyro=100,0,0 firmware/gyro-rs.bin
+...
+watching for motion
+motion at 1290 ms, INT_STA = 04, x=100.00 y=0.00 z=0.00 dps
+motion at 1410 ms, INT_STA = 04, x=100.00 y=0.00 z=0.00 dps
+...
+motion detected 25 times
+done
+```
+
+With the default motion nothing turns that fast and it reports 0 times. The INT line is wired to PD28; `--gyro-int=PB3` wires it to another pin and `--gyro-int=none` leaves it unconnected.
+
+How the INT line works, end to end:
+
+1. The sensor model takes a gyro sample 100 times a second of emulated time. When an enabled axis has been above the threshold for 12 samples in a row (120 ms), it sets `GYRO_AM` in `INT_STA` and raises its INT output.
+2. The bus copies that output to PD28 (`connect_i2c_interrupt` in `src/bus.rs`). To the PIO it looks like any other input pin changing.
+3. PD28 is set up for a rising-edge interrupt, so PIOD raises IRQ 16 and the firmware's `PIOD` handler runs. It reads `PIO_ISR` and sets a flag.
+4. `main` sees the flag, reads `INT_STA` and the rates over I2C, and writes `RST_INT` so the sensor lowers the line again.
+
 Times are emulated time: seconds since reset at 12 MHz. The firmware takes its first reading about 0.657 s after reset (it waits 650 ms after resetting the sensor and 7 ms after changing its mode) and then one every 100 ms.
 
 What was checked: with `--gyro=pattern`, all six printed readings equal the pattern's formula worked out separately for those moments; with a file, the readings change at the sample times; and the largest rate the sensor can report (±2000) prints correctly.
@@ -213,4 +239,5 @@ There is no real board to compare against, so correctness rests on:
 
 ## To verify
 
-- Which EXT header pins the card uses for the sensor's INT and nRESET lines. That is in the BNO055 Xplained Pro card's own user guide, which is not in the repo. The board side is known: see "Board wiring" above.
+- That the sensor's "any motion" interrupt compares the turn rate itself with the threshold. That is how the register description reads ("consecutive data points are above the any motion interrupt threshold"), and what the model does; a real sensor may instead compare the change between samples.
+- The gyro's sample rate. The model uses 100 samples a second whatever the sensor's bandwidth setting.

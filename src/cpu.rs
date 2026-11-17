@@ -73,6 +73,9 @@ pub struct Cpu {
     /// There, the 16-bit instructions that normally set the flags leave
     /// them alone. `step` sets this before each instruction.
     in_it_block: bool,
+    /// The "exclusive access" mark: set by LDREX, used up by STREX,
+    /// and cleared by every exception entry and return (see `data.rs`).
+    exclusive: bool,
     /// Set by an instruction that turns out to be a fault (see
     /// `fault.rs`). `step` raises it once the instruction has finished.
     fault: Option<fault::Fault>,
@@ -116,6 +119,7 @@ impl Cpu {
             cycles: 0,
             sleeping: false,
             in_it_block: false,
+            exclusive: false,
             fault: None,
             regs: [0; 16],
             fp: [0; 32],

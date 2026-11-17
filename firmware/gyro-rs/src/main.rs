@@ -13,7 +13,10 @@
 //! 3. reads the three turn rates several times, waiting for each byte
 //!    in a loop ("polled"), and prints them;
 //! 4. reads them once more with the I2C interrupt doing the work, and
-//!    prints that too.
+//!    prints that too;
+//! 5. asks the sensor to raise its INT line when the board turns
+//!    quickly, and reports each time it does. The INT line is on EXT1
+//!    pin 9, which is PD28.
 //!
 //! See `../../gyro.md`. SAME70 register addresses and bit positions are
 //! from `ATSAME70Q21.svd` and the datasheet in `reference/same70/`; the
@@ -35,6 +38,7 @@ const WDT_MR_WDDIS: u32 = 1 << 15;
 // Power Management Controller.
 const PMC_PCER0: *mut u32 = 0x400E_0610 as *mut u32;
 const ID_UART0: u32 = 7;
+const ID_PIOD: u32 = 16;
 const ID_TWIHS0: u32 = 19;
 
 // PIOA: hand pins to a peripheral (function A is a 0 in both select
@@ -43,6 +47,16 @@ const PIOA_PDR: *mut u32 = 0x400E_0E04 as *mut u32;
 const PIOA_ABCDSR0: *mut u32 = 0x400E_0E70 as *mut u32;
 const PIOA_ABCDSR1: *mut u32 = 0x400E_0E74 as *mut u32;
 const TWIHS0_PINS: u32 = (1 << 3) | (1 << 4); // PA3 = TWD0, PA4 = TWCK0
+
+// PIOD: the sensor's INT line comes in on PD28.
+const PIOD_PER: *mut u32 = 0x400E_1400 as *mut u32; // pin controlled by the PIO
+const PIOD_ODR: *mut u32 = 0x400E_1414 as *mut u32; // pin is an input
+const PIOD_IER: *mut u32 = 0x400E_1440 as *mut u32; // interrupt enable
+const PIOD_ISR: *mut u32 = 0x400E_144C as *mut u32; // interrupt status
+const PIOD_AIMER: *mut u32 = 0x400E_14B0 as *mut u32; // pick one edge or level
+const PIOD_ESR: *mut u32 = 0x400E_14C0 as *mut u32; // ... an edge
+const PIOD_REHLSR: *mut u32 = 0x400E_14D4 as *mut u32; // ... the rising one
+const INT_PIN: u32 = 1 << 28;
 
 // UART0.
 const UART0_CR: *mut u32 = 0x400E_0800 as *mut u32;
@@ -79,6 +93,7 @@ const TWIHS_SR_NACK: u32 = 1 << 8; // nothing answered
 
 // NVIC and SysTick, in the Arm core.
 const NVIC_ISER0: *mut u32 = 0xE000_E100 as *mut u32;
+const IRQ_PIOD: u32 = 16;
 const IRQ_TWIHS0: u32 = 19;
 const SYST_CSR: *mut u32 = 0xE000_E010 as *mut u32;
 const SYST_RVR: *mut u32 = 0xE000_E014 as *mut u32;
@@ -91,11 +106,30 @@ const CLOCK_HZ: u32 = 12_000_000;
 const BNO055: u32 = 0x29; // its I2C address
 const BNO055_CHIP_ID: u32 = 0x00;
 const BNO055_GYR_DATA: u32 = 0x14; // X, Y, Z: six bytes
+const BNO055_PAGE_ID: u32 = 0x07; // which of the two register pages
+const BNO055_INT_STA: u32 = 0x37; // which interrupts have happened
 const BNO055_OPR_MODE: u32 = 0x3D;
 const BNO055_SYS_TRIGGER: u32 = 0x3F;
+// On page 1:
+const BNO055_INT_MSK: u32 = 0x0F; // which interrupts drive the INT line
+const BNO055_INT_EN: u32 = 0x10; // which interrupts are watched for
+const BNO055_GYR_INT_SETTING: u32 = 0x17; // which axes
+const BNO055_GYR_AM_THRES: u32 = 0x1E; // any-motion threshold
+const BNO055_INT_GYRO_AM: u8 = 1 << 2; // the gyro any-motion interrupt
+const BNO055_RST_INT: u8 = 1 << 6; // in SYS_TRIGGER: lower the INT line
+const BNO055_MODE_CONFIG: u8 = 0x00;
 const BNO055_CHIP_ID_VALUE: u8 = 0xA0;
 const BNO055_MODE_GYROONLY: u8 = 0x03;
 const BNO055_RST_SYS: u8 = 1 << 5;
+
+/// "Turning quickly" means faster than this, in degrees per second.
+const MOTION_THRESHOLD_DPS: u8 = 50;
+/// How long to watch for it, in milliseconds.
+const MOTION_WATCH_MS: u32 = 3000;
+
+/// Set by the PIOD interrupt handler when the sensor raises its INT
+/// line.
+static MOTION: AtomicBool = AtomicBool::new(false);
 
 /// Milliseconds since start-up, counted by the SysTick handler.
 static TICKS: AtomicU32 = AtomicU32::new(0);
@@ -335,18 +369,33 @@ extern "C" fn TWIHS0() {
     }
 }
 
+/// Runs when a pin of PIOD that has its interrupt enabled changes:
+/// here, when the sensor's INT line goes high.
+///
+/// It only notes that it happened. Asking the sensor what it wants
+/// takes I2C transfers, which the main code does.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+extern "C" fn PIOD() {
+    // Reading the status is what stops the port asking again.
+    if read_reg(PIOD_ISR) & INT_PIN != 0 {
+        MOTION.store(true, Ordering::Relaxed);
+    }
+}
+
 unsafe extern "C" {
     /// `cortex-m-rt`'s handler for anything unexpected: it loops for ever.
     fn DefaultHandler();
 }
 
 /// The interrupt part of the vector table: entry n is the handler for
-/// IRQ n. TWIHS0 is IRQ 19.
+/// IRQ n. PIOD is IRQ 16 and TWIHS0 is IRQ 19.
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[unsafe(no_mangle)]
 #[used]
 pub static __INTERRUPTS: [unsafe extern "C" fn(); 20] = {
     let mut table: [unsafe extern "C" fn(); 20] = [DefaultHandler; 20];
+    table[IRQ_PIOD as usize] = PIOD;
     table[IRQ_TWIHS0 as usize] = TWIHS0;
     table
 };
@@ -361,6 +410,36 @@ fn rates_from(bytes: [u8; 6]) -> [i16; 3] {
         i16::from_le_bytes([bytes[2], bytes[3]]),
         i16::from_le_bytes([bytes[4], bytes[5]]),
     ]
+}
+
+/// Have the sensor raise its INT line when any axis turns faster than
+/// `MOTION_THRESHOLD_DPS`, and have that line interrupt the processor.
+fn motion_interrupt_init() {
+    // The sensor's settings can only be changed in its configuration
+    // mode. The waiting times are the datasheet's.
+    i2c_write(BNO055, BNO055_OPR_MODE, BNO055_MODE_CONFIG);
+    delay_ms(19);
+    i2c_write(BNO055, BNO055_PAGE_ID, 1);
+    i2c_write(BNO055, BNO055_GYR_INT_SETTING, 0b111); // X, Y and Z
+    // At the gyro's default range one unit is 1 degree per second.
+    i2c_write(BNO055, BNO055_GYR_AM_THRES, MOTION_THRESHOLD_DPS);
+    i2c_write(BNO055, BNO055_INT_MSK, BNO055_INT_GYRO_AM);
+    i2c_write(BNO055, BNO055_INT_EN, BNO055_INT_GYRO_AM);
+    i2c_write(BNO055, BNO055_PAGE_ID, 0);
+    i2c_write(BNO055, BNO055_OPR_MODE, BNO055_MODE_GYROONLY);
+    delay_ms(7);
+
+    // PD28 as an input that interrupts on its rising edge.
+    write_reg(PMC_PCER0, 1 << ID_PIOD);
+    write_reg(PIOD_PER, INT_PIN);
+    write_reg(PIOD_ODR, INT_PIN);
+    write_reg(PIOD_AIMER, INT_PIN);
+    write_reg(PIOD_ESR, INT_PIN);
+    write_reg(PIOD_REHLSR, INT_PIN);
+    // Forget any change seen on the pin before now.
+    read_reg(PIOD_ISR);
+    write_reg(PIOD_IER, INT_PIN);
+    write_reg(NVIC_ISER0, 1 << IRQ_PIOD);
 }
 
 fn stop(message: &str) -> ! {
@@ -429,6 +508,36 @@ fn main() -> ! {
         *slot = byte.load(Ordering::Relaxed);
     }
     report("gyro by interrupt", rates_from(data));
+
+    // 5. Let the sensor say when the board is turning quickly.
+    motion_interrupt_init();
+    uart_write_str("watching for motion\n");
+    let start = millis();
+    let mut detections = 0u32;
+    while millis().wrapping_sub(start) < MOTION_WATCH_MS {
+        if !MOTION.swap(false, Ordering::Relaxed) {
+            wait_for_interrupt();
+            continue;
+        }
+        // The sensor raised its INT line. Ask it why, and what the
+        // rates are now.
+        let mut status = [0u8; 1];
+        let mut data = [0u8; 6];
+        i2c_read(BNO055, BNO055_INT_STA, &mut status);
+        i2c_read(BNO055, BNO055_GYR_DATA, &mut data);
+        uart_write_str("motion at ");
+        uart_write_decimal(millis(), 1);
+        uart_write_str(" ms, INT_STA = ");
+        uart_write_hex8(status[0]);
+        uart_write_byte(b',');
+        report("", rates_from(data));
+        detections += 1;
+        // Lower the INT line so that the next rise can be seen.
+        i2c_write(BNO055, BNO055_SYS_TRIGGER, BNO055_RST_INT);
+    }
+    uart_write_str("motion detected ");
+    uart_write_decimal(detections, 1);
+    uart_write_str(" times\n");
 
     stop("done\n");
 }

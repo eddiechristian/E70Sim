@@ -20,11 +20,20 @@
 //! belong together: they are taken at the start of the transfer (the
 //! datasheet calls this data register shadowing, section 3.7).
 //!
+//! The chip also has an interrupt output, the INT pin, for getting the
+//! processor's attention without being asked. One cause is modelled:
+//! the gyro's "any motion" interrupt, which fires when the turn rate
+//! on an enabled axis stays above a threshold for a number of samples
+//! in a row. Firmware enables it in INT_EN, routes it to the pin in
+//! INT_MSK, sees what happened in INT_STA, and lowers the pin again
+//! with RST_INT in SYS_TRIGGER (datasheet section 3.8).
+//!
 //! Not modelled: the accelerometer, the magnetometer and the fused
 //! orientation outputs (their data registers read 0); calibration
-//! (always reported complete); the sensor's interrupts; the start-up
-//! and mode-switching delays (the chip is ready at once); and the rule
-//! that most settings can only be changed in CONFIGMODE.
+//! (always reported complete); the other interrupt causes; the
+//! start-up and mode-switching delays (the chip is ready at once); and
+//! the rule that most settings can only be changed in CONFIGMODE. The
+//! gyro is taken to sample 100 times a second whatever its settings.
 //!
 //! Register numbers, reset values and units are from the datasheet,
 //! `reference/bno055/BST-BNO055-DS000-18.pdf`, chapter 4.
@@ -51,6 +60,7 @@ const GYR_DATA_Z_MSB: u8 = 0x19;
 const TEMP: u8 = 0x34;
 const CALIB_STAT: u8 = 0x35;
 const ST_RESULT: u8 = 0x36;
+const INT_STA: u8 = 0x37; // which interrupts have happened; cleared by reading
 const SYS_STATUS: u8 = 0x39;
 const UNIT_SEL: u8 = 0x3B;
 const OPR_MODE: u8 = 0x3D;
@@ -61,7 +71,22 @@ const AXIS_MAP_CONFIG: u8 = 0x41;
 // Page 1 registers: settings of the individual sensors.
 const ACC_CONFIG: u8 = 0x08;
 const MAG_CONFIG: u8 = 0x09;
-const GYR_CONFIG_0: u8 = 0x0A;
+const GYR_CONFIG_0: u8 = 0x0A; // bits 2-0: the gyro's range
+const INT_MSK: u8 = 0x0F; // which interrupts drive the INT pin
+const INT_EN: u8 = 0x10; // which interrupts are watched for
+const GYR_INT_SETTING: u8 = 0x17; // bits 2-0: any motion on Z, Y, X
+const GYR_AM_THRES: u8 = 0x1E; // any-motion threshold
+const GYR_AM_SET: u8 = 0x1F; // bits 1-0: how many samples in a row
+
+/// The gyro any-motion interrupt's bit in INT_EN, INT_MSK and INT_STA.
+const INT_GYRO_AM: u8 = 1 << 2;
+
+/// SYS_TRIGGER bit 6 (RST_INT): clear the interrupt status and lower
+/// the INT pin.
+const SYS_TRIGGER_RST_INT: u8 = 1 << 6;
+
+/// Clock cycles between gyro samples: 100 samples a second.
+const SAMPLE_CYCLES: u64 = 120_000;
 
 /// Registers are numbered 0x00 to 0x7F on each page.
 const REGISTERS: usize = 0x80;
@@ -206,6 +231,12 @@ pub struct Bno055 {
     /// The gyro data registers as they were when the current transfer
     /// began.
     gyro_data: [u8; 6],
+    /// The level of the INT pin: high once an interrupt routed to it
+    /// has fired, until firmware resets it.
+    int_pin: bool,
+    /// How many samples in a row have been above the any-motion
+    /// threshold.
+    samples_above: u32,
 }
 
 impl Bno055 {
@@ -217,6 +248,8 @@ impl Bno055 {
             motion,
             cycles: 0,
             gyro_data: [0; 6],
+            int_pin: false,
+            samples_above: 0,
         };
         sensor.reset_registers();
         sensor
@@ -242,6 +275,43 @@ impl Bno055 {
         page1[ACC_CONFIG as usize] = 0x0D;
         page1[MAG_CONFIG as usize] = 0x0B;
         page1[GYR_CONFIG_0 as usize] = 0x38;
+        page1[GYR_AM_THRES as usize] = 0x04;
+        page1[GYR_AM_SET as usize] = 0x0A;
+        self.int_pin = false;
+        self.samples_above = 0;
+    }
+
+    /// The gyro has taken a sample, `seconds` after reset: check it
+    /// against the any-motion settings.
+    fn check_any_motion(&mut self, seconds: f64) {
+        let page1 = &self.pages[1];
+        if page1[INT_EN as usize] & INT_GYRO_AM == 0 || !gyro_on(self.mode()) {
+            self.samples_above = 0;
+            return;
+        }
+        // The threshold's unit depends on the gyro's range: 1 degree
+        // per second at the widest range (2000), halving with each
+        // narrower one.
+        let range = (page1[GYR_CONFIG_0 as usize] & 0x7).min(4);
+        let threshold = (page1[GYR_AM_THRES as usize] & 0x7F) as f64 / (1 << range) as f64;
+        let axes = page1[GYR_INT_SETTING as usize] & 0x7;
+        let rates = self.motion.rates_at(seconds);
+        let above = (0..3).any(|axis| axes & (1 << axis) != 0 && rates[axis].abs() > threshold);
+        if !above {
+            self.samples_above = 0;
+            return;
+        }
+        self.samples_above += 1;
+        // It fires after (setting + 1) * 4 such samples in a row.
+        let needed = ((page1[GYR_AM_SET as usize] & 0x3) as u32 + 1) * 4;
+        if self.samples_above >= needed {
+            self.samples_above = 0;
+            let routed = self.pages[1][INT_MSK as usize] & INT_GYRO_AM != 0;
+            self.pages[0][INT_STA as usize] |= INT_GYRO_AM;
+            if routed {
+                self.int_pin = true;
+            }
+        }
     }
 
     fn page(&self) -> usize {
@@ -274,7 +344,11 @@ impl Bno055 {
         }
     }
 
-    fn read_register(&self, register: u8) -> u8 {
+    fn read_register(&mut self, register: u8) -> u8 {
+        if register == INT_STA && self.page() == 0 {
+            // Reading the interrupt status clears it.
+            return std::mem::take(&mut self.pages[0][INT_STA as usize]);
+        }
         if register == PAGE_ID {
             return self.pages[0][PAGE_ID as usize];
         }
@@ -319,6 +393,10 @@ impl Bno055 {
                 if value & SYS_TRIGGER_RST_SYS != 0 {
                     self.reset_registers();
                 } else {
+                    if value & SYS_TRIGGER_RST_INT != 0 {
+                        self.pages[0][INT_STA as usize] = 0;
+                        self.int_pin = false;
+                    }
                     // The other bits (clock source, self-test,
                     // interrupt reset) act and read back as 0, except
                     // the clock source, bit 7, which is kept.
@@ -371,7 +449,26 @@ impl I2cDevice for Bno055 {
     }
 
     fn tick(&mut self, cycles: u32) {
-        self.cycles += cycles as u64;
+        // Take every sample that falls within this stretch of time.
+        let end = self.cycles + cycles as u64;
+        let mut sample = (self.cycles / SAMPLE_CYCLES + 1) * SAMPLE_CYCLES;
+        while sample <= end {
+            self.check_any_motion(sample as f64 / CYCLES_PER_SECOND);
+            sample += SAMPLE_CYCLES;
+        }
+        self.cycles = end;
+    }
+
+    fn interrupt_line(&self) -> Option<bool> {
+        Some(self.int_pin)
+    }
+
+    fn cycles_until_event(&self) -> Option<u32> {
+        // The next sample matters only while the interrupt is enabled.
+        if self.pages[1][INT_EN as usize] & INT_GYRO_AM == 0 {
+            return None;
+        }
+        Some((SAMPLE_CYCLES - self.cycles % SAMPLE_CYCLES) as u32)
     }
 }
 
@@ -622,5 +719,160 @@ mod tests {
         assert_eq!(gyro(&mut sensor)[0], 160);
         sensor.tick(12_000_000); // one second
         assert_eq!(gyro(&mut sensor)[0], 320);
+    }
+
+    /// A sensor in gyro mode with the any-motion interrupt set up:
+    /// all three axes, the given threshold, routed to the INT pin.
+    fn sensor_watching_for_motion(motion: Motion, threshold: u8) -> Bno055 {
+        let mut sensor = Bno055::new(motion);
+        write(&mut sensor, PAGE_ID, 1);
+        write(&mut sensor, GYR_INT_SETTING, 0x07);
+        write(&mut sensor, GYR_AM_THRES, threshold);
+        write(&mut sensor, INT_MSK, INT_GYRO_AM);
+        write(&mut sensor, INT_EN, INT_GYRO_AM);
+        write(&mut sensor, PAGE_ID, 0);
+        write(&mut sensor, OPR_MODE, GYROONLY);
+        sensor
+    }
+
+    /// Let `count` gyro samples go by.
+    fn samples(sensor: &mut Bno055, count: u32) {
+        for _ in 0..count {
+            sensor.tick(SAMPLE_CYCLES as u32);
+        }
+    }
+
+    #[test]
+    fn interrupt_pin_is_low_and_nothing_is_watched_after_reset() {
+        let mut sensor = Bno055::new(Motion::Constant([500.0, 0.0, 0.0]));
+        write(&mut sensor, OPR_MODE, GYROONLY);
+        samples(&mut sensor, 100);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        assert_eq!(read(&mut sensor, INT_STA, 1), [0]);
+        assert_eq!(sensor.cycles_until_event(), None);
+    }
+
+    #[test]
+    fn any_motion_fires_after_enough_samples_above_the_threshold() {
+        // 100 degrees per second against a threshold of 50. The default
+        // setting needs 12 samples in a row.
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([0.0, -100.0, 0.0]), 50);
+        samples(&mut sensor, 11);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        samples(&mut sensor, 1);
+        assert_eq!(sensor.interrupt_line(), Some(true));
+        assert_eq!(read(&mut sensor, INT_STA, 1), [INT_GYRO_AM]);
+    }
+
+    #[test]
+    fn slow_turning_does_not_fire() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([49.0, -49.0, 49.0]), 50);
+        samples(&mut sensor, 500);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        assert_eq!(read(&mut sensor, INT_STA, 1), [0]);
+    }
+
+    #[test]
+    fn samples_must_be_above_the_threshold_in_a_row() {
+        // Above for 0.1 s, below for 0.1 s, and so on: never 12 in a row.
+        let text: String = (0..20)
+            .map(|i| {
+                format!(
+                    "{} {} 0 0\n",
+                    i as f64 * 0.1,
+                    if i % 2 == 0 { 100 } else { 0 }
+                )
+            })
+            .collect();
+        let mut sensor = sensor_watching_for_motion(Motion::parse_samples(&text).unwrap(), 50);
+        samples(&mut sensor, 190);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+    }
+
+    #[test]
+    fn interrupt_pin_stays_high_until_reset_by_firmware() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([100.0, 0.0, 0.0]), 50);
+        samples(&mut sensor, 12);
+        // Reading the status clears the status, not the pin.
+        assert_eq!(read(&mut sensor, INT_STA, 1), [INT_GYRO_AM]);
+        assert_eq!(read(&mut sensor, INT_STA, 1), [0]);
+        assert_eq!(sensor.interrupt_line(), Some(true));
+        write(&mut sensor, SYS_TRIGGER, SYS_TRIGGER_RST_INT);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        // The turning goes on, so it fires again after 12 more samples.
+        samples(&mut sensor, 11);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        samples(&mut sensor, 1);
+        assert_eq!(sensor.interrupt_line(), Some(true));
+    }
+
+    #[test]
+    fn interrupt_not_routed_to_the_pin_shows_only_in_the_status() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([100.0, 0.0, 0.0]), 50);
+        write(&mut sensor, PAGE_ID, 1);
+        write(&mut sensor, INT_MSK, 0);
+        write(&mut sensor, PAGE_ID, 0);
+        samples(&mut sensor, 12);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        assert_eq!(read(&mut sensor, INT_STA, 1), [INT_GYRO_AM]);
+    }
+
+    #[test]
+    fn only_enabled_axes_are_watched() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([0.0, 0.0, 100.0]), 50);
+        write(&mut sensor, PAGE_ID, 1);
+        write(&mut sensor, GYR_INT_SETTING, 0x03); // X and Y only
+        write(&mut sensor, PAGE_ID, 0);
+        samples(&mut sensor, 50);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+    }
+
+    #[test]
+    fn threshold_unit_follows_the_gyro_range() {
+        // 30 degrees per second: below a threshold of 50 at the widest
+        // range, where one unit is 1 degree per second.
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([30.0, 0.0, 0.0]), 50);
+        samples(&mut sensor, 50);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        // At the 1000 range one unit is half a degree per second, so
+        // the same setting means 25.
+        write(&mut sensor, PAGE_ID, 1);
+        write(&mut sensor, GYR_CONFIG_0, 0x39);
+        write(&mut sensor, PAGE_ID, 0);
+        samples(&mut sensor, 12);
+        assert_eq!(sensor.interrupt_line(), Some(true));
+    }
+
+    #[test]
+    fn no_interrupt_while_the_gyro_is_off() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([100.0, 0.0, 0.0]), 50);
+        write(&mut sensor, OPR_MODE, 0); // back to CONFIGMODE
+        samples(&mut sensor, 50);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+    }
+
+    #[test]
+    fn samples_are_counted_however_time_is_cut_up() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([100.0, 0.0, 0.0]), 50);
+        // The next sample is predicted, and steps of any size work.
+        assert_eq!(sensor.cycles_until_event(), Some(SAMPLE_CYCLES as u32));
+        sensor.tick(50_000);
+        assert_eq!(sensor.cycles_until_event(), Some(70_000));
+        sensor.tick(11 * SAMPLE_CYCLES as u32 + 69_999); // one cycle short of the 12th
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        sensor.tick(1);
+        assert_eq!(sensor.interrupt_line(), Some(true));
+    }
+
+    #[test]
+    fn system_reset_lowers_the_pin_and_clears_the_settings() {
+        let mut sensor = sensor_watching_for_motion(Motion::Constant([100.0, 0.0, 0.0]), 50);
+        samples(&mut sensor, 12);
+        write(&mut sensor, SYS_TRIGGER, SYS_TRIGGER_RST_SYS);
+        assert_eq!(sensor.interrupt_line(), Some(false));
+        write(&mut sensor, PAGE_ID, 1);
+        assert_eq!(read(&mut sensor, INT_EN, 1), [0]);
+        // The any-motion registers have their datasheet reset values.
+        assert_eq!(read(&mut sensor, GYR_AM_THRES, 2), [0x04, 0x0A]);
     }
 }
