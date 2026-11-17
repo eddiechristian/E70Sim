@@ -54,6 +54,7 @@ fn it_advance(it_state: u8) -> u8 {
 }
 
 mod exception;
+mod system;
 mod thumb16;
 mod thumb32;
 
@@ -143,7 +144,9 @@ impl Cpu {
     pub fn step(&mut self, bus: &mut Bus) {
         // Asleep after WFI: nothing executes until an exception is pending.
         if self.sleeping {
-            if bus.has_pending_exception() {
+            // PRIMASK does not stop an exception from waking the CPU,
+            // only from being taken (B1.5.19).
+            if bus.has_pending_exception(self.execution_priority(bus, false)) {
                 self.sleeping = false;
             } else {
                 // Skip straight to the moment the next exception will be
@@ -158,15 +161,14 @@ impl Cpu {
             }
         }
 
-        // Exceptions are taken between instructions. Until priorities are
-        // implemented, a handler is never interrupted by another exception:
-        // anything that becomes pending meanwhile waits for Thread mode.
+        // Exceptions are taken between instructions. A pending exception
+        // is taken if it is more urgent than what is running now, which
+        // may itself be a handler: that is nesting. Otherwise it waits.
         let mut cycles = 0;
-        if !self.in_handler_mode() {
-            if let Some(number) = bus.take_pending_exception() {
-                self.exception_entry(number, bus);
-                cycles += CYCLES_EXCEPTION_ENTRY;
-            }
+        let priority = self.execution_priority(bus, true);
+        if let Some(number) = bus.take_pending_exception(priority) {
+            self.exception_entry(number, bus);
+            cycles += CYCLES_EXCEPTION_ENTRY;
         }
 
         let pc = self.regs[PC];
@@ -219,6 +221,32 @@ impl Cpu {
         self.cycles += cycles as u64;
         bus.tick(cycles);
         trace!(self, "{:?}\ncycles = {} (+{})\n", self, self.cycles, cycles);
+    }
+
+    /// The priority of the code running now (ExecutionPriority, B1.5.4).
+    /// A lower value is a higher priority, and an exception is taken only
+    /// if its priority is strictly higher than this.
+    ///
+    /// It starts from the active handlers (or Thread mode if there are
+    /// none) and can be raised further by the three mask registers.
+    /// `with_primask` is false when deciding whether to wake from WFI,
+    /// which PRIMASK does not prevent.
+    fn execution_priority(&self, bus: &Bus, with_primask: bool) -> i32 {
+        let mut priority = bus.active_priority();
+        // BASEPRI: 0 means off; otherwise nothing at that priority or
+        // less urgent gets through.
+        if self.basepri != 0 {
+            priority = priority.min(bus.group_priority(self.basepri as i32));
+        }
+        // PRIMASK: only NMI and HardFault get through.
+        if self.primask && with_primask {
+            priority = priority.min(0);
+        }
+        // FAULTMASK: only NMI gets through.
+        if self.faultmask {
+            priority = priority.min(-1);
+        }
+        priority
     }
 
     /// ITSTATE, the 8 bits that track an IT block (A7.3.3): the top four

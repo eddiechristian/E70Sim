@@ -35,13 +35,16 @@ const FRAME_LR: u32 = 0x14;
 const FRAME_RETURN_ADDRESS: u32 = 0x18;
 const FRAME_XPSR: u32 = 0x1C;
 
+/// Exception number of the non-maskable interrupt.
+const EXCEPTION_NMI: u32 = 2;
+
 // xPSR fields.
 const XPSR_IPSR: u32 = 0x1FF; // bits 8-0: number of the exception being handled
 const XPSR_STACK_ALIGN: u32 = 1 << 9; // in a saved xPSR: 4 bytes of padding were added
 const XPSR_T: u32 = 1 << 24; // Thumb state, always 1 on a Cortex-M
 
 // CONTROL bit 1 (SPSEL): 1 = Thread mode uses the process stack.
-const CONTROL_SPSEL: u8 = 1 << 1;
+pub(super) const CONTROL_SPSEL: u8 = 1 << 1;
 
 // EXC_RETURN values: what the handler's LR holds, and what it loads into
 // the PC to return. The values with bit 4 clear, used when the FPU has
@@ -59,7 +62,7 @@ impl Cpu {
 
     /// Make `regs[SP]` the process stack (`true`) or the main stack
     /// (`false`), parking the other one in its field.
-    fn select_stack(&mut self, process: bool) {
+    pub(super) fn select_stack(&mut self, process: bool) {
         let on_process = self.control & CONTROL_SPSEL != 0;
         if process == on_process {
             return;
@@ -118,6 +121,10 @@ impl Cpu {
         // The handler does not start inside the interrupted code's IT
         // block; the saved xPSR keeps that for the return.
         self.xpsr = (self.xpsr & !(XPSR_IPSR | XPSR_IT)) | (number & XPSR_IPSR);
+        // The exception is active from now until its handler returns,
+        // and its priority is the one to beat.
+        bus.activate_exception(number);
+        bus.set_current_exception(number);
 
         // 4. Load the PC from the vector table.
         let table = bus.read32(VTOR);
@@ -172,6 +179,12 @@ impl Cpu {
     /// interrupted code. `pc` is the address of the returning instruction.
     fn exception_return(&mut self, exc_return: u32, pc: u32, bus: &mut Bus) {
         let returning = self.xpsr & XPSR_IPSR;
+        bus.deactivate_exception(returning);
+        // FAULTMASK does not outlive the handler that set it, except
+        // for NMI's (B5.2.1).
+        if returning != EXCEPTION_NMI {
+            self.faultmask = false;
+        }
 
         // 1. EXC_RETURN picks the stack that holds the frame.
         match exc_return {
@@ -204,6 +217,7 @@ impl Cpu {
         // 4. Restore the flags and IPSR. Bit 9 is not part of the live
         //    xPSR, and the Thumb bit is always set.
         self.xpsr = (saved_xpsr & !XPSR_STACK_ALIGN) | XPSR_T;
+        bus.set_current_exception(self.xpsr & XPSR_IPSR);
 
         // 5. The restored IPSR must agree with the mode EXC_RETURN asked
         //    for. The real chip raises a UsageFault if it does not.
@@ -568,11 +582,11 @@ mod tests {
     fn wfi_with_an_exception_already_pending_does_not_sleep() {
         let (mut cpu, mut bus) = cpu_sleeping_between_systicks();
         bus.pend_exception(SYSTICK);
-        // Hold the exception back for one step by pretending to be in a
-        // handler, so that wfi executes while it is still pending.
-        cpu.xpsr |= 3;
+        // Hold the exception back for one step with PRIMASK ("interrupts
+        // off"), so that wfi executes while it is still pending.
+        cpu.primask = true;
         cpu.step(&mut bus); // wfi
-        cpu.xpsr &= !XPSR_IPSR;
+        cpu.primask = false;
 
         cpu.step(&mut bus); // wakes at once: entry and adds r4, #1
         assert_eq!(cpu.regs[4], 1);
@@ -816,5 +830,294 @@ mod tests {
         cpu.step(&mut bus); // movne r0, #2, skipped
         assert_eq!(cpu.regs[0], 1);
         assert_eq!(cpu.regs[PC], MAIN + 6);
+    }
+
+    const LOW: u32 = 0x0040_0200; // handler for the less urgent exception
+    const HIGH: u32 = 0x0040_0240; // handler for the more urgent one
+    const SHPR3_SYSTICK: u32 = 0xE000_ED23; // SysTick's priority byte
+    const NVIC_IPR7: u32 = 0xE000_E407; // IRQ 7's priority byte
+    const NVIC_IABR0: u32 = 0xE000_E300;
+
+    /// Main: `b .`. SysTick (exception 15) and IRQ 7 (exception 23) each
+    /// have their own handler, and IRQ 7 is enabled in the NVIC.
+    ///
+    /// SysTick handler at LOW:  adds r4, #1 ; adds r4, #1 ; bx lr
+    /// IRQ 7 handler at HIGH:   mov r6, r4 ; bx lr
+    ///
+    /// R6 records how far the SysTick handler had got when the IRQ 7
+    /// handler ran: 0 before it, 1 in the middle of it, 2 after it.
+    fn cpu_with_two_handlers(systick_priority: u8, irq7_priority: u8) -> (Cpu, Bus) {
+        let (cpu, mut bus) = cpu_with_handlers_at(SYSTICK, UART0_EXCEPTION);
+        bus.write8(SHPR3_SYSTICK, systick_priority);
+        bus.write8(NVIC_IPR7, irq7_priority);
+        (cpu, bus)
+    }
+
+    /// The same image with the handler at LOW serving exception `low` and
+    /// the one at HIGH serving exception `high`. Priorities are left at 0.
+    fn cpu_with_handlers_at(low: u32, high: u32) -> (Cpu, Bus) {
+        let mut image = vec![0u8; 0x300];
+        let mut put32 = |offset: usize, value: u32| {
+            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put32(0, STACK_TOP);
+        put32(4, MAIN | 1);
+        put32(4 * low as usize, LOW | 1);
+        put32(4 * high as usize, HIGH | 1);
+        let mut put_code = |address: u32, code: &[u16]| {
+            for (i, halfword) in code.iter().enumerate() {
+                let offset = (address - 0x0040_0000) as usize + 2 * i;
+                image[offset..offset + 2].copy_from_slice(&halfword.to_le_bytes());
+            }
+        };
+        put_code(MAIN, &[0xE7FE]);
+        put_code(LOW, &[0x3401, 0x3401, 0x4770]);
+        put_code(HIGH, &[0x4626, 0x4770]);
+
+        let mut bus = Bus::new();
+        bus.load_firmware(&image);
+        bus.write32(NVIC_ISER0, 1 << UART0_IRQ);
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut bus);
+        cpu.regs[6] = 0xFFFF_FFFF; // "the IRQ 7 handler has not run"
+        (cpu, bus)
+    }
+
+    #[test]
+    fn more_urgent_exception_interrupts_a_running_handler() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0xE0, 0x20);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // SysTick entry, first adds
+        assert_eq!(cpu.xpsr & XPSR_IPSR, SYSTICK);
+        let sp_in_systick = cpu.regs[SP];
+
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus); // IRQ 7 entry, mov r6, r4
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+        assert_eq!(cpu.regs[6], 1); // SysTick's handler was half done
+        // A second frame sits below the first, and LR says "back to a
+        // handler".
+        assert_eq!(cpu.regs[SP], sp_in_systick - 0x20);
+        assert_eq!(cpu.regs[LR], 0xFFFF_FFF1);
+        // Both are active.
+        assert_eq!(bus.read32(NVIC_IABR0), 1 << UART0_IRQ);
+
+        cpu.step(&mut bus); // bx lr: back into the SysTick handler
+        assert_eq!(cpu.xpsr & XPSR_IPSR, SYSTICK);
+        assert_eq!(cpu.regs[PC], LOW + 2);
+        assert_eq!(cpu.regs[SP], sp_in_systick);
+        assert_eq!(bus.read32(NVIC_IABR0), 0);
+
+        cpu.step(&mut bus); // second adds
+        assert_eq!(cpu.regs[4], 2);
+        cpu.step(&mut bus); // bx lr: back to main
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[PC], MAIN);
+        assert_eq!(cpu.regs[SP], STACK_TOP);
+    }
+
+    #[test]
+    fn less_urgent_exception_waits_for_the_running_handler() {
+        // The other way round: SysTick is the urgent one.
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0x20, 0xE0);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // SysTick entry, first adds
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus); // second adds: not interrupted
+        assert_eq!(cpu.xpsr & XPSR_IPSR, SYSTICK);
+        cpu.step(&mut bus); // bx lr
+        assert!(!cpu.in_handler_mode());
+
+        cpu.step(&mut bus); // now IRQ 7 is taken
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+        assert_eq!(cpu.regs[6], 2); // SysTick's handler had finished
+    }
+
+    #[test]
+    fn exception_of_equal_priority_waits_for_the_running_handler() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0x40, 0x40);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus);
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus);
+        cpu.step(&mut bus); // SysTick handler runs to its end
+        assert!(!cpu.in_handler_mode());
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[6], 2);
+    }
+
+    #[test]
+    fn of_two_waiting_exceptions_the_more_urgent_runs_first() {
+        // IRQ 7 has the higher exception number but the higher priority.
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0xE0, 0x20);
+        bus.pend_exception(SYSTICK);
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+        assert_eq!(cpu.regs[6], 0); // SysTick's handler had not started
+        cpu.step(&mut bus); // bx lr
+        cpu.step(&mut bus); // SysTick follows
+        assert_eq!(cpu.xpsr & XPSR_IPSR, SYSTICK);
+    }
+
+    #[test]
+    fn handler_cannot_be_interrupted_by_its_own_exception() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0xE0, 0x20);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // entry, first adds
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // second adds, same handler run
+        assert_eq!(cpu.regs[4], 2);
+        assert_eq!(cpu.regs[SP], STACK_TOP - 0x20);
+    }
+
+    #[test]
+    fn primask_holds_back_every_configurable_exception() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0xE0, 0x00);
+        cpu.primask = true;
+        bus.pend_exception(SYSTICK);
+        bus.pend_exception(UART0_EXCEPTION);
+        for _ in 0..5 {
+            cpu.step(&mut bus);
+            assert!(!cpu.in_handler_mode());
+        }
+        // They were only waiting.
+        cpu.primask = false;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+    }
+
+    #[test]
+    fn basepri_holds_back_its_own_priority_and_below() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0x40, 0x20);
+        cpu.basepri = 0x40;
+        bus.pend_exception(SYSTICK);
+        for _ in 0..5 {
+            cpu.step(&mut bus);
+            assert!(!cpu.in_handler_mode());
+        }
+        // A more urgent one still gets through.
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+        cpu.step(&mut bus); // bx lr
+        cpu.step(&mut bus);
+        assert!(!cpu.in_handler_mode()); // SysTick is still held back
+
+        cpu.basepri = 0;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr & XPSR_IPSR, SYSTICK);
+    }
+
+    #[test]
+    fn faultmask_holds_back_everything_but_nmi() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0x00, 0x00);
+        cpu.faultmask = true;
+        bus.pend_exception(SYSTICK);
+        bus.pend_exception(3); // HardFault
+        for _ in 0..5 {
+            cpu.step(&mut bus);
+            assert!(!cpu.in_handler_mode());
+        }
+    }
+
+    #[test]
+    fn sleeping_handler_is_woken_only_by_a_more_urgent_exception() {
+        let (mut cpu, mut bus) = cpu_with_two_handlers(0xE0, 0x20);
+        // Asleep while SysTick is active, as after a wfi in its handler.
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus);
+        cpu.sleeping = true;
+
+        bus.pend_exception(SYSTICK); // no more urgent than itself
+        cpu.step(&mut bus);
+        assert!(cpu.sleeping);
+
+        bus.pend_exception(UART0_EXCEPTION);
+        cpu.step(&mut bus);
+        assert!(!cpu.sleeping);
+        assert_eq!(cpu.xpsr & XPSR_IPSR, UART0_EXCEPTION);
+    }
+
+    #[test]
+    fn critical_section_delays_the_handler_until_interrupts_are_back_on() {
+        // Main: cpsid i ; adds r5, #1 ; adds r5, #1 ; cpsie i ; b .
+        // SysTick handler: mov r6, r5 ; bx lr (R6 = R5 when it ran).
+        let (mut cpu, mut bus) = cpu_with_handler(
+            &[0xB672, 0x3501, 0x3501, 0xB662, 0xE7FE],
+            &[0x462E, 0x4770],
+            &[SYSTICK],
+        );
+        cpu.step(&mut bus); // cpsid i
+        bus.pend_exception(SYSTICK); // arrives inside the critical section
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        cpu.step(&mut bus); // cpsie i
+        assert!(!cpu.in_handler_mode());
+        assert_eq!(cpu.regs[5], 2);
+
+        cpu.step(&mut bus); // taken before the next instruction
+        assert!(cpu.in_handler_mode());
+        assert_eq!(cpu.regs[6], 2); // both adds had run, uninterrupted
+    }
+
+    #[test]
+    fn faultmask_is_cleared_when_the_handler_returns() {
+        // SysTick handler: cpsid f ; bx lr
+        let (mut cpu, mut bus) = cpu_with_handler(&[0xE7FE], &[0xB671, 0x4770], &[SYSTICK]);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // entry, cpsid f
+        assert!(cpu.faultmask);
+        cpu.step(&mut bus); // bx lr
+        assert!(!cpu.in_handler_mode());
+        assert!(!cpu.faultmask);
+    }
+
+    #[test]
+    fn primask_is_kept_when_the_handler_returns() {
+        // SysTick handler: cpsid i ; bx lr
+        let (mut cpu, mut bus) = cpu_with_handler(&[0xE7FE], &[0xB672, 0x4770], &[SYSTICK]);
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert!(!cpu.in_handler_mode());
+        assert!(cpu.primask);
+    }
+
+    const ICSR: u32 = 0xE000_ED04;
+
+    #[test]
+    fn handler_can_ask_for_pendsv_which_runs_after_it() {
+        // The pattern an operating system uses: a handler asks for PendSV,
+        // which has the lowest priority and so runs once every other
+        // handler has finished.
+        //
+        // PendSV's handler is the one at LOW (adds r4, #1 ; ...) and
+        // SysTick's the one at HIGH (mov r6, r4 ; bx lr).
+        const PENDSV: u32 = 14;
+        let (mut cpu, mut bus) = cpu_with_handlers_at(PENDSV, SYSTICK);
+        bus.write8(0xE000_ED22, 0xE0); // SHPR3: PendSV at the lowest priority
+
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus); // SysTick entry, mov r6, r4
+        assert_eq!(bus.read32(ICSR) & 0x1FF, SYSTICK); // VECTACTIVE
+        bus.write32(ICSR, 1 << 28); // what the handler would write: PENDSVSET
+        cpu.step(&mut bus); // bx lr: PendSV did not interrupt it
+        assert!(!cpu.in_handler_mode());
+
+        cpu.step(&mut bus); // PendSV entry, adds r4, #1
+        assert_eq!(cpu.xpsr & XPSR_IPSR, PENDSV);
+        assert_eq!(cpu.regs[4], 1);
+        assert_eq!(bus.read32(ICSR) & (1 << 28), 0); // no longer pending
+    }
+
+    #[test]
+    fn icsr_shows_no_running_handler_after_the_return() {
+        let (mut cpu, mut bus) = cpu_counting_systicks();
+        bus.pend_exception(SYSTICK);
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(ICSR) & 0x1FF, SYSTICK);
+        cpu.step(&mut bus); // bx lr
+        assert_eq!(bus.read32(ICSR) & 0x1FF, 0);
     }
 }

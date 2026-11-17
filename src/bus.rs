@@ -62,10 +62,36 @@ const SYSTICK_END: u32 = SYSTICK_BASE + SYSTICK_SIZE - 1;
 const NVIC_END: u32 = NVIC_BASE + NVIC_SIZE - 1;
 const SCB_END: u32 = SCB_BASE + SCB_SIZE - 1;
 
+// Two System Control Block registers that the bus answers itself, because
+// they act on the pending and active exceptions (B3.2.4 and B3.2.21 of the
+// ARM manual).
+const ICSR: u32 = SCB_BASE + 0x04; // Interrupt Control and State
+const STIR: u32 = SCB_BASE + 0x200; // Software Triggered Interrupt
+
+// ICSR bits.
+const ICSR_NMIPENDSET: u32 = 1 << 31; // write 1: raise NMI; reads 1 while pending
+const ICSR_PENDSVSET: u32 = 1 << 28; // write 1: pend PendSV; reads 1 while pending
+const ICSR_PENDSVCLR: u32 = 1 << 27; // write 1: PendSV no longer pending
+const ICSR_PENDSTSET: u32 = 1 << 26; // write 1: pend SysTick; reads 1 while pending
+const ICSR_PENDSTCLR: u32 = 1 << 25; // write 1: SysTick no longer pending
+const ICSR_ISRPENDING: u32 = 1 << 22; // some IRQ is pending
+const ICSR_VECTPENDING_SHIFT: u32 = 12; // bits 20-12: most urgent pending exception
+const ICSR_RETTOBASE: u32 = 1 << 11; // no handler is active but the running one
+// Bits 8-0, VECTACTIVE: the exception whose handler is running.
+
+const ICSR_END: u32 = ICSR + 3;
+
+const EXCEPTION_NMI: u32 = 2;
+const EXCEPTION_PENDSV: u32 = 14;
 /// Exception number of the SysTick exception.
 const EXCEPTION_SYSTICK: u32 = 15;
 /// Exception number of IRQ 0. IRQ n is exception 16 + n.
 const EXCEPTION_IRQ0: u32 = 16;
+
+/// The priority of code running with no exception active (Thread mode):
+/// one below the lowest priority an exception can have, so that anything
+/// can interrupt it.
+pub const PRIORITY_THREAD: i32 = 256;
 
 /// UART0's interrupt number (from the SVD).
 const IRQ_UART0: u32 = 7;
@@ -120,6 +146,13 @@ pub struct Bus {
     /// are waiting for the CPU to take them: bit n is set while exception
     /// number n is pending. Peripheral interrupts are kept by the NVIC.
     pending_exceptions: u128,
+    /// Exceptions whose handler has started and not yet returned: bit n
+    /// for exception number n. More than one bit is set while handlers
+    /// are nested.
+    active_exceptions: u128,
+    /// The exception whose handler is running now (the CPU's IPSR), or 0
+    /// in Thread mode. Kept here so that ICSR can report it.
+    current_exception: u32,
 }
 
 impl Bus {
@@ -139,6 +172,8 @@ impl Bus {
             systick: SysTick::new(),
             nvic: Nvic::new(),
             pending_exceptions: 0,
+            active_exceptions: 0,
+            current_exception: 0,
         }
     }
     pub fn load_firmware_from_bin(&mut self, bin_filename: String) {
@@ -174,16 +209,155 @@ impl Bus {
     }
 
     /// Ask for exception `number` to be taken. It stays pending until the
-    /// CPU takes it. This goes round the NVIC, so it is meant for the
-    /// system exceptions; an IRQ pended this way needs no enable bit.
+    /// CPU takes it. For an IRQ (16 and up) this sets its pending bit in
+    /// the NVIC, where it also has to be enabled.
     pub fn pend_exception(&mut self, number: u32) {
-        self.pending_exceptions |= 1 << number;
+        if number < EXCEPTION_IRQ0 {
+            self.pending_exceptions |= 1 << number;
+        } else {
+            self.nvic.set_pending(number - EXCEPTION_IRQ0);
+        }
     }
 
-    /// True if any exception is waiting to be taken.
-    pub fn has_pending_exception(&mut self) -> bool {
+    /// The priority of exception `number`. A lower value is a higher
+    /// priority (B1.5.4). Reset, NMI and HardFault have fixed negative
+    /// priorities; firmware sets the rest, in the SCB for the system
+    /// exceptions and in the NVIC for the IRQs.
+    fn exception_priority(&self, number: u32) -> i32 {
+        match number {
+            1 => -3, // Reset
+            2 => -2, // NMI
+            3 => -1, // HardFault
+            4..EXCEPTION_IRQ0 => self.scb.system_priority(number) as i32,
+            _ => self.nvic.priority(number - EXCEPTION_IRQ0) as i32,
+        }
+    }
+
+    /// The part of `priority` that decides whether one exception can
+    /// interrupt another. AIRCR.PRIGROUP splits a priority value in two:
+    /// the upper bits are the group priority and the lower bits, the
+    /// subpriority, only settle the order among exceptions that are
+    /// waiting. With the reset value of PRIGROUP every implemented bit is
+    /// group priority.
+    pub fn group_priority(&self, priority: i32) -> i32 {
+        if priority < 0 {
+            return priority; // the fixed priorities are not split
+        }
+        let group_value = 2 << self.scb.priority_group();
+        priority - priority % group_value
+    }
+
+    /// The priority the active handlers give the running code: the most
+    /// urgent group priority among them, or `PRIORITY_THREAD` if no
+    /// exception is active.
+    pub fn active_priority(&self) -> i32 {
+        let mut priority = PRIORITY_THREAD;
+        let mut active = self.active_exceptions;
+        while active != 0 {
+            let number = active.trailing_zeros();
+            active &= active - 1; // clear the lowest set bit
+            priority = priority.min(self.group_priority(self.exception_priority(number)));
+        }
+        priority
+    }
+
+    /// Exception `number`'s handler is starting.
+    pub fn activate_exception(&mut self, number: u32) {
+        self.active_exceptions |= 1 << number;
+        if number >= EXCEPTION_IRQ0 {
+            self.nvic.set_active(number - EXCEPTION_IRQ0, true);
+        }
+    }
+
+    /// Exception `number`'s handler has returned.
+    pub fn deactivate_exception(&mut self, number: u32) {
+        self.active_exceptions &= !(1 << number);
+        if number >= EXCEPTION_IRQ0 {
+            self.nvic.set_active(number - EXCEPTION_IRQ0, false);
+        }
+    }
+
+    /// The CPU reports which exception's handler is running (0 for
+    /// Thread mode) whenever that changes.
+    pub fn set_current_exception(&mut self, number: u32) {
+        self.current_exception = number;
+    }
+
+    /// Read ICSR: which exceptions are pending and active.
+    fn read_icsr(&mut self) -> u32 {
+        let pending = |number: u32| self.pending_exceptions & (1 << number) != 0;
+        let mut value = self.current_exception; // VECTACTIVE
+        if pending(EXCEPTION_NMI) {
+            value |= ICSR_NMIPENDSET;
+        }
+        if pending(EXCEPTION_PENDSV) {
+            value |= ICSR_PENDSVSET;
+        }
+        if pending(EXCEPTION_SYSTICK) {
+            value |= ICSR_PENDSTSET;
+        }
+        // In a handler: set if returning from it would go back to Thread
+        // mode, that is, if it did not interrupt another handler.
+        if self.current_exception != 0
+            && self.active_exceptions & !(1 << self.current_exception) == 0
+        {
+            value |= ICSR_RETTOBASE;
+        }
         self.update_irq_lines();
-        self.pending_exceptions != 0 || self.nvic.has_pending_irq()
+        if self.nvic.any_pending() {
+            value |= ICSR_ISRPENDING;
+        }
+        if let Some(number) = self.next_pending_exception() {
+            value |= number << ICSR_VECTPENDING_SHIFT;
+        }
+        value
+    }
+
+    /// Write ICSR: firmware asks for NMI, PendSV or SysTick, or withdraws
+    /// a PendSV or SysTick that has not been taken yet. Bits written as 0
+    /// do nothing.
+    fn write_icsr(&mut self, bits: u32) {
+        if bits & ICSR_NMIPENDSET != 0 {
+            self.pend_exception(EXCEPTION_NMI);
+        }
+        if bits & ICSR_PENDSVSET != 0 {
+            self.pend_exception(EXCEPTION_PENDSV);
+        }
+        if bits & ICSR_PENDSTSET != 0 {
+            self.pend_exception(EXCEPTION_SYSTICK);
+        }
+        if bits & ICSR_PENDSVCLR != 0 {
+            self.pending_exceptions &= !(1 << EXCEPTION_PENDSV);
+        }
+        if bits & ICSR_PENDSTCLR != 0 {
+            self.pending_exceptions &= !(1 << EXCEPTION_SYSTICK);
+        }
+    }
+
+    /// The most urgent exception that is waiting, if any: the one with
+    /// the lowest priority value, and of those the lowest number.
+    fn next_pending_exception(&mut self) -> Option<u32> {
+        self.update_irq_lines();
+        let mut best = self.nvic.next_irq().map(|irq| EXCEPTION_IRQ0 + irq);
+        // System exceptions have the lower numbers, so they win a tie.
+        // Checked from the highest number down, each one that is at least
+        // as urgent as the best so far replaces it.
+        let mut pending = self.pending_exceptions;
+        while pending != 0 {
+            let number = 127 - pending.leading_zeros();
+            pending &= !(1 << number);
+            if best.is_none_or(|b| self.exception_priority(number) <= self.exception_priority(b)) {
+                best = Some(number);
+            }
+        }
+        best
+    }
+
+    /// True if an exception is waiting that is urgent enough to interrupt
+    /// code running at priority `current`.
+    pub fn has_pending_exception(&mut self, current: i32) -> bool {
+        self.next_pending_exception()
+            .is_some_and(|n| self.group_priority(self.exception_priority(n)) < current)
     }
 
     /// How many clock cycles from now the next exception will be raised,
@@ -196,19 +370,22 @@ impl Bus {
         self.systick.cycles_until_exception()
     }
 
-    /// Hand the CPU a pending exception to take, if there is one, and stop
-    /// it being pending. With several pending, the lowest exception number
-    /// goes first, so system exceptions come before peripheral interrupts;
-    /// real priorities are not implemented yet.
-    pub fn take_pending_exception(&mut self) -> Option<u32> {
-        if self.pending_exceptions != 0 {
-            let number = self.pending_exceptions.trailing_zeros();
-            self.pending_exceptions &= !(1 << number);
-            return Some(number);
+    /// Hand the CPU a pending exception to take, if one is urgent enough
+    /// to interrupt code running at priority `current`, and stop it being
+    /// pending. An exception interrupts only if its group priority is
+    /// strictly higher (a lower value) than `current`; otherwise it stays
+    /// pending.
+    pub fn take_pending_exception(&mut self, current: i32) -> Option<u32> {
+        let number = self.next_pending_exception()?;
+        if self.group_priority(self.exception_priority(number)) >= current {
+            return None;
         }
-        self.update_irq_lines();
-        let irq = self.nvic.take_pending_irq()?;
-        Some(EXCEPTION_IRQ0 + irq)
+        if number < EXCEPTION_IRQ0 {
+            self.pending_exceptions &= !(1 << number);
+        } else {
+            self.nvic.acknowledge(number - EXCEPTION_IRQ0);
+        }
+        Some(number)
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
@@ -258,6 +435,15 @@ impl Bus {
             SUPC_BASE..=SUPC_END => self.supc.read(addr - SUPC_BASE, size),
             SYSTICK_BASE..=SYSTICK_END => self.systick.read(addr - SYSTICK_BASE, size),
             NVIC_BASE..=NVIC_END => self.nvic.read(addr - NVIC_BASE, size),
+            // Any size of access to ICSR: pick the bytes asked for.
+            ICSR..=ICSR_END => {
+                let word = self.read_icsr() >> ((addr & 3) * 8);
+                match size {
+                    1 => word & 0xFF,
+                    2 => word & 0xFFFF,
+                    _ => word,
+                }
+            }
             SCB_BASE..=SCB_END => self.scb.read(addr - SCB_BASE, size),
             // Unmapped: log instead of panicking. The log shows which
             // peripheral the firmware wants next.
@@ -303,6 +489,12 @@ impl Bus {
             SUPC_BASE..=SUPC_END => self.supc.write(addr - SUPC_BASE, size, value),
             SYSTICK_BASE..=SYSTICK_END => self.systick.write(addr - SYSTICK_BASE, size, value),
             NVIC_BASE..=NVIC_END => self.nvic.write(addr - NVIC_BASE, size, value),
+            // Writing 1 acts and writing 0 does nothing, so a narrow write
+            // only needs its bits moved to their place in the register.
+            ICSR..=ICSR_END => self.write_icsr(value << ((addr & 3) * 8)),
+            // STIR: the value written is the number of an IRQ to make
+            // pending, the same as setting its bit in the NVIC's ISPR.
+            STIR => self.nvic.set_pending(value & 0x1FF),
             SCB_BASE..=SCB_END => self.scb.write(addr - SCB_BASE, size, value),
             _ => {
                 eprintln!(
@@ -507,18 +699,18 @@ mod tests {
         bus.write32(UART0_BASE + 0x08, 1 << 0); // UART_IER: RXRDY
         bus.write32(NVIC_BASE, 1 << IRQ_UART0); // ISER0
         bus.tick(1);
-        assert!(!bus.has_pending_exception());
+        assert!(!bus.has_pending_exception(PRIORITY_THREAD));
 
         sender.send(b'x').unwrap();
         bus.tick(1);
-        assert!(bus.has_pending_exception());
-        assert_eq!(bus.take_pending_exception(), Some(23));
+        assert!(bus.has_pending_exception(PRIORITY_THREAD));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(23));
         // Still asking: the byte has not been read.
-        assert_eq!(bus.take_pending_exception(), Some(23));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(23));
         // Reading UART_RHR withdraws the request.
         assert_eq!(bus.read32(UART0_BASE + 0x18), b'x' as u32);
-        assert_eq!(bus.take_pending_exception(), None);
-        assert!(!bus.has_pending_exception());
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+        assert!(!bus.has_pending_exception(PRIORITY_THREAD));
     }
 
     #[test]
@@ -528,7 +720,7 @@ mod tests {
         bus.write32(UART0_BASE + 0x08, 1 << 0);
         sender.send(b'x').unwrap();
         bus.tick(1);
-        assert_eq!(bus.take_pending_exception(), None);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
         // The NVIC shows it pending all the same (ISPR0).
         assert_eq!(bus.read32(NVIC_BASE + 0x100), 1 << IRQ_UART0);
 
@@ -537,7 +729,7 @@ mod tests {
         bus.write32(NVIC_BASE, 1 << IRQ_UART0);
         sender.send(b'x').unwrap();
         bus.tick(1);
-        assert_eq!(bus.take_pending_exception(), None);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
         // The byte can still be read by polling UART_SR.
         assert_eq!(bus.read32(UART0_BASE + 0x14) & 1, 1);
     }
@@ -550,8 +742,8 @@ mod tests {
         sender.send(b'x').unwrap();
         bus.tick(1);
         bus.pend_exception(EXCEPTION_SYSTICK);
-        assert_eq!(bus.take_pending_exception(), Some(15));
-        assert_eq!(bus.take_pending_exception(), Some(23));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(15));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(23));
     }
 
     #[test]
@@ -562,18 +754,18 @@ mod tests {
         bus.write32(SYSTICK_BASE, 0b011); // SYST_CSR: ENABLE | TICKINT
         // Load 2, then 1, then 0: the third cycle reaches zero.
         bus.tick(2);
-        assert_eq!(bus.take_pending_exception(), None);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
         bus.tick(1);
-        assert_eq!(bus.take_pending_exception(), Some(15));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(15));
         // Taking it stops it being pending.
-        assert_eq!(bus.take_pending_exception(), None);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
     }
 
     #[test]
     fn next_exception_time_follows_systick() {
         let mut bus = Bus::new();
         assert_eq!(bus.cycles_until_next_exception(), None);
-        assert!(!bus.has_pending_exception());
+        assert!(!bus.has_pending_exception(PRIORITY_THREAD));
 
         bus.write32(SYSTICK_BASE + 0x04, 99); // SYST_RVR: period 100
         bus.write32(SYSTICK_BASE + 0x08, 0); // SYST_CVR: clear
@@ -585,19 +777,20 @@ mod tests {
 
         // Ticking exactly that far raises it.
         bus.tick(70);
-        assert!(bus.has_pending_exception());
+        assert!(bus.has_pending_exception(PRIORITY_THREAD));
         assert_eq!(bus.cycles_until_next_exception(), Some(100));
     }
 
     #[test]
     fn pending_exceptions_are_taken_lowest_number_first() {
         let mut bus = Bus::new();
+        bus.write32(NVIC_BASE, 1 << 7); // ISER0: enable IRQ 7
         bus.pend_exception(23);
         bus.pend_exception(15);
         bus.pend_exception(23); // pending twice is still pending once
-        assert_eq!(bus.take_pending_exception(), Some(15));
-        assert_eq!(bus.take_pending_exception(), Some(23));
-        assert_eq!(bus.take_pending_exception(), None);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(15));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(23));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
     }
 
     #[test]
@@ -606,5 +799,197 @@ mod tests {
         assert_eq!(bus.read32(UART0_BASE + 0x14), 0x202);
         assert_eq!(bus.read16(UART0_BASE + 0x14), 0x202);
         assert_eq!(bus.read8(UART0_BASE + 0x14), 0x02);
+    }
+
+    const SHPR3_SYSTICK: u32 = SCB_BASE + 0x23; // SysTick's priority byte
+    const NVIC_IPR: u32 = NVIC_BASE + 0x300; // one priority byte per IRQ
+    const AIRCR: u32 = SCB_BASE + 0x0C;
+
+    /// A bus with IRQ 7 and IRQ 9 enabled in the NVIC.
+    fn bus_with_irqs_enabled() -> Bus {
+        let mut bus = Bus::new();
+        bus.write32(NVIC_BASE, (1 << 7) | (1 << 9));
+        bus
+    }
+
+    #[test]
+    fn most_urgent_pending_exception_is_taken_first() {
+        let mut bus = bus_with_irqs_enabled();
+        bus.write8(SHPR3_SYSTICK, 0xE0);
+        bus.write8(NVIC_IPR + 7, 0x40);
+        bus.write8(NVIC_IPR + 9, 0x20);
+        bus.pend_exception(15);
+        bus.pend_exception(23);
+        bus.pend_exception(25);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(25));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(23));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(15));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn exception_is_taken_only_if_more_urgent_than_the_running_code() {
+        let mut bus = bus_with_irqs_enabled();
+        bus.write8(NVIC_IPR + 7, 0x40);
+        bus.pend_exception(23);
+        // Equal priority does not interrupt, nor does anything more urgent.
+        assert!(!bus.has_pending_exception(0x40));
+        assert_eq!(bus.take_pending_exception(0x40), None);
+        assert_eq!(bus.take_pending_exception(0x20), None);
+        // It is still waiting, and gets in below less urgent code.
+        assert!(bus.has_pending_exception(0x60));
+        assert_eq!(bus.take_pending_exception(0x60), Some(23));
+    }
+
+    #[test]
+    fn active_exceptions_set_the_running_priority() {
+        let mut bus = bus_with_irqs_enabled();
+        bus.write8(SHPR3_SYSTICK, 0xE0);
+        bus.write8(NVIC_IPR + 7, 0x40);
+        assert_eq!(bus.active_priority(), PRIORITY_THREAD);
+
+        bus.activate_exception(15);
+        assert_eq!(bus.active_priority(), 0xE0);
+        bus.activate_exception(23); // nested inside SysTick
+        assert_eq!(bus.active_priority(), 0x40);
+        assert_eq!(bus.read32(NVIC_BASE + 0x200), 1 << 7); // IABR0
+
+        bus.deactivate_exception(23);
+        assert_eq!(bus.active_priority(), 0xE0);
+        assert_eq!(bus.read32(NVIC_BASE + 0x200), 0);
+        bus.deactivate_exception(15);
+        assert_eq!(bus.active_priority(), PRIORITY_THREAD);
+    }
+
+    #[test]
+    fn fixed_priorities_beat_every_configurable_one() {
+        let mut bus = Bus::new();
+        bus.pend_exception(15); // SysTick, priority 0
+        bus.pend_exception(3); // HardFault, priority -1
+        bus.pend_exception(2); // NMI, priority -2
+        // Nothing configurable gets in above priority 0, but these do.
+        assert_eq!(bus.take_pending_exception(0), Some(2));
+        assert_eq!(bus.take_pending_exception(0), Some(3));
+        assert_eq!(bus.take_pending_exception(0), None);
+        // HardFault cannot interrupt NMI or itself.
+        bus.pend_exception(3);
+        assert_eq!(bus.take_pending_exception(-1), None);
+        assert_eq!(bus.take_pending_exception(-2), None);
+    }
+
+    #[test]
+    fn only_three_priority_bits_exist() {
+        let mut bus = Bus::new();
+        bus.write8(SHPR3_SYSTICK, 0xFF);
+        assert_eq!(bus.read8(SHPR3_SYSTICK), 0xE0);
+        assert_eq!(bus.exception_priority(15), 0xE0);
+    }
+
+    #[test]
+    fn priority_grouping_stops_subpriority_from_interrupting() {
+        let mut bus = bus_with_irqs_enabled();
+        bus.write8(NVIC_IPR + 7, 0x40);
+        bus.write8(NVIC_IPR + 9, 0x20);
+        // PRIGROUP = 6: only bit 7 is group priority, so 0x20 and 0x40
+        // are in the same group.
+        bus.write32(AIRCR, 0x05FA_0000 | (6 << 8));
+        assert_eq!(bus.group_priority(0x40), 0);
+        assert_eq!(bus.group_priority(0xE0), 0x80);
+
+        bus.activate_exception(23);
+        bus.pend_exception(25);
+        assert_eq!(bus.take_pending_exception(bus.active_priority()), None);
+        // Among waiting exceptions the subpriority still orders them.
+        bus.deactivate_exception(23);
+        bus.pend_exception(23);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(25));
+
+        // With the reset grouping, 0x20 does interrupt 0x40.
+        bus.write32(AIRCR, 0x05FA_0000);
+        bus.activate_exception(23);
+        bus.pend_exception(25);
+        assert_eq!(bus.take_pending_exception(bus.active_priority()), Some(25));
+    }
+
+    #[test]
+    fn icsr_write_pends_systick_pendsv_and_nmi() {
+        let mut bus = Bus::new();
+        bus.write32(ICSR, ICSR_PENDSTSET | ICSR_PENDSVSET | ICSR_NMIPENDSET);
+        // They read back as pending.
+        let icsr = bus.read32(ICSR);
+        assert_eq!(
+            icsr & (ICSR_PENDSTSET | ICSR_PENDSVSET | ICSR_NMIPENDSET),
+            ICSR_PENDSTSET | ICSR_PENDSVSET | ICSR_NMIPENDSET
+        );
+        // NMI first (priority -2), then PendSV (14) before SysTick (15).
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(2));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(14));
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(15));
+        assert_eq!(bus.read32(ICSR), 0);
+    }
+
+    #[test]
+    fn icsr_write_can_withdraw_pendsv_and_systick() {
+        let mut bus = Bus::new();
+        bus.write32(ICSR, ICSR_PENDSTSET | ICSR_PENDSVSET);
+        bus.write32(ICSR, ICSR_PENDSVCLR);
+        assert_eq!(bus.read32(ICSR) & ICSR_PENDSVSET, 0);
+        assert_ne!(bus.read32(ICSR) & ICSR_PENDSTSET, 0);
+        bus.write32(ICSR, ICSR_PENDSTCLR);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn icsr_byte_write_reaches_the_right_bits() {
+        let mut bus = Bus::new();
+        // PENDSVSET is bit 28: bit 4 of the top byte.
+        bus.write8(ICSR + 3, 1 << 4);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(14));
+        bus.write32(ICSR, ICSR_PENDSTSET);
+        assert_eq!(bus.read8(ICSR + 3), (ICSR_PENDSTSET >> 24) as u8);
+    }
+
+    #[test]
+    fn icsr_reports_the_most_urgent_pending_exception() {
+        let mut bus = bus_with_irqs_enabled();
+        assert_eq!(bus.read32(ICSR), 0);
+        bus.write8(SHPR3_SYSTICK, 0xE0);
+        bus.write8(NVIC_IPR + 7, 0x20);
+        bus.write32(ICSR, ICSR_PENDSTSET);
+        assert_eq!((bus.read32(ICSR) >> 12) & 0x1FF, 15);
+        assert_eq!(bus.read32(ICSR) & ICSR_ISRPENDING, 0);
+
+        bus.pend_exception(23); // IRQ 7, more urgent
+        assert_eq!((bus.read32(ICSR) >> 12) & 0x1FF, 23);
+        assert_ne!(bus.read32(ICSR) & ICSR_ISRPENDING, 0);
+    }
+
+    #[test]
+    fn icsr_reports_the_running_handler_and_whether_it_is_nested() {
+        let mut bus = Bus::new();
+        bus.activate_exception(15);
+        bus.set_current_exception(15);
+        assert_eq!(bus.read32(ICSR) & 0x1FF, 15);
+        assert_ne!(bus.read32(ICSR) & ICSR_RETTOBASE, 0);
+
+        bus.activate_exception(23); // interrupts the SysTick handler
+        bus.set_current_exception(23);
+        assert_eq!(bus.read32(ICSR) & 0x1FF, 23);
+        assert_eq!(bus.read32(ICSR) & ICSR_RETTOBASE, 0);
+
+        bus.deactivate_exception(23);
+        bus.set_current_exception(15);
+        assert_ne!(bus.read32(ICSR) & ICSR_RETTOBASE, 0);
+    }
+
+    #[test]
+    fn stir_write_pends_an_irq() {
+        let mut bus = bus_with_irqs_enabled();
+        bus.write32(STIR, 9);
+        assert_eq!(bus.read32(NVIC_BASE + 0x100), 1 << 9); // ISPR0
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), Some(25));
+        // A number with no IRQ behind it is ignored.
+        bus.write32(STIR, 300);
+        assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
     }
 }

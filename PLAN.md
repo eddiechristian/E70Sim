@@ -106,10 +106,10 @@ All offsets and bit names in this table are verified against the SVD.
 ## Phase 4 — Exceptions and interrupts (ARM ARM B1, B3)
 
 - [x] Exception entry: push 8-word frame; return via `EXC_RETURN` (`0xFFFFFFF1` / `9` / `D`)
-- [ ] MSP/PSP switching, PRIMASK, BASEPRI
+- [x] MSP/PSP switching, PRIMASK, BASEPRI, FAULTMASK, CONTROL; changed with `CPSID` / `CPSIE` and `MRS` / `MSR`
 - [x] SysTick (`0xE000E010`), counting emulated clock cycles
 - [x] NVIC (`0xE000E100`): enable and pending bits
-- [ ] Exception priorities and nesting
+- [x] Exception priorities and nesting (priority grouping included)
 - [ ] HardFault with a useful dump of the faulting state
 - [x] UART0 RX interrupt (IRQ 7) fed from stdin
 

@@ -104,7 +104,7 @@ This is the second job of LR. The check is made by the instructions that can ret
 
 There are two stack pointers, **MSP** (main) and **PSP** (process). Register R13 (SP) is whichever one is currently selected. Simple firmware, including `hello-rs`, uses only MSP. An operating system gives each task its own stack through PSP and keeps MSP for handlers, so a task with a full stack cannot break interrupt handling.
 
-`Cpu` already has `msp`, `psp` and `control` fields; nothing uses them yet.
+In the emulator `regs[SP]` is always the stack in use, and the other one is kept in `Cpu`'s `msp` or `psp` field. Exception entry and return switch between them, and firmware can with `MSR` (see "Changing the masks" below).
 
 ## Priorities: which exception wins
 
@@ -128,7 +128,73 @@ Firmware can also hold exceptions back with three mask registers:
 | `FAULTMASK` | Blocks everything except NMI |
 | `BASEPRI` | Blocks exceptions at or below a chosen priority level |
 
-`PRIMASK` is set and cleared by the `CPSID i` and `CPSIE i` instructions. All three can be read and written with `MRS` and `MSR`. `Cpu` already has the fields.
+`PRIMASK` is set and cleared by the `CPSID i` and `CPSIE i` instructions. All three can be read and written with `MRS` and `MSR`.
+
+### Where the priorities are set
+
+| Exception | Register | Address |
+|---|---|---|
+| System exceptions 4 to 15 | `SHPR1`–`SHPR3` in the SCB, one byte each | `0xE000_ED18 + (number - 4)`; SysTick is `0xE000_ED23` |
+| IRQ n | `IPR` in the NVIC, one byte each | `0xE000_E400 + n` |
+
+Every priority is 0 after reset, the highest a configurable exception can have. So until firmware sets priorities, nothing can interrupt a handler. When two waiting exceptions have the same priority, the lower exception number goes first.
+
+### Group priority and subpriority
+
+`AIRCR.PRIGROUP` (SCB, `0xE000_ED0C`) can split the priority value in two. The upper part, the **group priority**, decides whether one exception can interrupt another. The lower part, the **subpriority**, only decides the order among exceptions that are waiting. With the reset value all 3 implemented bits are group priority, which is what most firmware uses.
+
+### How the emulator does it
+
+This follows the `ExecutionPriority` pseudocode in B1.5.4.
+
+- The bus keeps the set of **active** exceptions (`activate_exception` on entry, `deactivate_exception` on return). The priority of the running code is the most urgent group priority among them, or 256 in Thread mode, a value that anything can beat (`Bus::active_priority`).
+- `Cpu::execution_priority` then applies `BASEPRI`, `PRIMASK` and `FAULTMASK`.
+- Before each instruction the CPU asks the bus for a pending exception more urgent than that (`Bus::take_pending_exception`). The bus picks the most urgent one waiting and hands it over only if its group priority is strictly higher. The CPU enters it whether it was in Thread mode or in a handler.
+
+Nesting needs nothing special on the stack: the second frame is simply pushed below the first, and its `EXC_RETURN` is `0xFFFF_FFF1`, "back to a handler".
+
+### Pending an exception from firmware: `ICSR` and `STIR`
+
+Firmware can ask for an exception itself, with no timer or peripheral involved.
+
+| Register | Address | Write | Read |
+|---|---|---|---|
+| `ICSR` | `0xE000_ED04` | Bit 31 raises NMI. Bit 28 pends PendSV and bit 27 withdraws it. Bit 26 pends SysTick and bit 25 withdraws it. | The same "set" bits show what is pending. Bits 8–0 (`VECTACTIVE`) are the exception running now, bits 20–12 (`VECTPENDING`) the most urgent one waiting, bit 22 says some IRQ is pending, and bit 11 (`RETTOBASE`) says the running handler did not interrupt another one. |
+| `STIR` | `0xE000_EF00` | The number of an IRQ to make pending | — |
+
+The main user is an operating system. **PendSV** exists for this: it is given the lowest priority, and any handler that decides a task switch is needed writes `PENDSVSET`. PendSV then runs only after every other handler has finished, and does the switch there.
+
+The bus handles both registers (`read_icsr` and `write_icsr` in `src/bus.rs`), because it is what keeps the pending and active state. To report `VECTACTIVE` it needs to know which handler is running, so the CPU tells it on every exception entry and return (`set_current_exception`).
+
+### Changing the masks: `CPSID` / `CPSIE`, `MRS` and `MSR`
+
+These are in `src/cpu/system.rs` (ARM manual B5.2).
+
+| Instruction | What it does |
+|---|---|
+| `cpsid i` / `cpsie i` | Set / clear `PRIMASK`: interrupts off / on |
+| `cpsid f` / `cpsie f` | Set / clear `FAULTMASK` |
+| `mrs r0, <register>` | Read a special-purpose register into R0 |
+| `msr <register>, r0` | Write R0 to a special-purpose register |
+
+The special-purpose registers `MRS` and `MSR` can name are `PRIMASK`, `FAULTMASK`, `BASEPRI`, `BASEPRI_MAX`, `CONTROL`, `MSP`, `PSP` and the parts of the xPSR.
+
+The usual use is a **critical section**: a few instructions that must not be interrupted, for example main code updating a variable that a handler also uses.
+
+```
+mrs   r0, primask   ; remember whether interrupts were already off
+cpsid i             ; interrupts off
+...                 ; the protected instructions
+msr   primask, r0   ; put it back the way it was
+```
+
+An exception that arrives in between is not lost. It stays pending and is taken right after interrupts come back on.
+
+Details worth knowing:
+
+- `BASEPRI_MAX` is `BASEPRI` with a safety catch: a write only takes effect if it masks more than before, so nested critical sections cannot accidentally unmask.
+- `FAULTMASK` is cleared automatically when a handler returns (other than NMI's). `PRIMASK` is not.
+- Writing `CONTROL` bit 1 in Thread mode switches to the process stack. Bit 0 makes Thread mode **unprivileged**: from then on its writes to the masks, `CONTROL` and the stack pointers are ignored and its reads of them return 0. Only an exception handler can undo that.
 
 ## The NVIC
 
@@ -217,7 +283,7 @@ How this is done in the emulator:
 
 - A thread reads the host's stdin and passes the bytes down a channel (`stdin_bytes` in `src/peripheral/uart.rs`). After every instruction the bus lets the UART take one byte from the channel, if `UART_RHR` is free.
 - The bus then asks the UART whether it wants its interrupt and tells the NVIC (`update_irq_lines` in `src/bus.rs`). This is the route from a peripheral to the CPU.
-- When the CPU asks the bus for the next exception, system exceptions go first, then the lowest-numbered IRQ that is pending and enabled in the NVIC.
+- When the CPU asks the bus for the next exception, the bus considers the pending system exceptions and the IRQs that are pending and enabled in the NVIC, and picks by priority (see "Priorities" above).
 
 Two things differ from a real board:
 
@@ -230,20 +296,24 @@ When a byte arrives is not tied to the emulated clock, so two runs can see it at
 
 | Piece | Where | Notes |
 |---|---|---|
-| Pending state for every exception | `Bus` (`pend_exception`, `take_pending_exception`) | Done. Active state and priorities are still to come |
-| NVIC registers | `src/peripheral/nvic.rs` | Done: enable and pending. Priorities are stored but not used yet |
+| Pending and active state for every exception | `Bus` (`pend_exception`, `take_pending_exception`, `activate_exception`) | Done |
+| Priorities, pre-emption and nesting | `Bus` (`exception_priority`, `active_priority`), `Cpu::execution_priority` | Done, including priority grouping |
+| `PRIMASK`, `FAULTMASK`, `BASEPRI` | `Cpu::execution_priority`, `src/cpu/system.rs` | Done, with `CPSID` / `CPSIE`, `MRS` and `MSR` |
+| NVIC registers | `src/peripheral/nvic.rs` | Done: enable, pending, active and priority |
 | SysTick registers and countdown | `src/peripheral/systick.rs` | Done. Counts emulated clock cycles |
-| `ICSR`, `SHPR`, `SHCSR` behaviour | `src/peripheral/scb.rs` | Currently store-and-readback or logged |
-| Check for a pending exception | `Cpu::step` | Done. Before fetching each instruction, and only in Thread mode until priorities exist |
+| `ICSR` and `STIR` | `read_icsr`, `write_icsr` in `src/bus.rs` | Done. Firmware can pend NMI, PendSV, SysTick or any IRQ, and read which exception is running and which is waiting |
+| `SHPR` (priorities) | `src/peripheral/scb.rs` | Done |
+| `SHCSR` (fault enables) | `src/peripheral/scb.rs` | Store-and-readback; it matters once faults exist |
+| Check for a pending exception | `Cpu::step` | Done. Before fetching each instruction, in Thread mode or in a handler |
 | Exception entry | `src/cpu/exception.rs` | Push the frame, set LR, load the PC |
 | Exception return | `bx_write_pc` in `src/cpu/exception.rs` | Used by `BX` and `POP`; loads into the PC will need it too |
-| MSP / PSP switching | `src/cpu/exception.rs` | Done for entry and return; writing `CONTROL` with `MSR` is still to come |
+| MSP / PSP switching | `src/cpu/exception.rs`, `src/cpu/system.rs` | Done: entry, return, and writing `CONTROL`, `MSP` and `PSP` with `MSR` |
 | A way for a peripheral to raise an IRQ | `update_irq_lines` in `src/bus.rs` | Done. The bus asks each peripheral whether it wants its interrupt and tells the NVIC |
 | UART0 receive from stdin | `src/peripheral/uart.rs` | Done |
 
-A peripheral can only answer reads and writes; it cannot call anyone to say that something happened. So the bus does the asking: it owns the exception state, checks each peripheral's interrupt request after every instruction, and the CPU asks the bus once per step whether anything is waiting. The SCB stub still has the old limit: writes that pend an exception through `ICSR` are logged, not carried out.
+A peripheral can only answer reads and writes; it cannot call anyone to say that something happened. So the bus does the asking: it owns the exception state, checks each peripheral's interrupt request after every instruction, and the CPU asks the bus once per step whether anything is waiting. Two SCB registers act on that state, `ICSR` and `STIR`, so the bus answers those itself instead of passing them to the SCB stub.
 
-New instructions are needed as well, as real firmware hits them. `BX` and `WFI` exist; `CPSID` / `CPSIE`, `MRS` / `MSR` and `SVC` are still to come.
+New instructions are needed as well, as real firmware hits them. `BX`, `WFI`, `CPSID` / `CPSIE` and `MRS` / `MSR` exist; `SVC` is still to come.
 
 `WFI` (wait for interrupt) is what firmware uses to idle. After it, the CPU is asleep: `Cpu::step` executes nothing until an exception is pending. Instead of counting through the wait one cycle at a time, it asks the bus how many cycles remain until the next exception will be raised and jumps emulated time forward by that much. If nothing is set up to raise one, the CPU stays asleep and time creeps on a cycle per step.
 

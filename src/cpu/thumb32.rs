@@ -30,6 +30,12 @@ impl Cpu {
         // BL, encoding T1: 11110 S imm10 | 11 J1 1 J2 imm11  (A7.7.18)
         if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
             self.bl(hw1, hw2, pc)
+        // MRS, encoding T1: 1111001111101111 | 1000 Rd SYSm  (B5.2.2)
+        } else if hw1 == 0xF3EF && hw2 & 0xF000 == 0x8000 {
+            self.mrs(hw2, pc)
+        // MSR, encoding T1: 111100111000 Rn | 1000 mask 00 SYSm  (B5.2.3)
+        } else if hw1 & 0xFFF0 == 0xF380 && hw2 & 0xF300 == 0x8000 {
+            self.msr(hw1, hw2, pc, bus)
         // MOV (immediate), encoding T3 (MOVW):
         // 11110 i 100100 imm4 | 0 imm3 Rd imm8  (A7.7.76)
         } else if hw1 & 0xFBF0 == 0xF240 && hw2 & 0x8000 == 0 {

@@ -71,6 +71,9 @@ impl Cpu {
         // UXTB, encoding T1: 1011001011 Rm Rd  (A7.7.221)
         } else if instr >> 6 == 0b1011001011 {
             self.uxtb(instr)
+        // CPS, encoding T1: 10110110011 im 0 0 I F  (B5.2.1)
+        } else if instr & 0xFFEC == 0xB660 {
+            self.cps(instr, pc, bus)
         // WFI, encoding T1: 1011111100110000  (A7.7.263)
         } else if instr == 0xBF30 {
             self.wfi()

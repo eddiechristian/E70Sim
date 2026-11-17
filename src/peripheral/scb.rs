@@ -5,11 +5,17 @@
 //! on the FPU (CPACR), turn on the caches (CCR plus the cache maintenance
 //! registers) and set exception priorities (SHPR).
 //!
-//! None of those have any effect here yet: there are no caches, no FPU and
-//! no exceptions. Registers remember what was written, the identification
-//! registers return the values of a SAME70's Cortex-M7, and requests the
-//! emulator cannot carry out (pending an exception, system reset) are
-//! logged.
+//! The exception priorities (SHPR) and the priority grouping (AIRCR) are
+//! used by the bus to decide which exception can interrupt which, and
+//! VTOR is where the CPU finds the vector table. The rest has no effect
+//! here: there are no caches and no FPU. Registers remember what was
+//! written, the identification registers return the values of a SAME70's
+//! Cortex-M7, and a system reset request, which the emulator
+//! cannot carry out, is logged.
+//!
+//! Two registers in this range are not handled here but by the bus,
+//! because they act on the pending and active exceptions, which the bus
+//! keeps: ICSR (0xE000_ED04) and STIR (0xE000_EF00).
 //!
 //! The stub covers 0xE000_ED00 to 0xE000_EFFF, which also takes in the MPU
 //! (0xE000_ED90), the debug registers (0xE000_EDF0) and the FPU control
@@ -32,6 +38,8 @@ const ICSR: u32 = 0x04; // Interrupt Control and State
 const VTOR: u32 = 0x08; // Vector Table Offset
 const AIRCR: u32 = 0x0C; // Application Interrupt and Reset Control
 const CCR: u32 = 0x14; // Configuration and Control
+const SHPR1: u32 = 0x18; // System Handler Priority 1-3: one byte each
+const SHPR3: u32 = 0x20; //   for exceptions 4 to 15
 const CFSR: u32 = 0x28; // Configurable Fault Status
 const HFSR: u32 = 0x2C; // HardFault Status
 const DFSR: u32 = 0x30; // Debug Fault Status
@@ -63,10 +71,9 @@ const CCSIDR_DCACHE: u32 = 0xF000_0000 | (127 << 13) | (3 << 3) | 1; // 4-way
 const CCSIDR_ICACHE: u32 = 0xF000_0000 | (255 << 13) | (1 << 3) | 1; // 2-way
 const CSSELR_IND: u32 = 1 << 0; // 1 selects the instruction cache
 
-// ICSR: bits that ask for an exception to be made pending.
-const ICSR_NMIPENDSET: u32 = 1 << 31;
-const ICSR_PENDSVSET: u32 = 1 << 28;
-const ICSR_PENDSTSET: u32 = 1 << 26;
+// The SAME70 implements 3 priority bits, the top 3 of each priority
+// byte. The other bits always read 0.
+const PRIORITY_MASK: u32 = 0xE0E0_E0E0;
 
 // VTOR: bits 6-0 are always 0.
 const VTOR_MASK: u32 = 0xFFFF_FF80;
@@ -97,6 +104,19 @@ impl ScbStub {
         scb
     }
 
+    /// The priority firmware has given system exception `number` (4 to
+    /// 15, for example 15 = SysTick): its byte of SHPR1-3.
+    pub fn system_priority(&self, number: u32) -> u8 {
+        let byte = number - 4;
+        (self.get(SHPR1 + (byte & !3)) >> (8 * (byte & 3))) as u8
+    }
+
+    /// AIRCR.PRIGROUP: where a priority value splits into group priority
+    /// and subpriority.
+    pub fn priority_group(&self) -> u32 {
+        (self.get(AIRCR) & AIRCR_PRIGROUP) >> 8
+    }
+
     fn get(&self, offset: u32) -> u32 {
         self.regs[(offset / 4) as usize]
     }
@@ -109,7 +129,9 @@ impl ScbStub {
     fn read_word(&self, offset: u32) -> u32 {
         match offset {
             CPUID => CPUID_VALUE,
-            // No exception is ever active or pending.
+            // ICSR is about which exceptions are pending and active,
+            // which the bus knows and this stub does not. The bus
+            // answers ICSR itself, so this is never reached through it.
             ICSR => 0,
             AIRCR => AIRCR_VECTKEYSTAT | self.get(AIRCR),
             // No fault is ever recorded.
@@ -141,14 +163,8 @@ impl ScbStub {
         let merged = (self.get(offset) & !mask) | bits;
         match offset {
             CPUID | CLIDR | CTR | CCSIDR | MPU_TYPE | MVFR0..=MVFR2 => {}
-            ICSR => {
-                if bits & (ICSR_NMIPENDSET | ICSR_PENDSVSET | ICSR_PENDSTSET) != 0 {
-                    eprintln!(
-                        "WARNING: ICSR write {:#010X} asks for an exception, not implemented",
-                        bits
-                    );
-                }
-            }
+            // Handled by the bus, like STIR below.
+            ICSR | STIR => {}
             VTOR => self.set(VTOR, merged & VTOR_MASK),
             AIRCR => {
                 // Without the key the whole write is dropped, which also
@@ -162,15 +178,12 @@ impl ScbStub {
                 }
             }
             CCR => self.set(CCR, (merged & CCR_WRITABLE) | CCR_ALWAYS_SET),
+            SHPR1..=SHPR3 => self.set(offset, merged & PRIORITY_MASK),
             // Fault status bits are cleared by writing 1, and none are set.
             CFSR | HFSR | DFSR => {}
-            STIR => eprintln!(
-                "WARNING: STIR write asks for interrupt {}, not implemented",
-                bits & 0x1FF
-            ),
             // Cache invalidate / clean operations: there are no caches.
             ICIALLU..=BPIALL => {}
-            // Store-and-readback for everything else: SCR, SHPR1-3, SHCSR,
+            // Store-and-readback for everything else: SCR, SHCSR,
             // MMFAR, BFAR, CSSELR, CPACR, the MPU, debug and FPU registers.
             _ => self.set(offset, merged),
         }
@@ -308,7 +321,7 @@ mod tests {
     #[test]
     fn fault_and_exception_state_stays_clear() {
         let mut scb = ScbStub::new();
-        scb.write(ICSR, 4, ICSR_PENDSVSET);
+        scb.write(ICSR, 4, 1 << 28); // PENDSVSET: the bus's business
         scb.write(CFSR, 4, 0xFFFF_FFFF);
         assert_eq!(scb.read(ICSR, 4), 0);
         assert_eq!(scb.read(CFSR, 4), 0);

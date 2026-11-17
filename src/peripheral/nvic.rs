@@ -13,8 +13,11 @@
 //! - firmware wrote its bit in ISPR. That lasts until the handler starts
 //!   or firmware writes the bit in ICPR.
 //!
-//! Not implemented yet: priorities are stored but not used (the lowest IRQ
-//! number goes first), and IABR, the "active" bits, always reads 0.
+//! Each IRQ also has a priority byte in IPR; a lower value is a higher
+//! priority. The NVIC only stores the priorities and picks the most
+//! urgent IRQ that is ready. Whether that IRQ may interrupt what is
+//! running now is decided by the bus, which also knows the priorities of
+//! the system exceptions.
 //!
 //! Register layout and behaviour are from the ARMv7-M ARM, section B3.4.
 //! The number of IRQs is from `ATSAME70Q21.svd`.
@@ -47,6 +50,8 @@ pub struct Nvic {
     pending: [u32; WORDS],
     /// Interrupt lines: bit set while the peripheral is asking.
     lines: [u32; WORDS],
+    /// IABR: the IRQ's handler has started and not yet returned.
+    active: [u32; WORDS],
     /// IPR, four priority bytes per word.
     priority: [u32; IRQ_COUNT as usize / 4],
 }
@@ -57,6 +62,7 @@ impl Nvic {
             enabled: [0; WORDS],
             pending: [0; WORDS],
             lines: [0; WORDS],
+            active: [0; WORDS],
             priority: [0; IRQ_COUNT as usize / 4],
         }
     }
@@ -72,25 +78,66 @@ impl Nvic {
         }
     }
 
-    /// The lowest-numbered IRQ that is pending and enabled, if any.
-    fn next_irq(&self) -> Option<u32> {
-        (0..WORDS).find_map(|word| {
-            let ready = (self.pending[word] | self.lines[word]) & self.enabled[word];
-            (ready != 0).then(|| 32 * word as u32 + ready.trailing_zeros())
-        })
+    /// Make `irq` pending, as a write to ISPR does.
+    pub fn set_pending(&mut self, irq: u32) {
+        // A number beyond the last IRQ is ignored.
+        if let Some(word) = self.pending.get_mut((irq / 32) as usize) {
+            *word |= 1 << (irq % 32);
+        }
     }
 
-    /// True if some IRQ is pending and enabled.
-    pub fn has_pending_irq(&self) -> bool {
-        self.next_irq().is_some()
+    /// True if any IRQ is pending, enabled or not (ICSR.ISRPENDING).
+    pub fn any_pending(&self) -> bool {
+        (0..WORDS).any(|word| self.pending[word] | self.lines[word] != 0)
     }
 
-    /// Hand over the IRQ whose handler should run next, if there is one.
-    /// A pending bit set through ISPR is cleared; a peripheral's request
-    /// stays until the peripheral withdraws it.
-    pub fn take_pending_irq(&mut self) -> Option<u32> {
-        let irq = self.next_irq()?;
+    /// Record that the handler for `irq` has started (true) or returned
+    /// (false). Shows in IABR.
+    pub fn set_active(&mut self, irq: u32, active: bool) {
+        let (word, bit) = ((irq / 32) as usize, 1 << (irq % 32));
+        if active {
+            self.active[word] |= bit;
+        } else {
+            self.active[word] &= !bit;
+        }
+    }
+
+    /// The priority byte of `irq`. A lower value is a higher priority.
+    pub fn priority(&self, irq: u32) -> u8 {
+        (self.priority[(irq / 4) as usize] >> (8 * (irq % 4))) as u8
+    }
+
+    /// The most urgent IRQ that is pending and enabled, if any: the one
+    /// with the lowest priority value, and of those the lowest number.
+    pub fn next_irq(&self) -> Option<u32> {
+        let mut best = None;
+        for word in 0..WORDS {
+            let mut ready = (self.pending[word] | self.lines[word]) & self.enabled[word];
+            while ready != 0 {
+                let irq = 32 * word as u32 + ready.trailing_zeros();
+                ready &= ready - 1; // clear the lowest set bit
+                // Going up through the numbers, so only a strictly more
+                // urgent IRQ replaces the best so far.
+                if best.is_none_or(|b| self.priority(irq) < self.priority(b)) {
+                    best = Some(irq);
+                }
+            }
+        }
+        best
+    }
+
+    /// The handler for `irq` is about to start: a pending bit set through
+    /// ISPR is cleared. A peripheral's request stays until the peripheral
+    /// withdraws it.
+    pub fn acknowledge(&mut self, irq: u32) {
         self.pending[(irq / 32) as usize] &= !(1 << (irq % 32));
+    }
+
+    /// `next_irq` and `acknowledge` in one step.
+    #[cfg(test)]
+    fn take_pending_irq(&mut self) -> Option<u32> {
+        let irq = self.next_irq()?;
+        self.acknowledge(irq);
         Some(irq)
     }
 
@@ -104,7 +151,7 @@ impl Nvic {
                 true => self.pending[index] | self.lines[index],
                 false => 0,
             },
-            IABR => 0,
+            IABR => self.active.get(index).copied().unwrap_or(0),
             _ if offset >= IPR => {
                 let index = ((offset - IPR) / 4) as usize;
                 self.priority.get(index).copied().unwrap_or(0)
@@ -203,13 +250,11 @@ mod tests {
     fn pending_irq_waits_until_it_is_enabled() {
         let mut nvic = Nvic::new();
         nvic.write(ISPR, 4, 1 << 7);
-        assert!(!nvic.has_pending_irq());
         assert_eq!(nvic.take_pending_irq(), None);
         // It still shows as pending.
         assert_eq!(nvic.read(ISPR, 4), 1 << 7);
 
         nvic.write(ISER, 4, 1 << 7);
-        assert!(nvic.has_pending_irq());
         assert_eq!(nvic.take_pending_irq(), Some(7));
     }
 
@@ -247,7 +292,41 @@ mod tests {
     }
 
     #[test]
-    fn lowest_irq_number_goes_first() {
+    fn more_urgent_priority_goes_first_whatever_the_number() {
+        let mut nvic = Nvic::new();
+        nvic.write(ISER, 4, 0xFFFF_FFFF);
+        nvic.write(ISER + 4, 4, 0xFFFF_FFFF);
+        nvic.write(IPR + 7, 1, 0x80);
+        nvic.write(IPR + 20, 1, 0x40);
+        nvic.write(IPR + 33, 1, 0x20);
+        nvic.write(IPR + 34, 1, 0x20);
+        nvic.write(ISPR, 4, (1 << 20) | (1 << 7));
+        nvic.write(ISPR + 4, 4, (1 << 1) | (1 << 2)); // IRQ 33 and 34
+        assert_eq!(nvic.priority(20), 0x40);
+        // 33 and 34 share the best priority: the lower number wins.
+        assert_eq!(nvic.take_pending_irq(), Some(33));
+        assert_eq!(nvic.take_pending_irq(), Some(34));
+        assert_eq!(nvic.take_pending_irq(), Some(20));
+        assert_eq!(nvic.take_pending_irq(), Some(7));
+        assert_eq!(nvic.take_pending_irq(), None);
+    }
+
+    #[test]
+    fn active_irqs_show_in_iabr() {
+        let mut nvic = Nvic::new();
+        nvic.set_active(7, true);
+        nvic.set_active(68, true);
+        assert_eq!(nvic.read(IABR, 4), 1 << 7);
+        assert_eq!(nvic.read(IABR + 8, 4), 1 << 4);
+        nvic.set_active(7, false);
+        assert_eq!(nvic.read(IABR, 4), 0);
+        // IABR is read-only.
+        nvic.write(IABR + 8, 4, 0);
+        assert_eq!(nvic.read(IABR + 8, 4), 1 << 4);
+    }
+
+    #[test]
+    fn with_equal_priorities_the_lowest_irq_number_goes_first() {
         let mut nvic = Nvic::new();
         nvic.write(ISER, 4, 0xFFFF_FFFF);
         nvic.write(ISER + 4, 4, 0xFFFF_FFFF);
