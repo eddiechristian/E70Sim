@@ -79,13 +79,15 @@ Startup code busy-waits on "ready" bits; stubs must report ready immediately.
 |---|---|---|
 | UART0 | `0x400E0800` | SR: TXRDY + TXEMPTY (bits 1, 9) always set; THR → stdout; RHR ← stdin (later) |
 | PMC | `0x400E0600` | `PMC_SR` (`+0x68`): MOSCXTS, LOCKA, MCKRDY, MOSCSELS set; store other writes |
-| EFC | `0x400E0C00` | `EEFC_FSR` (`+0x08`): FRDY set |
-| WDT | `0x400E1850` | Accept disable write, otherwise no-op |
-| SUPC / RSTC | `0x400E1810` / `0x400E1800` | Store-and-readback |
-| PIOx / MATRIX | `0x400E0E00+` / `0x40088000` | Store-and-readback (pin muxing irrelevant for now) |
-| SCB | `0xE000ED00` | Store-and-readback: VTOR, CPACR, cache maintenance registers |
+| EFC | `0x400E0C00` | ✅ `EEFC_FSR` (`+0x08`): FRDY (bit 0) set; `EEFC_FMR` (`+0x00`) store-and-readback; `EEFC_FCR` (`+0x04`) commands logged, not executed |
+| WDT | `0x400E1850` | ✅ Never expires. `WDT_MR` (`+0x04`) resets to `0x3FFF2FFF` and is write-once, so the disable write (WDDIS, bit 15) reads back; `WDT_CR` (`+0x00`) restart is a no-op; `WDT_SR` (`+0x08`) reads 0 |
+| SUPC | `0x400E1810` | ✅ Store-and-readback; `SUPC_CR` (`+0x00`) XTALSEL sets OSCSEL (bit 7) in `SUPC_SR` (`+0x14`) at once |
+| RSTC | `0x400E1800` | ✅ `RSTC_SR` (`+0x04`) reports a power-up reset with NRST high; `RSTC_MR` (`+0x08`) store-and-readback; software reset logged, not carried out |
+| PIOA–PIOE | `0x400E0E00` + `0x200` per port | ✅ Enable / disable / status register groups; outputs read back in `PIO_PDSR` (`+0x3C`), inputs read 1; no interrupts |
+| MATRIX | `0x40088000` | ✅ Store-and-readback (including `CCFG_SYSIO`, `+0x114`) |
+| SCB | `0xE000ED00` | ✅ Store-and-readback: VTOR, CPACR, CCR, SHPR, MPU; fixed CPUID and cache ID registers; cache maintenance writes ignored; exception and reset requests logged, not carried out |
 
-PMC/EFC offsets and bit names are from memory — verify against the SVD.
+All offsets and bit names in this table are verified against the SVD.
 
 ## Phase 3 — Compiled firmware, instruction set on demand
 

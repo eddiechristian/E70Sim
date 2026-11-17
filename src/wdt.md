@@ -1,0 +1,5 @@
+### WDT — Watchdog Timer
+*   **Base Address:** `0x400E_1850`
+*   **Why It's There:** A safety timer that resets the chip if the firmware stops restarting it, so a hung program recovers by itself.
+*   **The Problem:** The watchdog is already running when the chip leaves reset. Startup code therefore either disables it by writing `WDDIS` (bit 15) to the Mode Register (`WDT_MR`, offset `+0x04`), or keeps restarting it through the Control Register (`WDT_CR`, offset `+0x00`). If those writes land on unmapped memory the emulator logs a warning for each one, and firmware that reads `WDT_MR` back sees 0 instead of what it wrote.
+*   **Stub Logic:** There is no countdown, so the watchdog never expires. `WDT_MR` starts at its reset value `0x3FFF_2FFF` (enabled) and, as on the real chip, accepts only the first write after reset; later writes are logged and ignored. Writes to `WDT_CR` do nothing; a restart without the `0xA5` key in bits 31–24 is logged. The Status Register (`WDT_SR`, offset `+0x08`) always reads 0 (no underflow, no error).
