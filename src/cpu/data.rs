@@ -14,6 +14,10 @@ use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, PC, SP};
 use crate::bus::Bus;
 use crate::helpers::{add_with_carry, asr_c, lsl_c, lsr_c, ror_c, rrx_c, thumb_expand_imm_c};
 
+/// A divide takes from 2 to 12 cycles depending on the values; this is
+/// a middling figure.
+const CYCLES_DIVIDE: u32 = 6;
+
 // The four kinds of shift, as encoded in two bits.
 const SHIFT_LSL: u32 = 0b00;
 const SHIFT_LSR: u32 = 0b01;
@@ -314,6 +318,199 @@ impl Cpu {
                 address
             );
             Some(CYCLES_MEMORY + 1)
+        // Loads and stores with an 8-bit offset or a register offset:
+        // 1111100 S 0 size L Rn | Rt 1 P U W imm8   (offset, with the
+        //                                             choice of applying it before or after
+        //                                             and of keeping the new address in Rn)
+        // 1111100 S 0 size L Rn | Rt 000000 imm2 Rm (Rn + (Rm << imm2))
+        // and loads with a 12-bit offset that widen a signed value:
+        // 1111100 1 1 size 1 Rn | Rt imm12
+        // (A7.7.43 to A7.7.63, A7.7.161 to A7.7.171). S, for loads,
+        // copies the sign bit of a byte or halfword into the upper bits.
+        } else if hw1 & 0xFE00 == 0xF800 && n != PC {
+            let signed = hw1 & (1 << 8) != 0;
+            let long_offset = hw1 & (1 << 7) != 0;
+            let size = (hw1 >> 5) & 3; // 0 byte, 1 halfword, 2 word
+            let load = hw1 & (1 << 4) != 0;
+            // What does not exist: a size of 3, a signed word, a signed
+            // store. With Rt = 15 a byte or halfword "load" is a hint.
+            if size == 3 || (signed && (size == 2 || !load)) || (t == PC && (!load || size != 2)) {
+                return None;
+            }
+            let base = self.regs[n];
+            // (address to use, new value for Rn if it is to be kept)
+            let (address, writeback) = if long_offset {
+                (base.wrapping_add(hw2 & 0xFFF), None)
+            } else if hw2 & (1 << 11) != 0 {
+                let index = hw2 & (1 << 10) != 0; // P: apply the offset first
+                let add = hw2 & (1 << 9) != 0; // U
+                let keep = hw2 & (1 << 8) != 0; // W
+                if !index && !keep {
+                    return None;
+                }
+                let imm8 = hw2 & 0xFF;
+                let offset_address = if add {
+                    base.wrapping_add(imm8)
+                } else {
+                    base.wrapping_sub(imm8)
+                };
+                (
+                    if index { offset_address } else { base },
+                    keep.then_some(offset_address),
+                )
+            } else if hw2 & 0x0FC0 == 0 {
+                (base.wrapping_add(self.regs[m] << ((hw2 >> 4) & 3)), None)
+            } else {
+                return None;
+            };
+            if load {
+                let value = match (size, signed) {
+                    (0, false) => bus.read8(address) as u32,
+                    (0, true) => bus.read8(address) as i8 as u32,
+                    (1, false) => bus.read16(address) as u32,
+                    (1, true) => bus.read16(address) as i16 as u32,
+                    _ => bus.read32(address),
+                };
+                if let Some(new_base) = writeback {
+                    self.regs[n] = new_base;
+                }
+                trace!(
+                    self,
+                    "  load r{}, [{:#010X}]  -> {:#010X}", t, address, value
+                );
+                if t == PC {
+                    return Some(CYCLES_MEMORY + self.bx_write_pc(value, pc, bus));
+                }
+                self.regs[t] = value;
+            } else {
+                match size {
+                    0 => bus.write8(address, self.regs[t] as u8),
+                    1 => bus.write16(address, self.regs[t] as u16),
+                    _ => bus.write32(address, self.regs[t]),
+                }
+                if let Some(new_base) = writeback {
+                    self.regs[n] = new_base;
+                }
+                trace!(self, "  store r{}, [{:#010X}]", t, address);
+            }
+            Some(CYCLES_MEMORY)
+        // LDR Rt, [PC, #+/-imm12]: a constant from a literal pool.
+        // 11111000 U 1011111 | Rt imm12  (A7.7.44 T2)
+        } else if hw1 & 0xFF7F == 0xF85F && t != PC {
+            let base = pc.wrapping_add(4) & !3;
+            let address = if hw1 & (1 << 7) != 0 {
+                base.wrapping_add(hw2 & 0xFFF)
+            } else {
+                base.wrapping_sub(hw2 & 0xFFF)
+            };
+            self.regs[t] = bus.read32(address);
+            trace!(self, "  ldr r{}, [pc]  -> {:#010X}", t, self.regs[t]);
+            Some(CYCLES_MEMORY)
+        // PUSH.W: 1110100100101101 | 0 M 0 register_list  (A7.7.101 T2)
+        // The 32-bit PUSH, which can save R8-R12 and LR as well.
+        } else if hw1 == 0xE92D && hw2 & 0xA000 == 0 {
+            let registers = hw2;
+            if registers.count_ones() < 2 {
+                return None;
+            }
+            // Lowest-numbered register at the lowest address.
+            let mut address = self.regs[SP].wrapping_sub(4 * registers.count_ones());
+            self.regs[SP] = address;
+            for i in 0..15 {
+                if registers & (1 << i) != 0 {
+                    bus.write32(address, self.regs[i]);
+                    address = address.wrapping_add(4);
+                }
+            }
+            trace!(self, "  push.w {{list {:#06X}}}", registers);
+            Some(CYCLES_DATA + registers.count_ones())
+        // B<cond>.W: 11110 S cond imm6 | 10 J1 0 J2 imm11  (A7.7.12 T3)
+        // A conditional branch that reaches further than the 16-bit one.
+        } else if hw1 & 0xF800 == 0xF000 && hw2 & 0xD000 == 0x8000 && (hw1 >> 6) & 0xE != 0xE {
+            let cond = (hw1 >> 6) & 0xF;
+            let s = (hw1 >> 10) & 1;
+            let (j1, j2) = ((hw2 >> 13) & 1, (hw2 >> 11) & 1);
+            // S:J2:J1:imm6:imm11:'0', sign-extended from 21 bits.
+            let raw =
+                (s << 20) | (j2 << 19) | (j1 << 18) | ((hw1 & 0x3F) << 12) | ((hw2 & 0x7FF) << 1);
+            let offset = ((raw << 11) as i32) >> 11;
+            let taken = crate::helpers::condition_passed(cond as u16, self.xpsr);
+            if taken {
+                self.regs[PC] = pc.wrapping_add(4).wrapping_add(offset as u32);
+            }
+            trace!(
+                self,
+                "  b<cond {:04b}>.w  -> {}",
+                cond,
+                if taken { "taken" } else { "not taken" }
+            );
+            Some(CYCLES_DATA + if taken { CYCLES_REFILL } else { 0 })
+        // B.W: 11110 S imm10 | 10 J1 1 J2 imm11  (A7.7.12 T4)
+        // An unconditional branch with the same reach as BL.
+        } else if hw1 & 0xF800 == 0xF000 && hw2 & 0xD000 == 0x9000 {
+            let s = (hw1 >> 10) & 1;
+            let i1 = !(((hw2 >> 13) & 1) ^ s) & 1;
+            let i2 = !(((hw2 >> 11) & 1) ^ s) & 1;
+            // S:I1:I2:imm10:imm11:'0', sign-extended from 25 bits.
+            let raw =
+                (s << 24) | (i1 << 23) | (i2 << 22) | ((hw1 & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1);
+            let offset = ((raw << 7) as i32) >> 7;
+            self.regs[PC] = pc.wrapping_add(4).wrapping_add(offset as u32);
+            trace!(self, "  b.w {:#010X}", self.regs[PC]);
+            Some(CYCLES_DATA + CYCLES_REFILL)
+        // MUL, MLA, MLS: 111110110000 Rn | Ra Rd 000 op Rm
+        // (A7.7.84, A7.7.74, A7.7.75). Rd = Rn * Rm, with the result
+        // added to Ra (MLA) or subtracted from it (MLS). Ra = 1111
+        // means plain MUL. Only the low 32 bits of the product are kept.
+        } else if hw1 & 0xFFF0 == 0xFB00 && hw2 & 0x00E0 == 0 {
+            let a = t; // Ra is where other encodings have Rt
+            let product = self.regs[n].wrapping_mul(self.regs[m]);
+            let subtract = hw2 & (1 << 4) != 0;
+            self.regs[d] = match (a == PC, subtract) {
+                (true, false) => product,
+                (false, false) => self.regs[a].wrapping_add(product),
+                (false, true) => self.regs[a].wrapping_sub(product),
+                (true, true) => return None,
+            };
+            trace!(
+                self,
+                "  mul r{}, r{}, r{}  -> {:#010X}", d, n, m, self.regs[d]
+            );
+            Some(CYCLES_DATA)
+        // SMULL, UMULL: 11111011 1 U 00 Rn | RdLo RdHi 0000 Rm
+        // (A7.7.149, A7.7.204). The full 64-bit product of two 32-bit
+        // values, signed or unsigned, in two registers. A compiler uses
+        // UMULL to divide by a constant without a divide instruction.
+        } else if (hw1 & 0xFFF0 == 0xFB80 || hw1 & 0xFFF0 == 0xFBA0) && hw2 & 0x00F0 == 0 {
+            let (low, high) = (t, d);
+            let product = if hw1 & 0x0020 != 0 {
+                self.regs[n] as u64 * self.regs[m] as u64
+            } else {
+                (self.regs[n] as i32 as i64 * self.regs[m] as i32 as i64) as u64
+            };
+            self.regs[low] = product as u32;
+            self.regs[high] = (product >> 32) as u32;
+            trace!(self, "  mull r{}, r{}, r{}, r{}", low, high, n, m);
+            Some(CYCLES_DATA)
+        // SDIV, UDIV: 11111011 10 U 1 Rn | 1111 Rd 1111 Rm
+        // (A7.7.127, A7.7.195). Dividing by zero gives 0; the trap that
+        // can be enabled for it in CCR is not modelled.
+        } else if (hw1 & 0xFFF0 == 0xFB90 || hw1 & 0xFFF0 == 0xFBB0) && hw2 & 0xF0F0 == 0xF0F0 {
+            let (dividend, divisor) = (self.regs[n], self.regs[m]);
+            self.regs[d] = if divisor == 0 {
+                0
+            } else if hw1 & 0x0020 != 0 {
+                dividend / divisor
+            } else {
+                // The one overflow, the most negative number divided by
+                // -1, gives the most negative number back.
+                (dividend as i32).wrapping_div(divisor as i32) as u32
+            };
+            trace!(
+                self,
+                "  div r{}, r{}, r{}  -> {:#010X}", d, n, m, self.regs[d]
+            );
+            Some(CYCLES_DIVIDE)
         // DSB, DMB, ISB: wait for memory accesses or the pipeline to
         // settle. Nothing to wait for here.
         // 1111001110111111 | 100011110 op 1111  (A7.7.33, A7.7.34, A7.7.37)
@@ -427,6 +624,17 @@ impl Cpu {
                 _ => return None,
             }
             trace!(self, "  load/store r{}, [r{}, r{}]", low, mid, high);
+            Some(CYCLES_MEMORY)
+        // LDRH / STRH Rt, [Rn, #imm]: 1000 L imm5 Rn Rt, the offset
+        // being imm5 * 2  (A7.7.55 T1, A7.7.170 T1)
+        } else if instr >> 12 == 0b1000 {
+            let address = self.regs[mid].wrapping_add(((instr >> 6) & 0x1F) << 1);
+            if instr & (1 << 11) != 0 {
+                self.regs[low] = bus.read16(address) as u32;
+            } else {
+                bus.write16(address, self.regs[low] as u16);
+            }
+            trace!(self, "  ldrh/strh r{}, [{:#010X}]", low, address);
             Some(CYCLES_MEMORY)
         // STRB Rt, [Rn, #imm5]: 01110 imm5 Rn Rt  (A7.7.163 T1)
         } else if instr >> 11 == 0b01110 {
@@ -1031,5 +1239,232 @@ mod tests {
         }
         assert_eq!(cpu.regs[0], 0);
         assert_eq!(nzcv(&cpu), flags);
+    }
+
+    #[test]
+    fn wide_conditional_branch_is_taken_only_if_the_condition_holds() {
+        // beq.w +10, at 0x0040_0008
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF000, 0x8005]);
+        cpu.xpsr |= 1 << 30; // Z
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0008 + 4 + 10);
+        assert_eq!(cpu.cycles, 3);
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF000, 0x8005]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_000C); // not taken
+        assert_eq!(cpu.cycles, 1);
+        // bne.w +6 is the opposite.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF040, 0x8003]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0008 + 4 + 6);
+    }
+
+    #[test]
+    fn wide_unconditional_branch_goes_forwards_and_backwards() {
+        // b.w +2
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF000, 0xB801]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0008 + 4 + 2);
+        // b.w -4: a branch to itself
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF7FF, 0xBFFE]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0008);
+    }
+
+    #[test]
+    fn byte_load_and_store_with_a_negative_offset() {
+        // strb r0, [r7, #-25] ; ldrb r0, [r7, #-25]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF807, 0x0C19, 0xF817, 0x0C19]);
+        cpu.regs[7] = 0x2040_0020;
+        cpu.regs[0] = 0x1234_56AB;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read8(0x2040_0007), 0xAB);
+        cpu.regs[0] = 0;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0xAB);
+        assert_eq!(cpu.regs[7], 0x2040_0020); // the base is not changed
+    }
+
+    #[test]
+    fn loads_and_stores_that_move_the_base_register() {
+        const BASE: u32 = 0x2040_0100;
+        // ldr r0, [r1, #4]!: move the base up, then load from it
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF851, 0x0F04]);
+        cpu.regs[1] = BASE;
+        bus.write32(BASE + 4, 0xAAAA_AAAA);
+        cpu.step(&mut bus);
+        assert_eq!((cpu.regs[0], cpu.regs[1]), (0xAAAA_AAAA, BASE + 4));
+
+        // ldr r0, [r1], #4: load from the base, then move it up
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF851, 0x0B04]);
+        cpu.regs[1] = BASE;
+        bus.write32(BASE, 0xBBBB_BBBB);
+        cpu.step(&mut bus);
+        assert_eq!((cpu.regs[0], cpu.regs[1]), (0xBBBB_BBBB, BASE + 4));
+
+        // str r0, [r1, #-8]!: move the base down, then store
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF841, 0x0D08]);
+        cpu.regs[0] = 0xCCCC_CCCC;
+        cpu.regs[1] = BASE;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(BASE - 8), 0xCCCC_CCCC);
+        assert_eq!(cpu.regs[1], BASE - 8);
+    }
+
+    #[test]
+    fn loads_with_a_shifted_register_offset() {
+        const BASE: u32 = 0x2040_0000;
+        // ldr.w r3, [r2, r1, lsl #2]: entry R1 of a table of words
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF852, 0x3021]);
+        cpu.regs[2] = BASE;
+        cpu.regs[1] = 3;
+        bus.write32(BASE + 12, 0x0BAD_CAFE);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[3], 0x0BAD_CAFE);
+
+        // ldrsh.w r10, [r6, r11, lsl #1]: entry R11 of a table of
+        // signed halfwords
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF936, 0xA01B]);
+        cpu.regs[6] = BASE;
+        cpu.regs[11] = 2;
+        bus.write16(BASE + 4, 0xFFE0); // -32
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[10] as i32, -32);
+
+        // strb.w r2, [r9, r0]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF809, 0x2000]);
+        cpu.regs[9] = BASE;
+        cpu.regs[0] = 5;
+        cpu.regs[2] = 0x7E;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read8(BASE + 5), 0x7E);
+    }
+
+    #[test]
+    fn signed_byte_load_with_a_12_bit_offset() {
+        // ldrsb.w r0, [r1, #0x100]
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF991, 0x0100]);
+        cpu.regs[1] = 0x2040_0000;
+        bus.write8(0x2040_0100, 0x80);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0xFFFF_FF80);
+    }
+
+    #[test]
+    fn halfword_load_and_store_with_a_small_offset() {
+        // strh r0, [r2, #4] ; ldrh r0, [r2, #4]
+        let (mut cpu, mut bus) = cpu_with_code(&[0x8090, 0x8890]);
+        cpu.regs[2] = 0x2040_0000;
+        cpu.regs[0] = 0x1234_BEEF;
+        bus.write32(0x2040_0004, 0xFFFF_FFFF);
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x2040_0004), 0xFFFF_BEEF);
+        cpu.regs[0] = 0;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0xBEEF);
+    }
+
+    #[test]
+    fn wide_literal_load() {
+        // ldr.w r0, [pc, #8], at 0x0040_0008: the PC reads as
+        // 0x0040_000C, so the constant is at 0x0040_0014.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF8DF, 0x0008, 0, 0, 0, 0, 0x5678, 0x1234]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0x1234_5678);
+    }
+
+    #[test]
+    fn wide_push_saves_high_registers() {
+        // push.w {r8-r11} ; pop.w {r8-r11} is e8bd 0f00
+        let (mut cpu, mut bus) = cpu_with_code(&[0xE92D, 0x0F00, 0xE8BD, 0x0F00]);
+        for r in 8..12 {
+            cpu.regs[r] = 0x100 + r as u32;
+        }
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[SP], 0x2045_FFF0);
+        // Lowest-numbered register at the lowest address.
+        assert_eq!(bus.read32(0x2045_FFF0), 0x108);
+        assert_eq!(bus.read32(0x2045_FFFC), 0x10B);
+        for r in 8..12 {
+            cpu.regs[r] = 0;
+        }
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[8..12], [0x108, 0x109, 0x10A, 0x10B]);
+        assert_eq!(cpu.regs[SP], 0x2046_0000);
+    }
+
+    #[test]
+    fn multiply_and_its_accumulating_forms() {
+        // mul r0, r10, r8
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFB0A, 0xF008]);
+        cpu.regs[10] = 100_000;
+        cpu.regs[8] = 100_000;
+        cpu.xpsr |= 0xF << 28;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 10_000_000_000u64 as u32); // low 32 bits only
+        assert_eq!(nzcv(&cpu), 0xF); // no flags changed
+
+        // mla r0, r1, r2, r3: r3 + r1 * r2 ; mls: r3 - r1 * r2
+        let mla = after_with_r3(&[0xFB01, 0x3002], 6, 7, 100);
+        assert_eq!(mla, 142);
+        let mls = after_with_r3(&[0xFB01, 0x3012], 6, 7, 100);
+        assert_eq!(mls, 58);
+    }
+
+    /// R0 after one instruction, with R1, R2 and R3 preset.
+    fn after_with_r3(code: &[u16], r1: u32, r2: u32, r3: u32) -> u32 {
+        let (mut cpu, mut bus) = cpu_with_code(code);
+        cpu.regs[1] = r1;
+        cpu.regs[2] = r2;
+        cpu.regs[3] = r3;
+        cpu.step(&mut bus);
+        cpu.regs[0]
+    }
+
+    #[test]
+    fn long_multiply_gives_all_64_bits() {
+        // umull r3, r4, r0, r12
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFBA0, 0x340C]);
+        cpu.regs[0] = 0xFFFF_FFFF;
+        cpu.regs[12] = 0xFFFF_FFFF;
+        cpu.step(&mut bus);
+        assert_eq!((cpu.regs[4], cpu.regs[3]), (0xFFFF_FFFE, 0x0000_0001));
+
+        // smull r0, r1, r2, r3: -2 * 3 = -6
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFB82, 0x0103]);
+        cpu.regs[2] = -2i32 as u32;
+        cpu.regs[3] = 3;
+        cpu.step(&mut bus);
+        assert_eq!((cpu.regs[1], cpu.regs[0]), (0xFFFF_FFFF, -6i32 as u32));
+    }
+
+    #[test]
+    fn dividing_by_ten_the_way_a_compiler_does() {
+        // A compiler divides by a constant with umull: the high word of
+        // n * 0xCCCCCCCD, shifted right by 3, is n / 10.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFBA0, 0x340C]);
+        cpu.regs[0] = 1234;
+        cpu.regs[12] = 0xCCCC_CCCD;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[4] >> 3, 123);
+    }
+
+    #[test]
+    fn divide_instructions() {
+        // udiv r0, r1, r2 ; sdiv r0, r1, r2
+        assert_eq!(r0_after(&[0xFBB1, 0xF0F2], 0, 100, 7), 14);
+        assert_eq!(r0_after(&[0xFBB1, 0xF0F2], 0, 0xFFFF_FFFF, 2), 0x7FFF_FFFF);
+        assert_eq!(
+            r0_after(&[0xFB91, 0xF0F2], 0, -100i32 as u32, 7),
+            -14i32 as u32
+        );
+        // Dividing by zero gives 0.
+        assert_eq!(r0_after(&[0xFBB1, 0xF0F2], 9, 100, 0), 0);
+        assert_eq!(r0_after(&[0xFB91, 0xF0F2], 9, 100, 0), 0);
+        // The most negative number divided by -1 gives itself back.
+        assert_eq!(
+            r0_after(&[0xFB91, 0xF0F2], 0, 0x8000_0000, -1i32 as u32),
+            0x8000_0000
+        );
     }
 }

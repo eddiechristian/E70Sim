@@ -416,9 +416,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unhandled 32-bit instruction at 0x00400008: 0xFBB1 0xF0F2")]
+    #[should_panic(expected = "unhandled 32-bit instruction at 0x00400008: 0xFAB1 0xF081")]
     fn step_fetches_both_halves_of_a_32_bit_instruction() {
-        let (mut cpu, mut bus) = cpu_with_code(&[0xFBB1, 0xF0F2]); // udiv r0, r1, r2
+        let (mut cpu, mut bus) = cpu_with_code(&[0xFAB1, 0xF081]); // clz r0, r1
         cpu.step(&mut bus);
     }
 

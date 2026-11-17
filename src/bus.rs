@@ -344,9 +344,6 @@ impl Bus {
 
     /// Plug a device into one of the I2C buses: `controller` is 0
     /// (TWIHS0) to 2 (TWIHS2).
-    // Nothing is plugged in outside the tests until the sensor model
-    // exists (step 3 of `gyro.md`).
-    #[allow(dead_code)]
     pub fn attach_i2c_device(&mut self, controller: usize, device: Box<dyn I2cDevice>) {
         self.twihs[controller].attach(device);
     }

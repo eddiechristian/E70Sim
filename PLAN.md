@@ -148,15 +148,15 @@ References: `reference/bno055/BST-BNO055-DS000-18.pdf` (register map chapter 4, 
   - `TWIHS_SR` (`+0x20`): TXCOMP (bit 0), RXRDY (bit 1), TXRDY (bit 2), NACK (bit 8)
   - `TWIHS_RHR` (`+0x30`) / `TWIHS_THR` (`+0x34`): one byte in / out; register number auto-increments across a multi-byte transfer
   - No device at DADR → set NACK in `TWIHS_SR`
-- [ ] BNO055 device model at I2C address `0x29` (card default; `0x28` if COM3 is low)
+- [x] BNO055 device model at I2C address `0x29` (card default; `0x28` if COM3 is low): `src/bno055.rs`
   - ID registers: `CHIP_ID` (`0x00`) = `0xA0`, plus `ACC_ID` (`0x01`), `MAG_ID` (`0x02`), `GYR_ID` (`0x03`)
   - `PAGE_ID` (`0x07`): selects register page 0 or 1
   - Store-and-readback config: `UNIT_SEL` (`0x3B`), `OPR_MODE` (`0x3D`, starts in CONFIGMODE), `PWR_MODE` (`0x3E`), `SYS_TRIGGER` (`0x3F`, reset bit restores defaults)
   - Status reads "all good": `CALIB_STAT` (`0x35`), `ST_RESULT` (`0x36`), `SYS_STATUS` (`0x39`)
   - Gyro data: `GYR_DATA_X_LSB` (`0x14`) through Z MSB (`0x19`), little-endian 16-bit, 16 LSB per degree/second
   - Later: accelerometer (`0x08`), Euler angles (`0x1A`), temperature (`0x34`)
-- [ ] Motion source for the data registers: constants first, then a generated pattern or values from a file
-- [ ] Hand-written assembly test: read `CHIP_ID` over TWIHS and print it over UART
+- [x] Motion source for the data registers: constants, a generated pattern or values from a file, chosen with `--gyro=`
+- [x] Test firmware, in Rust instead of assembly (`firmware/gyro-rs/`): reads `CHIP_ID` over TWIHS and prints it over UART, then reads and prints the gyro rates, by polling and by interrupt
 
 To verify before or during implementation:
 - Which TWIHS instance the EXT1/EXT2 header pins use on the SAM E70 Xplained Ultra: TWIHS0 on PA3 / PA4, from the schematic on page 33 of the board's user guide in `reference/same70/`

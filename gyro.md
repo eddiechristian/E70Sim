@@ -157,14 +157,43 @@ Each step can be tested before the next begins.
 |---|---|---|
 | 1 ✅ | `I2cDevice` trait and a trivial test device (a few bytes of memory): `src/i2c.rs` | Unit tests |
 | 2 ✅ | TWIHS, both ways of reading a register, NACK for an absent address, and its interrupt: `src/peripheral/twihs.rs`. Mapped at all three bases | Unit tests driving the registers as firmware would |
-| 3 | BNO055 with identity, page, mode, reset and status registers, and constant gyro data | Unit tests against datasheet values |
-| 4 | Rust firmware `firmware/gyro-rs/`: set up TWIHS0, read `CHIP_ID`, print it | Prints `A0`. This is the `PLAN.md` "read CHIP_ID and print it" item |
-| 5 | Firmware: switch to a gyro mode, read the three axes in a loop, print them. Add the divide instructions if not already there | Printed values match the motion source. **Milestone 3** |
-| 6 | Firmware that reads through the TWIHS interrupt (IRQ 19; the controller side was done in step 2), and optionally the sensor's INT pin through a PIO interrupt | An interrupt-driven read gives the same values |
-| 7 | Motion pattern, then motion from a file | Readings follow the pattern over time |
+| 3 ✅ | BNO055 with identity, page, mode, reset and status registers, and gyro data: `src/bno055.rs`, attached to TWIHS0 in `main.rs` | Unit tests against datasheet values |
+| 4 ✅ | Rust firmware `firmware/gyro-rs/`: set up TWIHS0, read `CHIP_ID`, print it | Prints `A0`. This is the `PLAN.md` "read CHIP_ID and print it" item |
+| 5 ✅ | Firmware: switch to a gyro mode, read the three axes in a loop, print them in decimal. Multiply and divide instructions added | Printed values match the motion source. **Milestone 3** |
+| 6 ✅ | Firmware that reads through the TWIHS interrupt (IRQ 19; the controller side was done in step 2). The optional part, the sensor's INT pin through a PIO interrupt, is not done | An interrupt-driven read gives the same values |
+| 7 ✅ | Motion pattern and motion from a file, chosen with `--gyro=` | Readings follow the pattern over time |
 | 8 | Sensor timing behind a switch; transfer time taken from `TWIHS_CWGR` | A driver without the delays fails with the switch on |
 
 Steps 1 to 5 are the core. Steps 6 to 8 are refinements and can be done in any order, or not at all.
+
+## Running it
+
+```
+firmware/gyro-rs/build.sh
+cargo run -- firmware/gyro-rs.bin
+```
+
+```
+Gyro test
+BNO055 chip id = A0
+gyro x=1.00 y=-2.00 z=0.50 dps
+...
+gyro by interrupt x=1.00 y=-2.00 z=0.50 dps
+done
+```
+
+The sensor is always attached to TWIHS0. `--gyro=` chooses how the imaginary board is turning, in degrees per second:
+
+| Option | Motion |
+|---|---|
+| (none) | Constant: X = 1.0, Y = −2.0, Z = 0.5 |
+| `--gyro=10,0,-5.5` | Constant rates for X, Y, Z |
+| `--gyro=pattern` | Each axis swings back and forth: X to ±90 once a second, Y to ±45 every two seconds, Z to ±10 every four seconds |
+| `--gyro=file:PATH` | Samples from a text file: one per line, `seconds x y z`, separated by spaces or commas; `#` starts a comment. A sample holds until the next one's time |
+
+Times are emulated time: seconds since reset at 12 MHz. The firmware takes its first reading about 0.657 s after reset (it waits 650 ms after resetting the sensor and 7 ms after changing its mode) and then one every 100 ms.
+
+What was checked: with `--gyro=pattern`, all six printed readings equal the pattern's formula worked out separately for those moments; with a file, the readings change at the sample times; and the largest rate the sensor can report (±2000) prints correctly.
 
 ## Verification
 

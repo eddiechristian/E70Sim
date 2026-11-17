@@ -7,3 +7,4 @@
 # Rust firmware build output (the .bin files are kept: the emulator loads them)
 /firmware/hello-rs/target
 /firmware/float-rs/target
+/firmware/gyro-rs/target

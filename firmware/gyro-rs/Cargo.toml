@@ -1,0 +1,19 @@
+[package]
+name = "gyro-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Vector table and startup code. The "device" feature leaves the interrupt
+# part of the vector table for us to supply (see __INTERRUPTS in main.rs).
+cortex-m-rt = { version = "0.7", features = ["device"] }
+panic-halt = "1"    # on panic, loop forever
+
+[profile.release]
+opt-level = "s"   # small code: fewer distinct instructions for the emulator
+lto = true
+codegen-units = 1
+debug = true      # keep symbols in the ELF for disassembly; not in the .bin
+
+# This is a separate project from the emulator in the repo root.
+[workspace]

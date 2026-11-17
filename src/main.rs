@@ -1,3 +1,4 @@
+pub mod bno055;
 pub mod bus;
 pub mod cpu;
 pub mod helpers;
@@ -9,13 +10,16 @@ use cpu::Cpu;
 
 fn main() {
     let mut bus = Bus::new();
-    // Usage: E70_emulator [--trace] [--bus-faults] [--pin=...] [firmware.bin]
+    // Usage: E70_emulator [--trace] [--bus-faults] [--pin=...] [--gyro=...] [firmware.bin]
     // `--trace` logs every instruction and the registers to stderr.
     // `--bus-faults` makes an access to an unmapped address a BusFault,
     // as on the real chip, instead of a warning.
     // `--pin=PA11=0@5000000` drives an input pin (here PA11) to a level
     // (0) at a moment given in clock cycles since reset. It can be given
     // several times.
+    // `--gyro=1.0,-2.0,0.5` sets how fast the gyro sensor is turning
+    // around X, Y and Z, in degrees per second. `--gyro=pattern` gives a
+    // changing pattern and `--gyro=file:PATH` reads samples from a file.
     // The first argument that is not a flag is the firmware image to load.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let firmware = args
@@ -38,6 +42,21 @@ fn main() {
             }
         }
     }
+    // The BNO055 gyro card is plugged into the EXT1 header, which is
+    // wired to TWIHS0.
+    let mut motion = bno055::Motion::Constant([1.0, -2.0, 0.5]);
+    for arg in &args {
+        if let Some(text) = arg.strip_prefix("--gyro=") {
+            match bno055::Motion::parse_option(text) {
+                Ok(chosen) => motion = chosen,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    bus.attach_i2c_device(0, Box::new(bno055::Bno055::new(motion)));
     let mut cpu = Cpu::new();
     cpu.trace = args.iter().any(|arg| arg == "--trace");
     cpu.reset(&mut bus);

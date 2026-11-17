@@ -381,6 +381,33 @@ The FPU is in `src/cpu/fpu.rs`. The arithmetic is done with the host's own `f32`
 
 Building this firmware also needed several dozen ordinary integer instructions that `hello-rs` never used. They are in `src/cpu/data.rs`.
 
+## The gyro firmware: `gyro-rs`
+
+`firmware/gyro-rs/` reads the BNO055 gyro sensor over I2C and prints the three turn rates. It builds to `firmware/gyro-rs.bin`. The plan it belongs to, the wiring and the `--gyro=` option that sets the sensor's motion are described in `gyro.md` in the repo root.
+
+```
+firmware/gyro-rs/build.sh
+cargo run -- firmware/gyro-rs.bin
+cargo run -- --gyro=pattern firmware/gyro-rs.bin
+```
+
+It is soft-float, like `hello-rs`: the sensor's values are integers, in units of 1/16 degree per second, and are printed with integer arithmetic.
+
+What it does, in order:
+
+1. **Sets up TWIHS0**, the I2C controller wired to the EXT1 header: its clock in the PMC, pins PA3 and PA4 handed over in the PIO, a reset, the bus speed (100 kHz), and host mode on.
+2. **Reads the sensor's chip ID** (register `0x00`, expected `0xA0`). If nothing answers at I2C address `0x29`, the controller reports NACK and the firmware says so and stops.
+3. **Resets the sensor and switches the gyro on** (register `OPR_MODE` to GYROONLY), waiting the times the sensor's datasheet asks for: 650 ms and 7 ms, using `delay_ms`.
+4. **Reads six bytes five times**, 100 ms apart, waiting for each byte in a loop, and prints X, Y and Z.
+5. **Reads them once more by interrupt**: the TWIHS0 handler (IRQ 19) collects the bytes while `main` sleeps in `WFI`.
+
+Two details of the I2C code are worth knowing:
+
+- **The register number travels as the "internal address".** `TWIHS_MMR` is told to send one extra byte from `TWIHS_IADR` before the data, which is how the sensor learns which register is meant.
+- **STOP is asked for one byte early.** The controller has always begun the next byte by the time one is ready, so the firmware writes STOP while the next-to-last byte is waiting. Asking after the last byte would make the controller fetch one more than wanted.
+
+Building this firmware needed another batch of integer instructions: multiply and long multiply (the compiler divides by 10 with a multiplication), divide, the wide conditional branch, `PUSH.W`, and loads and stores with the remaining kinds of offset. They are in `src/cpu/data.rs`.
+
 ## To verify
 
 Checked against the SAM E70 datasheet in `reference/same70/`:
