@@ -88,6 +88,24 @@ const EXCEPTION_SYSTICK: u32 = 15;
 /// Exception number of IRQ 0. IRQ n is exception 16 + n.
 const EXCEPTION_IRQ0: u32 = 16;
 
+/// Whether code can run from an address.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Executable {
+    /// Flash or RAM.
+    Yes,
+    /// Nothing is there at all.
+    NoMemory,
+    /// The peripheral and system regions, from 0x4000_0000 up, can never
+    /// hold code ("execute never" in the architecture's memory map,
+    /// B3.1), except for the external RAM region, which is not used here.
+    Never,
+}
+
+// SHCSR bits that enable the three configurable fault exceptions.
+const SHCSR_MEMFAULTENA: u32 = 1 << 16;
+const SHCSR_BUSFAULTENA: u32 = 1 << 17;
+const SHCSR_USGFAULTENA: u32 = 1 << 18;
+
 /// The priority of code running with no exception active (Thread mode):
 /// one below the lowest priority an exception can have, so that anything
 /// can interrupt it.
@@ -153,6 +171,13 @@ pub struct Bus {
     /// The exception whose handler is running now (the CPU's IPSR), or 0
     /// in Thread mode. Kept here so that ICSR can report it.
     current_exception: u32,
+    /// The `--bus-faults` switch. Off: an access to an unmapped address
+    /// prints a warning and carries on, which shows which peripheral the
+    /// firmware wants next. On: it is a BusFault, as on the real chip.
+    bus_faults: bool,
+    /// With the switch on: the first unmapped data access since the CPU
+    /// last asked, as (address, was it a write).
+    bus_fault: Option<(u32, bool)>,
 }
 
 impl Bus {
@@ -174,6 +199,8 @@ impl Bus {
             pending_exceptions: 0,
             active_exceptions: 0,
             current_exception: 0,
+            bus_faults: false,
+            bus_fault: None,
         }
     }
     pub fn load_firmware_from_bin(&mut self, bin_filename: String) {
@@ -275,6 +302,47 @@ impl Bus {
         if number >= EXCEPTION_IRQ0 {
             self.nvic.set_active(number - EXCEPTION_IRQ0, false);
         }
+    }
+
+    /// Turn the `--bus-faults` switch on or off.
+    pub fn set_bus_faults(&mut self, on: bool) {
+        self.bus_faults = on;
+    }
+
+    /// The unmapped data access the last instruction made, if the switch
+    /// is on and there was one. Asking clears it.
+    pub fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
+        self.bus_fault.take()
+    }
+
+    /// Whether code can run from `addr`.
+    pub fn executable(&self, addr: u32) -> Executable {
+        match addr {
+            0..=BOOT_ALIAS_END | FLASH_BASE..=FLASH_END | SRAM_BASE..=SRAM_END => Executable::Yes,
+            0x4000_0000..=0x5FFF_FFFF | 0xA000_0000..=0xFFFF_FFFF => Executable::Never,
+            _ => Executable::NoMemory,
+        }
+    }
+
+    /// True if fault exception `number` (4 MemManage, 5 BusFault, 6
+    /// UsageFault) can be used for a fault in code running at priority
+    /// `current`: firmware has enabled it in SHCSR, and it is urgent
+    /// enough to interrupt. If not, the fault becomes a HardFault.
+    pub fn fault_exception_usable(&self, number: u32, current: i32) -> bool {
+        let enable = match number {
+            4 => SHCSR_MEMFAULTENA,
+            5 => SHCSR_BUSFAULTENA,
+            6 => SHCSR_USGFAULTENA,
+            _ => return false,
+        };
+        self.scb.shcsr() & enable != 0
+            && self.group_priority(self.exception_priority(number)) < current
+    }
+
+    /// Record a fault in the SCB's status registers: bits for CFSR and
+    /// HFSR, and the address of a failed data access for BFAR.
+    pub fn record_fault(&mut self, cfsr_bits: u32, hfsr_bits: u32, address: Option<u32>) {
+        self.scb.record_fault(cfsr_bits, hfsr_bits, address);
     }
 
     /// The CPU reports which exception's handler is running (0 for
@@ -445,13 +513,19 @@ impl Bus {
                 }
             }
             SCB_BASE..=SCB_END => self.scb.read(addr - SCB_BASE, size),
-            // Unmapped: log instead of panicking. The log shows which
-            // peripheral the firmware wants next.
+            // Unmapped. With the bus-faults switch on, note it for the
+            // CPU to raise a BusFault. Otherwise log instead of
+            // panicking: the log shows which peripheral the firmware
+            // wants next.
             _ => {
-                eprintln!(
-                    "WARNING: Unmapped {}-byte read at Addr: {:#010X}",
-                    size, addr
-                );
+                if self.bus_faults {
+                    self.bus_fault.get_or_insert((addr, false));
+                } else {
+                    eprintln!(
+                        "WARNING: Unmapped {}-byte read at Addr: {:#010X}",
+                        size, addr
+                    );
+                }
                 0
             }
         }
@@ -497,10 +571,14 @@ impl Bus {
             STIR => self.nvic.set_pending(value & 0x1FF),
             SCB_BASE..=SCB_END => self.scb.write(addr - SCB_BASE, size, value),
             _ => {
-                eprintln!(
-                    "WARNING: Unmapped {}-byte write at Addr: {:#010X} = {:#010X}",
-                    size, addr, value
-                );
+                if self.bus_faults {
+                    self.bus_fault.get_or_insert((addr, true));
+                } else {
+                    eprintln!(
+                        "WARNING: Unmapped {}-byte write at Addr: {:#010X} = {:#010X}",
+                        size, addr, value
+                    );
+                }
             }
         }
     }
@@ -991,5 +1069,47 @@ mod tests {
         // A number with no IRQ behind it is ignored.
         bus.write32(STIR, 300);
         assert_eq!(bus.take_pending_exception(PRIORITY_THREAD), None);
+    }
+
+    #[test]
+    fn unmapped_access_is_noted_only_with_the_switch_on() {
+        let mut bus = Bus::new();
+        bus.read32(0x6000_0000);
+        assert_eq!(bus.take_bus_fault(), None);
+
+        bus.set_bus_faults(true);
+        bus.write8(0x6000_0010, 1);
+        bus.read32(0x6000_0020); // only the first is kept
+        assert_eq!(bus.take_bus_fault(), Some((0x6000_0010, true)));
+        assert_eq!(bus.take_bus_fault(), None);
+        // Mapped addresses are unaffected.
+        bus.read32(SRAM_BASE);
+        bus.read32(UART0_BASE + 0x14);
+        assert_eq!(bus.take_bus_fault(), None);
+    }
+
+    #[test]
+    fn only_flash_and_ram_can_hold_code() {
+        let bus = Bus::new();
+        assert_eq!(bus.executable(0x0000_0100), Executable::Yes);
+        assert_eq!(bus.executable(FLASH_BASE), Executable::Yes);
+        assert_eq!(bus.executable(SRAM_END - 1), Executable::Yes);
+        assert_eq!(bus.executable(0x1000_0000), Executable::NoMemory);
+        assert_eq!(bus.executable(SRAM_END + 1), Executable::NoMemory);
+        assert_eq!(bus.executable(UART0_BASE), Executable::Never);
+        assert_eq!(bus.executable(0xFFFF_FFF8), Executable::Never);
+    }
+
+    #[test]
+    fn fault_exception_needs_its_enable_bit_and_enough_priority() {
+        let mut bus = Bus::new();
+        const SHCSR: u32 = SCB_BASE + 0x24;
+        assert!(!bus.fault_exception_usable(6, PRIORITY_THREAD));
+        bus.write32(SHCSR, SHCSR_USGFAULTENA);
+        assert!(bus.fault_exception_usable(6, PRIORITY_THREAD));
+        assert!(!bus.fault_exception_usable(5, PRIORITY_THREAD)); // BusFault is still off
+        // UsageFault has priority 0 by default: it cannot interrupt code
+        // already running at 0.
+        assert!(!bus.fault_exception_usable(6, 0));
     }
 }

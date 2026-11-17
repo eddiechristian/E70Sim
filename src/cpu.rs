@@ -54,6 +54,7 @@ fn it_advance(it_state: u8) -> u8 {
 }
 
 mod exception;
+mod fault;
 mod system;
 mod thumb16;
 mod thumb32;
@@ -70,6 +71,9 @@ pub struct Cpu {
     /// There, the 16-bit instructions that normally set the flags leave
     /// them alone. `step` sets this before each instruction.
     in_it_block: bool,
+    /// Set by an instruction that turns out to be a fault (see
+    /// `fault.rs`). `step` raises it once the instruction has finished.
+    fault: Option<fault::Fault>,
     regs: [u32; 16],
     xpsr: u32,
     msp: u32,
@@ -105,6 +109,7 @@ impl Cpu {
             cycles: 0,
             sleeping: false,
             in_it_block: false,
+            fault: None,
             regs: [0; 16],
             xpsr: 0,
             msp: 0,
@@ -169,9 +174,29 @@ impl Cpu {
         if let Some(number) = bus.take_pending_exception(priority) {
             self.exception_entry(number, bus);
             cycles += CYCLES_EXCEPTION_ENTRY;
+            // With the bus-faults switch on: the frame did not fit in
+            // mapped memory. The real chip raises a BusFault (STKERR)
+            // here, which is not emulated.
+            if let Some((address, _)) = bus.take_bus_fault() {
+                panic!(
+                    "stack overflow or bad SP: pushing the frame for exception {} wrote to unmapped address {:#010X}",
+                    number, address
+                );
+            }
         }
 
+        // A fault is raised with the registers as they were before the
+        // faulting instruction, so keep a copy to go back to.
+        let before = (self.regs, self.xpsr);
         let pc = self.regs[PC];
+
+        // Some faults show before the instruction is even fetched.
+        if let Some(fault) = self.fetch_fault(bus) {
+            cycles += self.raise_fault(fault, bus);
+            self.cycles += cycles as u64;
+            bus.tick(cycles);
+            return;
+        }
         let hw1 = bus.read16(pc); // Thumb instructions are 16-bit units
 
         // Inside an IT block the instruction only executes if the block's
@@ -216,6 +241,18 @@ impl Cpu {
             trace!(self, "{:#010X}: {:#06X} = {:016b}", pc, hw1, hw1);
             self.regs[PC] = pc.wrapping_add(2);
             cycles += self.execute16(hw1, pc, bus);
+        }
+
+        // Did the instruction fault? Either it said so itself, or (with
+        // the bus-faults switch on) it touched an unmapped address.
+        let bus_fault = bus
+            .take_bus_fault()
+            .map(|(address, write)| fault::Fault::DataBusError { address, write });
+        if let Some(fault) = self.fault.take().or(bus_fault) {
+            // Undo whatever the instruction did to the registers, so the
+            // saved return address is the instruction itself.
+            (self.regs, self.xpsr) = before;
+            cycles += self.raise_fault(fault, bus);
         }
         // Emulated time moves on by the cycles this step took.
         self.cycles += cycles as u64;

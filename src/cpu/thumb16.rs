@@ -5,6 +5,7 @@
 //! instruction takes (see the `CYCLES_` constants in `cpu.rs`). Section numbers (A7.7.x) refer to the ARMv7-M Architecture
 //! Reference Manual.
 
+use super::fault::Fault;
 use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
 use crate::helpers::{add_with_carry, condition_passed, lsl_c, lsr_c};
@@ -24,6 +25,12 @@ impl Cpu {
         // CMP (immediate), encoding T1: 00101 Rn imm8  (A7.7.27)
         } else if instr >> 11 == 0b00101 {
             self.cmp_immediate(instr)
+        // UDF, encoding T1: 11011110 imm8  (A7.7.194). Permanently
+        // undefined: compilers use it to stop on a failed check.
+        } else if instr >> 8 == 0b11011110 {
+            self.fault = Some(Fault::UndefinedInstruction);
+            trace!(self, "  udf #{}", instr & 0xFF);
+            CYCLES_DATA
         // B<cond>, encoding T1: 1101 cond imm8  (A7.7.12)
         // cond 1110 is UDF and 1111 is SVC, so they are excluded here.
         } else if instr >> 12 == 0b1101 && (instr >> 8) & 0xF < 0b1110 {
@@ -840,11 +847,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "without the Thumb bit")]
-    fn bx_to_an_address_without_the_thumb_bit_stops() {
+    fn bx_to_an_address_without_the_thumb_bit_clears_the_thumb_state() {
         let (mut cpu, mut bus) = cpu_with_code(&[0x4770]); // bx lr
         cpu.regs[LR] = 0x0040_0404; // bit 0 clear
         cpu.step(&mut bus);
+        // The branch happens; the fault comes when the target tries to
+        // execute (tested in fault.rs).
+        assert_eq!(cpu.regs[PC], 0x0040_0404);
+        assert_eq!(cpu.xpsr & (1 << 24), 0);
     }
 
     #[test]
@@ -986,12 +996,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "without the Thumb bit")]
-    fn pop_to_pc_without_the_thumb_bit_stops() {
+    fn pop_to_pc_without_the_thumb_bit_clears_the_thumb_state() {
         let (mut cpu, mut bus) = cpu_with_code(&[0xBD00]); // pop {pc}
         cpu.regs[SP] = 0x2045_FFFC;
         bus.write32(0x2045_FFFC, 0x0040_0404); // bit 0 clear
         cpu.step(&mut bus);
+        assert_eq!(cpu.regs[PC], 0x0040_0404);
+        assert_eq!(cpu.xpsr & (1 << 24), 0);
     }
 
     #[test]

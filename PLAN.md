@@ -110,7 +110,7 @@ All offsets and bit names in this table are verified against the SVD.
 - [x] SysTick (`0xE000E010`), counting emulated clock cycles
 - [x] NVIC (`0xE000E100`): enable and pending bits
 - [x] Exception priorities and nesting (priority grouping included)
-- [ ] HardFault with a useful dump of the faulting state
+- [x] HardFault with a useful dump of the faulting state: UsageFault, BusFault and MemManage with escalation and lockup; `--bus-faults` switch for unmapped accesses
 - [x] UART0 RX interrupt (IRQ 7) fed from stdin
 
 ## Phase 5 — As needed

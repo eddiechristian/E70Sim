@@ -53,7 +53,7 @@ impl Cpu {
     }
 
     /// The main stack pointer, whether or not it is the one in use.
-    fn main_sp(&self) -> u32 {
+    pub(super) fn main_sp(&self) -> u32 {
         if self.control & CONTROL_SPSEL != 0 {
             self.msp
         } else {
@@ -62,7 +62,7 @@ impl Cpu {
     }
 
     /// The process stack pointer, whether or not it is the one in use.
-    fn process_sp(&self) -> u32 {
+    pub(super) fn process_sp(&self) -> u32 {
         if self.control & CONTROL_SPSEL != 0 {
             self.regs[SP]
         } else {

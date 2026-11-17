@@ -258,15 +258,88 @@ The CLKSOURCE bit of `SYST_CSR` is ignored. On the real chip it selects between 
 
 ## Faults
 
-A fault is an exception caused by the program doing something wrong (ARM manual B1.5.14). Today the emulator panics in those places. On a real chip:
+A fault is an exception caused by the program doing something wrong (ARM manual B1.5.14). The code for this is in `src/cpu/fault.rs`.
 
-- An undefined instruction raises **UsageFault**.
-- An access to unmapped memory raises **BusFault**.
-- If that specific fault is not enabled (they are off at reset), it **escalates** to **HardFault**.
+### What raises a fault
 
-Firmware often has a HardFault handler that prints diagnostics, so emulating the fault properly lets that code run. The plan also asks for the emulator itself to print a dump of the faulting state (registers, the stacked frame, the fault status registers in the SCB), which is far more useful for debugging than the firmware's own output.
+| The firmware does | Fault | Bit set in `CFSR` |
+|---|---|---|
+| Executes `udf`, the "permanently undefined" instruction. Compilers emit it to stop on a failed check | UsageFault | UNDEFINSTR |
+| Branches to an address without bit 0 set (the Thumb bit), or has a vector table entry without it | UsageFault | INVSTATE |
+| Returns from an exception with a bad `EXC_RETURN` value, or one for the wrong mode | UsageFault | INVPC |
+| Runs off into an address where there is no memory | BusFault | IBUSERR |
+| Runs off into the peripheral or system area (`0x4000_0000` and up) | MemManage | IACCVIOL |
+| Reads or writes an unmapped address, **only with `--bus-faults`** | BusFault | PRECISERR |
 
-One caution: unimplemented instructions should keep panicking. A panic means "the emulator is missing something"; a fault means "the firmware did something wrong". Mixing them up would hide the to-do list.
+For the Thumb-bit case the branch itself works; the fault comes when the instruction at the target tries to execute. This is how the real chip behaves, and it means the saved return address is the bad target.
+
+### The `--bus-faults` switch
+
+On the real chip an access to an address where nothing exists is a BusFault. In the emulator "nothing exists there" often means "that peripheral is not emulated yet", and a warning that lets the firmware carry on is more useful: the warnings are the list of peripherals the firmware wants.
+
+So this is a switch:
+
+| | Unmapped read or write |
+|---|---|
+| Default | Prints `WARNING: Unmapped ...`, reads 0, carries on |
+| `cargo run -- --bus-faults` | BusFault, as on the real chip |
+
+Use the switch when the firmware runs with no warnings and you want wild pointers caught.
+
+### Escalation to HardFault
+
+MemManage, BusFault and UsageFault are switched off after reset. Firmware enables them with bits 16, 17 and 18 of `SHCSR` (`0xE000_ED24`). A fault uses its own exception only if that is enabled and has a priority high enough to interrupt the running code. Otherwise it **escalates**: it is delivered as HardFault, which is always on, and bit 30 (FORCED) is set in `HFSR`.
+
+So in firmware that enables nothing, such as `hello-rs`, every fault arrives at the HardFault handler. `cortex-m-rt`'s default one loops for ever.
+
+### What the firmware's handler sees
+
+A fault is taken like any other exception: the 8-word frame is pushed and the handler runs. The saved return address is the instruction that faulted, and the registers are as they were before it.
+
+| Register | Address | Holds |
+|---|---|---|
+| `CFSR` | `0xE000_ED28` | Which fault: MemManage bits 7–0, BusFault bits 15–8, UsageFault bits 31–16 |
+| `HFSR` | `0xE000_ED2C` | Bit 30: this HardFault is an escalated fault |
+| `BFAR` | `0xE000_ED38` | The address of a failed data access, when `CFSR` bit 15 (BFARVALID) is set |
+
+The status bits stay set until firmware writes 1 to them.
+
+### The emulator's dump
+
+Whenever a fault is raised the emulator prints the state to stderr, before the handler runs:
+
+```
+==== FAULT at PC 0x00400100 ====
+  cause: BusFault: read of unmapped address 0x60000000 (CFSR.PRECISERR, BFAR valid)
+  taken as: HardFault (BusFault is disabled or cannot interrupt the running code; HFSR.FORCED)
+  instruction: 0x6801
+  r0  = 60000000  r1  = FFFFFFFF  r2  = 00000000  r3  = 00000000
+  ...
+  r12 = 00000000  sp  = 20460000  lr  = 00000000  pc  = 00400100
+  xpsr = 01000000  flags ----
+  mode: Thread, main stack
+  masks: primask = 0, faultmask = 0, basepri = 0x00
+  cycles since reset: 0
+====
+```
+
+Look the PC up in the disassembly (see `firmware/firmware.md`) to find the line of code.
+
+### Lockup
+
+A fault while HardFault or NMI is already running, or with `FAULTMASK` set, has no handler that can take it. The real chip stops in a state called **lockup**. The emulator prints the dump and stops with a `LOCKUP` panic.
+
+This is also what happens to firmware with no HardFault handler at all. The assembly `hello.s` has only two vector table entries, so its HardFault "vector" is whatever bytes come next; a fault there ends in lockup.
+
+### Not a fault: unimplemented instructions
+
+An instruction the emulator has not implemented still panics with "unhandled instruction". A panic means "the emulator is missing something"; a fault means "the firmware did something wrong". Only `udf`, which is undefined by design, raises UNDEFINSTR.
+
+### Not emulated
+
+- A fault while pushing or popping an exception frame (a stack that has run off the end of RAM). With `--bus-faults` the emulator stops with a message; without it, the usual warnings appear.
+- Divide by zero and unaligned access traps; there is no divide instruction yet.
+- `MMFAR`, and the "active" and "pended" bits of `SHCSR`.
 
 ## UART receive interrupt
 
@@ -303,7 +376,8 @@ When a byte arrives is not tied to the emulated clock, so two runs can see it at
 | SysTick registers and countdown | `src/peripheral/systick.rs` | Done. Counts emulated clock cycles |
 | `ICSR` and `STIR` | `read_icsr`, `write_icsr` in `src/bus.rs` | Done. Firmware can pend NMI, PendSV, SysTick or any IRQ, and read which exception is running and which is waiting |
 | `SHPR` (priorities) | `src/peripheral/scb.rs` | Done |
-| `SHCSR` (fault enables) | `src/peripheral/scb.rs` | Store-and-readback; it matters once faults exist |
+| `SHCSR` (fault enables), `CFSR`, `HFSR`, `BFAR` | `src/peripheral/scb.rs` | Done: the enables are honoured and the status registers are filled in |
+| Faults and the state dump | `src/cpu/fault.rs` | Done; see "Faults" above |
 | Check for a pending exception | `Cpu::step` | Done. Before fetching each instruction, in Thread mode or in a handler |
 | Exception entry | `src/cpu/exception.rs` | Push the frame, set LR, load the PC |
 | Exception return | `bx_write_pc` in `src/cpu/exception.rs` | Used by `BX` and `POP`; loads into the PC will need it too |

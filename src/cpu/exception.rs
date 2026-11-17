@@ -16,6 +16,7 @@
 //! the value of the stack that is not in use. CONTROL bit 1 (SPSEL) says
 //! which is which, and `select_stack` swaps them.
 
+use super::fault::Fault;
 use super::{CYCLES_EXCEPTION_RETURN, CYCLES_REFILL, Cpu, LR, PC, SP, XPSR_IT};
 use crate::bus::Bus;
 
@@ -129,14 +130,11 @@ impl Cpu {
         // 4. Load the PC from the vector table.
         let table = bus.read32(VTOR);
         let vector = bus.read32(table.wrapping_add(4 * number));
-        if vector & 1 == 0 {
-            // The real chip would fault on the handler's first instruction.
-            panic!(
-                "vector for exception {} is {:#010X}, without the Thumb bit",
-                number, vector
-            );
-        }
+        // Bit 0 of the vector becomes the Thumb bit. A vector without it
+        // (an empty table entry, say) gives a handler that cannot execute:
+        // its first instruction raises a UsageFault.
         self.regs[PC] = vector & !1;
+        self.xpsr = (self.xpsr & !XPSR_T) | ((vector & 1) << 24);
 
         trace!(
             self,
@@ -162,16 +160,11 @@ impl Cpu {
             self.exception_return(value, pc, bus);
             return CYCLES_EXCEPTION_RETURN;
         }
-        // An address must have bit 0 set to mark it as Thumb code. The
-        // real chip raises a UsageFault on the next instruction if it is
-        // clear; faults are not implemented, so stop here instead.
-        if value & 1 == 0 {
-            panic!(
-                "instruction at {:#010X} loaded PC value {:#010X} without the Thumb bit",
-                pc, value
-            );
-        }
+        // Bit 0 of the address becomes the Thumb bit, and must be set.
+        // The branch itself works either way; with the bit clear, the
+        // instruction at the target raises a UsageFault (see `fault.rs`).
         self.regs[PC] = value & !1;
+        self.xpsr = (self.xpsr & !XPSR_T) | ((value & 1) << 24);
         CYCLES_REFILL
     }
 
@@ -179,6 +172,33 @@ impl Cpu {
     /// interrupted code. `pc` is the address of the returning instruction.
     fn exception_return(&mut self, exc_return: u32, pc: u32, bus: &mut Bus) {
         let returning = self.xpsr & XPSR_IPSR;
+
+        // 0. Check that the return can be carried out, before changing
+        //    anything. If not, it is a UsageFault (INVPC), raised by
+        //    `step` against the returning instruction.
+        let frame = match exc_return {
+            EXC_RETURN_HANDLER | EXC_RETURN_THREAD_MSP => self.main_sp(),
+            EXC_RETURN_THREAD_PSP => self.process_sp(),
+            // The forms with bit 4 clear are for a frame that includes
+            // FPU registers. That is a gap in the emulator, not a bug in
+            // the firmware, so it stops instead of faulting.
+            0xFFFF_FFE1 | 0xFFFF_FFE9 | 0xFFFF_FFED => panic!(
+                "instruction at {:#010X} returned from exception {} with unsupported EXC_RETURN {:#010X}",
+                pc, returning, exc_return
+            ),
+            _ => {
+                self.fault = Some(Fault::InvalidPcLoad);
+                return;
+            }
+        };
+        // The stacked xPSR must be for the mode EXC_RETURN asks for.
+        let wants_handler = exc_return == EXC_RETURN_HANDLER;
+        let stacked_is_handler = bus.read32(frame + FRAME_XPSR) & XPSR_IPSR != 0;
+        if wants_handler != stacked_is_handler {
+            self.fault = Some(Fault::InvalidPcLoad);
+            return;
+        }
+
         bus.deactivate_exception(returning);
         // FAULTMASK does not outlive the handler that set it, except
         // for NMI's (B5.2.1).
@@ -187,15 +207,7 @@ impl Cpu {
         }
 
         // 1. EXC_RETURN picks the stack that holds the frame.
-        match exc_return {
-            EXC_RETURN_HANDLER | EXC_RETURN_THREAD_MSP => self.select_stack(false),
-            EXC_RETURN_THREAD_PSP => self.select_stack(true),
-            // The real chip raises a UsageFault for a bad value.
-            _ => panic!(
-                "instruction at {:#010X} returned from exception {} with unsupported EXC_RETURN {:#010X}",
-                pc, returning, exc_return
-            ),
-        }
+        self.select_stack(exc_return == EXC_RETURN_THREAD_PSP);
 
         // 2. Pop the frame.
         let frame = self.regs[SP];
@@ -214,19 +226,18 @@ impl Cpu {
             self.regs[SP] |= 4;
         }
 
-        // 4. Restore the flags and IPSR. Bit 9 is not part of the live
-        //    xPSR, and the Thumb bit is always set.
-        self.xpsr = (saved_xpsr & !XPSR_STACK_ALIGN) | XPSR_T;
+        // 4. Restore the flags, the Thumb bit and IPSR. Bit 9 is not part
+        //    of the live xPSR.
+        self.xpsr = saved_xpsr & !XPSR_STACK_ALIGN;
         bus.set_current_exception(self.xpsr & XPSR_IPSR);
 
-        // 5. The restored IPSR must agree with the mode EXC_RETURN asked
-        //    for. The real chip raises a UsageFault if it does not.
-        let wants_handler = exc_return == EXC_RETURN_HANDLER;
-        if wants_handler != self.in_handler_mode() {
+        // With the bus-faults switch on: the frame was not in mapped
+        // memory. The real chip raises a BusFault (UNSTKERR) here, which
+        // is not emulated.
+        if let Some((address, _)) = bus.take_bus_fault() {
             panic!(
-                "instruction at {:#010X} returned from exception {} with EXC_RETURN {:#010X}, \
-                 but the stacked xPSR {:#010X} is for the other mode",
-                pc, returning, exc_return, saved_xpsr
+                "instruction at {:#010X} returned from exception {} with its frame at unmapped address {:#010X}",
+                pc, returning, address
             );
         }
 
@@ -676,11 +687,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "without the Thumb bit")]
-    fn vector_without_the_thumb_bit_stops() {
+    fn vector_without_the_thumb_bit_gives_a_handler_that_cannot_run() {
         // Exception 14 has no vector in this image: the table entry is 0.
         let (mut cpu, mut bus) = cpu_with_handler(&[], &[], &[SYSTICK]);
         cpu.exception_entry(14, &mut bus);
+        // Entry itself works; the handler's first instruction would fault
+        // (tested in fault.rs).
+        assert_eq!(cpu.regs[PC], 0);
+        assert_eq!(cpu.xpsr & XPSR_T, 0);
     }
 
     const UART0: u32 = 0x400E_0800;

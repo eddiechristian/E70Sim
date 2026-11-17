@@ -8,8 +8,10 @@ use cpu::Cpu;
 
 fn main() {
     let mut bus = Bus::new();
-    // Usage: E70_emulator [--trace] [firmware.bin]
+    // Usage: E70_emulator [--trace] [--bus-faults] [firmware.bin]
     // `--trace` logs every instruction and the registers to stderr.
+    // `--bus-faults` makes an access to an unmapped address a BusFault,
+    // as on the real chip, instead of a warning.
     // The first argument that is not a flag is the firmware image to load.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let firmware = args
@@ -20,6 +22,7 @@ fn main() {
     bus.load_firmware_from_bin(firmware);
     // What is typed on stdin arrives at UART0's receiver.
     bus.set_uart0_input(peripheral::uart::stdin_bytes());
+    bus.set_bus_faults(args.iter().any(|arg| arg == "--bus-faults"));
     let mut cpu = Cpu::new();
     cpu.trace = args.iter().any(|arg| arg == "--trace");
     cpu.reset(&mut bus);

@@ -38,6 +38,8 @@ const ICSR: u32 = 0x04; // Interrupt Control and State
 const VTOR: u32 = 0x08; // Vector Table Offset
 const AIRCR: u32 = 0x0C; // Application Interrupt and Reset Control
 const CCR: u32 = 0x14; // Configuration and Control
+const SHCSR: u32 = 0x24; // System Handler Control and State
+const BFAR: u32 = 0x38; // BusFault Address
 const SHPR1: u32 = 0x18; // System Handler Priority 1-3: one byte each
 const SHPR3: u32 = 0x20; //   for exceptions 4 to 15
 const CFSR: u32 = 0x28; // Configurable Fault Status
@@ -111,6 +113,22 @@ impl ScbStub {
         (self.get(SHPR1 + (byte & !3)) >> (8 * (byte & 3))) as u8
     }
 
+    /// SHCSR, whose bits 16 to 18 enable MemManage, BusFault and
+    /// UsageFault.
+    pub fn shcsr(&self) -> u32 {
+        self.get(SHCSR)
+    }
+
+    /// Record a fault: set `cfsr_bits` in CFSR and `hfsr_bits` in HFSR,
+    /// and put the address of a failed data access in BFAR.
+    pub fn record_fault(&mut self, cfsr_bits: u32, hfsr_bits: u32, address: Option<u32>) {
+        self.set(CFSR, self.get(CFSR) | cfsr_bits);
+        self.set(HFSR, self.get(HFSR) | hfsr_bits);
+        if let Some(address) = address {
+            self.set(BFAR, address);
+        }
+    }
+
     /// AIRCR.PRIGROUP: where a priority value splits into group priority
     /// and subpriority.
     pub fn priority_group(&self) -> u32 {
@@ -134,8 +152,8 @@ impl ScbStub {
             // answers ICSR itself, so this is never reached through it.
             ICSR => 0,
             AIRCR => AIRCR_VECTKEYSTAT | self.get(AIRCR),
-            // No fault is ever recorded.
-            CFSR | HFSR | DFSR => 0,
+            // There is no debugger, so no debug event is ever recorded.
+            DFSR => 0,
             CLIDR => CLIDR_VALUE,
             CTR => CTR_VALUE,
             CCSIDR => {
@@ -179,8 +197,9 @@ impl ScbStub {
             }
             CCR => self.set(CCR, (merged & CCR_WRITABLE) | CCR_ALWAYS_SET),
             SHPR1..=SHPR3 => self.set(offset, merged & PRIORITY_MASK),
-            // Fault status bits are cleared by writing 1, and none are set.
-            CFSR | HFSR | DFSR => {}
+            // Fault status bits stay set until firmware writes 1 to them.
+            CFSR | HFSR => self.set(offset, self.get(offset) & !bits),
+            DFSR => {}
             // Cache invalidate / clean operations: there are no caches.
             ICIALLU..=BPIALL => {}
             // Store-and-readback for everything else: SCR, SHCSR,
@@ -316,6 +335,23 @@ mod tests {
         let mut scb = ScbStub::new();
         assert_eq!(scb.read(CPUID, 1), 0x71);
         assert_eq!(scb.read(CPUID + 2, 2), 0x411F);
+    }
+
+    #[test]
+    fn recorded_fault_shows_until_firmware_clears_it() {
+        let mut scb = ScbStub::new();
+        scb.record_fault(1 << 9 | 1 << 15, 1 << 30, Some(0x6000_0000));
+        scb.record_fault(1 << 16, 0, None); // a second fault adds its bit
+        assert_eq!(scb.read(CFSR, 4), 1 << 9 | 1 << 15 | 1 << 16);
+        assert_eq!(scb.read(HFSR, 4), 1 << 30);
+        assert_eq!(scb.read(BFAR, 4), 0x6000_0000);
+        // Writing 1 clears a bit; writing 0 leaves it.
+        scb.write(CFSR, 4, 1 << 9);
+        assert_eq!(scb.read(CFSR, 4), 1 << 15 | 1 << 16);
+        scb.write(CFSR + 2, 1, 0x01); // byte write: bit 16
+        assert_eq!(scb.read(CFSR, 4), 1 << 15);
+        scb.write(HFSR, 4, 0xFFFF_FFFF);
+        assert_eq!(scb.read(HFSR, 4), 0);
     }
 
     #[test]

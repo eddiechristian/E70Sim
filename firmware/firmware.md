@@ -110,8 +110,11 @@ From the repo root. Without an argument the emulator loads `firmware/hello-rs.bi
 ```
 cargo run
 cargo run -- --trace
+cargo run -- --bus-faults
 cargo run -- firmware/firmware.bin
 ```
+
+`--bus-faults` makes a read or write of an unmapped address a BusFault, as on the real chip, instead of a warning. When firmware faults, the emulator prints a dump of the registers; `exceptionInterrupt.md` explains it.
 
 The emulator's stdin is UART0's receive line. Type a line and press Enter and the firmware echoes it; the terminal hands input over a line at a time, so nothing arrives before Enter. Input can also be piped in:
 
@@ -317,7 +320,7 @@ Normally a "peripheral access crate" generated from the chip's SVD file supplies
 
 So only step 5 is needed for UART output in the emulator, plus RXEN from step 4 for input. The rest is there so the same firmware would work on a real board.
 
-When the firmware uses an instruction the CPU core does not implement yet, the emulator stops with an "unknown instruction" panic that names the next one to add.
+When the firmware uses an instruction the CPU core does not implement yet, the emulator stops with an "unhandled instruction" panic that names the next one to add. That is different from a fault, which is the firmware doing something illegal: the emulator then prints a dump and runs the firmware's HardFault handler, which in `hello-rs` is `cortex-m-rt`'s default endless loop.
 
 ## To verify
 

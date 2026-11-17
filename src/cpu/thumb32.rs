@@ -5,6 +5,7 @@
 //! instruction takes (see the `CYCLES_` constants in `cpu.rs`). Section numbers (A7.7.x) refer to the ARMv7-M
 //! Architecture Reference Manual.
 
+use super::fault::Fault;
 use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
 use crate::helpers::{add_with_carry, thumb_expand_imm_c};
@@ -30,6 +31,11 @@ impl Cpu {
         // BL, encoding T1: 11110 S imm10 | 11 J1 1 J2 imm11  (A7.7.18)
         if hw1 >> 11 == 0b11110 && hw2 & 0xD000 == 0xD000 {
             self.bl(hw1, hw2, pc)
+        // UDF, encoding T2: 111101111111 imm4 | 1010 imm12  (A7.7.194)
+        } else if hw1 & 0xFFF0 == 0xF7F0 && hw2 & 0xF000 == 0xA000 {
+            self.fault = Some(Fault::UndefinedInstruction);
+            trace!(self, "  udf.w");
+            CYCLES_DATA
         // MRS, encoding T1: 1111001111101111 | 1000 Rd SYSm  (B5.2.2)
         } else if hw1 == 0xF3EF && hw2 & 0xF000 == 0x8000 {
             self.mrs(hw2, pc)
