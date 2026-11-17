@@ -152,6 +152,19 @@ impl Bus {
         self.pending_exceptions |= 1 << number;
     }
 
+    /// True if any exception is waiting to be taken.
+    pub fn has_pending_exception(&self) -> bool {
+        self.pending_exceptions != 0
+    }
+
+    /// How many clock cycles from now the next exception will be raised,
+    /// if nothing else changes. `None` if nothing is set up to raise one.
+    /// A sleeping CPU uses this to skip the wait.
+    pub fn cycles_until_next_exception(&self) -> Option<u32> {
+        // SysTick is the only source so far. Others will take the minimum.
+        self.systick.cycles_until_exception()
+    }
+
     /// Hand the CPU a pending exception to take, if there is one, and stop
     /// it being pending. With several pending, the lowest exception number
     /// goes first; real priorities are not implemented yet.
@@ -449,6 +462,26 @@ mod tests {
         assert_eq!(bus.take_pending_exception(), Some(15));
         // Taking it stops it being pending.
         assert_eq!(bus.take_pending_exception(), None);
+    }
+
+    #[test]
+    fn next_exception_time_follows_systick() {
+        let mut bus = Bus::new();
+        assert_eq!(bus.cycles_until_next_exception(), None);
+        assert!(!bus.has_pending_exception());
+
+        bus.write32(SYSTICK_BASE + 0x04, 99); // SYST_RVR: period 100
+        bus.write32(SYSTICK_BASE + 0x08, 0); // SYST_CVR: clear
+        bus.write32(SYSTICK_BASE, 0b011); // SYST_CSR: ENABLE | TICKINT
+        assert_eq!(bus.cycles_until_next_exception(), Some(100));
+
+        bus.tick(30);
+        assert_eq!(bus.cycles_until_next_exception(), Some(70));
+
+        // Ticking exactly that far raises it.
+        bus.tick(70);
+        assert!(bus.has_pending_exception());
+        assert_eq!(bus.cycles_until_next_exception(), Some(100));
     }
 
     #[test]

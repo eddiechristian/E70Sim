@@ -1,6 +1,6 @@
 # Rust firmware for the emulator
 
-This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line, then starts the SysTick timer and prints a dot from its exception handler on every tick. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
+This describes the first compiled firmware for Phase 3 of `PLAN.md`: a bare-metal Rust program that sets up UART0 and prints a line, then starts a 1 ms SysTick and prints a dot every 500 ms, timed by a millisecond counter that the SysTick handler keeps. The project is in `firmware/hello-rs/` and builds to `firmware/hello-rs.bin`. The hand-written `hello.s` and its `firmware.bin` are kept as a known-good test.
 
 "Bare-metal" means the program runs directly on the chip with no operating system. Nothing prepares memory or calls `main` for it, so the program has to bring its own startup code.
 
@@ -176,30 +176,64 @@ For each byte:
 
 This is the same loop as `hello.s`.
 
-## SysTick
+## SysTick, `millis` and `delay_ms`
 
-After printing its line, the firmware starts the Arm core's system timer and leaves `main` in an empty loop. From then on all the work happens in the SysTick exception handler, which interrupts that loop. `exceptionInterrupt.md` in the repo root explains exceptions and how the emulator counts time.
+After printing its line, the firmware starts the Arm core's system timer with a period of 1 ms. This is the usual way firmware keeps time: the handler only counts, and everything else is built on the count. `exceptionInterrupt.md` in the repo root explains exceptions and how the emulator counts time.
 
 ### Set-up
 
 | Order | Register | Address | Value | Meaning |
 |---|---|---|---|---|
-| 1 | `SYST_RVR` | `0xE000_E014` | `999` | Reload value: a period of 1,000 clock cycles |
+| 1 | `SYST_RVR` | `0xE000_E014` | `11_999` | Reload value: a period of 12,000 clock cycles, 1 ms at 12 MHz |
 | 2 | `SYST_CVR` | `0xE000_E018` | `0` | Any write clears the counter, so the first period is a full one |
 | 3 | `SYST_CSR` | `0xE000_E010` | `0b111` | ENABLE, TICKINT (raise the exception at zero), CLKSOURCE (processor clock) |
 
-The period is short on purpose, so that output appears at once in the emulator. A real 1 ms tick at 12 MHz would use a reload value of 11,999.
-
-### The handler
+### The handler and the counter
 
 ```rust
+static TICKS: AtomicU32 = AtomicU32::new(0);
+
 #[exception]
 fn SysTick() {
-    uart_write_byte(b'.');
+    TICKS.store(TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
 ```
 
 `#[exception]` comes from `cortex-m-rt`. It puts the function's address in the vector table at word 15 (`0x0040_003C`), the entry for the SysTick exception. The function itself is ordinary code: the processor saves and restores the interrupted registers around it.
+
+`TICKS` is the number of milliseconds since the timer started. It is an atomic because the handler and the main code share it. A separate load and store is enough here, because the handler is the only writer and cannot interrupt itself.
+
+`TICKS` is the firmware's first global variable. It lives in RAM in the `.bss` section, which the startup code fills with zeros before `main` runs, so the zeroing loop described under "Minimal startup" now has real work to do.
+
+### Using the count
+
+```rust
+fn millis() -> u32 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+fn delay_ms(ms: u32) {
+    let start = millis();
+    while millis().wrapping_sub(start) < ms {
+        wait_for_interrupt();
+    }
+}
+```
+
+`delay_ms` compares elapsed time (`now - start`) with the wanted delay, not the current time with a deadline. That keeps working when the 32-bit counter wraps round to 0, which happens after about 49.7 days.
+
+The main loop is then:
+
+```rust
+loop {
+    delay_ms(500);
+    uart_write_byte(b'.');
+}
+```
+
+`wait_for_interrupt` is the `WFI` instruction, written with `core::arch::asm!`. It stops the processor until the next exception. The count can only change when SysTick fires, so there is no point checking it more often than that; on a real chip sleeping in between saves power.
+
+The emulator skips the sleep: when the CPU is asleep it jumps emulated time straight to the next SysTick. So the dots appear far faster than two per second on the host, while being exactly 6,000,000 emulated cycles (500 ms at 12 MHz) apart.
 
 ## What the emulator does with this
 
@@ -212,11 +246,13 @@ fn SysTick() {
 | `UART_SR` | Always reports TXRDY |
 | `UART_THR` | Byte goes to stdout |
 | SysTick set-up | The emulated timer starts counting clock cycles |
-| SysTick reaching zero | The handler runs and a dot is printed, every 1,000 emulated cycles |
+| SysTick reaching zero | The handler runs and adds 1 to `TICKS`, every 12,000 emulated cycles |
+| `WFI` | The CPU sleeps; emulated time jumps to the next SysTick |
+| `delay_ms(500)` | Takes 6,000,000 emulated cycles, which the host gets through almost at once |
 
 So only step 5 is needed for UART output in the emulator. Steps 1 to 4 are there so the same firmware would work on a real board.
 
-The firmware as it stands runs to the end with the instructions the CPU core has. When it grows, the compiler will emit instructions the core does not implement yet; the emulator then stops with an "unknown instruction" panic that names the next one to add.
+When the firmware uses an instruction the CPU core does not implement yet, the emulator stops with an "unknown instruction" panic that names the next one to add.
 
 ## To verify
 

@@ -91,6 +91,22 @@ impl SysTick {
         }
         fire
     }
+
+    /// How many clock cycles from now the timer will next raise its
+    /// exception, or `None` if it is not going to.
+    pub fn cycles_until_exception(&self) -> Option<u32> {
+        let will_fire =
+            self.control & CSR_ENABLE != 0 && self.control & CSR_TICKINT != 0 && self.reload != 0;
+        if !will_fire {
+            return None;
+        }
+        if self.current == 0 {
+            // One cycle to reload, then the whole count.
+            Some(self.reload + 1)
+        } else {
+            Some(self.current)
+        }
+    }
 }
 
 impl Peripheral for SysTick {
@@ -215,6 +231,31 @@ mod tests {
         assert!(systick.tick(12)); // four periods in one step
         assert_eq!(systick.read(SYST_CVR, 4), 0);
         assert_ne!(systick.read(SYST_CSR, 4) & CSR_COUNTFLAG, 0);
+    }
+
+    #[test]
+    fn predicted_time_to_the_exception_is_when_it_fires() {
+        let mut systick = started(9, CSR_ENABLE | CSR_TICKINT); // period 10
+        for _ in 0..3 {
+            let cycles = systick.cycles_until_exception().unwrap();
+            // One cycle short does not fire; the last cycle does.
+            assert!(!systick.tick(cycles - 1));
+            assert!(systick.tick(1));
+        }
+        // From partway through a period too.
+        systick.tick(4);
+        assert_eq!(systick.cycles_until_exception(), Some(6));
+    }
+
+    #[test]
+    fn no_exception_is_predicted_when_none_can_happen() {
+        assert_eq!(SysTick::new().cycles_until_exception(), None);
+        assert_eq!(started(9, CSR_TICKINT).cycles_until_exception(), None); // not enabled
+        assert_eq!(started(9, CSR_ENABLE).cycles_until_exception(), None); // no TICKINT
+        assert_eq!(
+            started(0, CSR_ENABLE | CSR_TICKINT).cycles_until_exception(),
+            None
+        ); // reload 0
     }
 
     #[test]

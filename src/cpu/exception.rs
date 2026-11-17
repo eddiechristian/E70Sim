@@ -510,6 +510,86 @@ mod tests {
         assert_ne!(bus.read32(SYST_CSR) & (1 << 16), 0);
     }
 
+    /// Main: `wfi ; b` back to the wfi. SysTick handler: `adds r4, #1 ;
+    /// bx lr`. The idle loop of tick-driven firmware.
+    fn cpu_sleeping_between_systicks() -> (Cpu, Bus) {
+        cpu_with_handler(&[0xBF30, 0xE7FD], &[0x3401, 0x4770], &[SYSTICK])
+    }
+
+    #[test]
+    fn wfi_sleeps_until_the_next_systick() {
+        let (mut cpu, mut bus) = cpu_sleeping_between_systicks();
+        bus.write32(SYST_RVR, 11_999); // 12,000-cycle period
+        bus.write32(SYST_CVR, 0);
+        bus.write32(SYST_CSR, 0b011); // ENABLE | TICKINT
+
+        cpu.step(&mut bus); // wfi
+        assert_eq!(cpu.cycles, 1);
+        assert_eq!(cpu.regs[PC], MAIN + 2);
+
+        // One step skips the whole wait: no instruction runs, and time
+        // jumps to the moment the timer reaches zero.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.cycles, 12_000);
+        assert_eq!(cpu.regs[PC], MAIN + 2);
+        assert_eq!(cpu.regs[4], 0);
+
+        // Awake: the exception is taken and the handler runs.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[4], 1);
+        assert!(cpu.in_handler_mode());
+
+        // After the handler, execution continues after the wfi.
+        cpu.step(&mut bus); // bx lr
+        assert_eq!(cpu.regs[PC], MAIN + 2);
+        cpu.step(&mut bus); // b back to the wfi
+        assert_eq!(cpu.regs[PC], MAIN);
+    }
+
+    #[test]
+    fn sleeping_firmware_gets_a_tick_every_period_exactly() {
+        let (mut cpu, mut bus) = cpu_sleeping_between_systicks();
+        bus.write32(SYST_RVR, 11_999);
+        bus.write32(SYST_CVR, 0);
+        bus.write32(SYST_CSR, 0b011);
+        // Each trip is 5 steps: wfi, sleep, handler (2 steps), branch.
+        for _ in 0..5 * 100 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs[4], 100);
+        // The 100th period ended at 1,200,000 cycles; the handler and the
+        // branch back took 12 + 1 + 11 + 3 more.
+        assert_eq!(cpu.cycles, 1_200_000 + 27);
+    }
+
+    #[test]
+    fn wfi_with_an_exception_already_pending_does_not_sleep() {
+        let (mut cpu, mut bus) = cpu_sleeping_between_systicks();
+        bus.pend_exception(SYSTICK);
+        // Hold the exception back for one step by pretending to be in a
+        // handler, so that wfi executes while it is still pending.
+        cpu.xpsr |= 3;
+        cpu.step(&mut bus); // wfi
+        cpu.xpsr &= !XPSR_IPSR;
+
+        cpu.step(&mut bus); // wakes at once: entry and adds r4, #1
+        assert_eq!(cpu.regs[4], 1);
+        assert_eq!(cpu.cycles, 1 + 12 + 1);
+    }
+
+    #[test]
+    fn wfi_with_nothing_to_wake_it_stays_asleep() {
+        // SysTick is off, so no exception will ever arrive.
+        let (mut cpu, mut bus) = cpu_sleeping_between_systicks();
+        cpu.step(&mut bus); // wfi
+        for _ in 0..50 {
+            cpu.step(&mut bus);
+        }
+        // Still parked after the wfi; time has crept on a cycle per step.
+        assert_eq!(cpu.regs[PC], MAIN + 2);
+        assert_eq!(cpu.cycles, 51);
+    }
+
     #[test]
     fn exception_pending_during_a_handler_waits_for_it_to_finish() {
         let (mut cpu, mut bus) = cpu_counting_systicks();

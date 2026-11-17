@@ -183,7 +183,7 @@ Every new instruction has to return its cost; the compiler enforces that, becaus
 Three things to keep in mind:
 
 - **The costs are estimates.** They follow the timings Arm publishes for the Cortex-M4. The Cortex-M7 runs two instructions at once where it can, predicts branches and has caches, so the true cost of an instruction depends on its neighbours and on history, and Arm publishes no simple table for it. Ratios between pieces of code come out roughly right; absolute numbers do not match the real chip.
-- **It is emulated time, not real time.** A "1 second" delay takes however long the host needs to emulate that many cycles. Pacing the emulator against the host's clock, so that 1 ms takes 1 ms, would build on the cycle count but is not implemented.
+- **It is emulated time, not real time.** A "1 second" delay takes however long the host needs to emulate that many cycles, and almost no time at all if the firmware sleeps in `WFI` meanwhile. Pacing the emulator against the host's clock, so that 1 ms takes 1 ms, would build on the cycle count but is not implemented.
 - **It is exactly repeatable.** The same firmware takes its SysTick exception at the same instruction on every run.
 
 The running total is also what `DWT_CYCCNT` (the core's cycle counter register, a Phase 5 item) will report. With `--trace`, each step prints the total and the cycles that step took.
@@ -227,7 +227,9 @@ The last Phase 4 item makes input work. Typed characters on the host's stdin bec
 
 The last row is the main design question. At present a peripheral can only answer reads and writes; it cannot tell anyone that something happened. The SCB stub ran into the same limit ("logged but not carried out"). One workable shape is for the bus to own the exception state, for peripherals to set a pending bit there, and for the CPU to ask the bus once per step whether anything is waiting.
 
-New instructions will be needed as well, as real firmware hits them: `BX`, `CPSID` / `CPSIE`, `MRS` / `MSR`, `SVC`, and `WFI` (wait for interrupt, which firmware uses to idle).
+New instructions are needed as well, as real firmware hits them. `BX` and `WFI` exist; `CPSID` / `CPSIE`, `MRS` / `MSR` and `SVC` are still to come.
+
+`WFI` (wait for interrupt) is what firmware uses to idle. After it, the CPU is asleep: `Cpu::step` executes nothing until an exception is pending. Instead of counting through the wait one cycle at a time, it asks the bus how many cycles remain until the next exception will be raised and jumps emulated time forward by that much. If nothing is set up to raise one, the CPU stays asleep and time creeps on a cycle per step.
 
 ## A suggested order
 

@@ -7,7 +7,7 @@
 
 use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
-use crate::helpers::thumb_expand_imm_c;
+use crate::helpers::{add_with_carry, thumb_expand_imm_c};
 
 impl Cpu {
     /// Decode and execute a 32-bit instruction. `hw1` is the halfword at
@@ -44,6 +44,12 @@ impl Cpu {
         // 11110 i 00001 S Rn | 0 imm3 Rd imm8  (A7.7.15)
         } else if hw1 & 0xFBE0 == 0xF020 && hw2 & 0x8000 == 0 {
             self.bic_immediate(hw1, hw2, pc)
+        // CMP (immediate), encoding T2:
+        // 11110 i 011011 Rn | 0 imm3 1111 imm8  (A7.7.27)
+        // With anything other than 1111 in bits 11-8 of hw2 this is SUBS
+        // (immediate) instead.
+        } else if hw1 & 0xFBF0 == 0xF1B0 && hw2 & 0x8F00 == 0x0F00 {
+            self.cmp_modified_immediate(hw1, hw2, pc)
         // STR (immediate), encoding T3: 111110001100 Rn | Rt imm12  (A7.7.161)
         // Rn = 1111 is not a valid STR, so it is left to the panic below.
         } else if hw1 & 0xFFF0 == 0xF8C0 && hw1 & 0xF != 0xF {
@@ -84,6 +90,42 @@ impl Cpu {
             self.regs[t]
         );
         CYCLES_MEMORY
+    }
+
+    /// CMP.W <Rn>, #<const> -- subtract a modified-immediate constant from
+    /// Rn and set the flags, discarding the result. The 32-bit form of
+    /// CMP: any register, and constants beyond the 0-255 of the 16-bit
+    /// form. `pc` is the address of this instruction.
+    fn cmp_modified_immediate(&mut self, hw1: u16, hw2: u16, pc: u32) -> u32 {
+        let n = (hw1 & 0xF) as usize;
+        if n == PC {
+            // UNPREDICTABLE in the architecture; a compiler never emits it.
+            panic!("CMP.W with the PC at {:#010X}", pc);
+        }
+
+        // The 12-bit encoded constant is i:imm3:imm8.
+        let i = ((hw1 >> 10) & 1) as u32;
+        let imm3 = ((hw2 >> 12) & 0x7) as u32;
+        let imm8 = (hw2 & 0xFF) as u32;
+        let imm12 = (i << 11) | (imm3 << 8) | imm8;
+        // The carry from expanding the constant is not used: the flags
+        // all come from the subtraction.
+        let (imm32, _) = thumb_expand_imm_c(imm12, false);
+
+        // Rn - imm32, computed as Rn + NOT(imm32) + 1
+        let (result, carry, overflow) = add_with_carry(self.regs[n], !imm32, true);
+        self.set_nzcv(result, carry, overflow);
+        trace!(
+            self,
+            "  cmp.w r{}, #{:#X}  -> N={} Z={} C={} V={}",
+            n,
+            imm32,
+            result >> 31,
+            (result == 0) as u8,
+            carry as u8,
+            overflow as u8
+        );
+        CYCLES_DATA
     }
 
     /// BIC <Rd>, <Rn>, #<const> / BICS -- "bit clear": Rd = Rn AND NOT
@@ -498,6 +540,45 @@ mod tests {
         assert_eq!(cpu.regs[0], 0x7FFF_FFFF);
         // N clear, Z clear, C set, V clear.
         assert_eq!(cpu.xpsr >> 28, 0b0010);
+    }
+
+    #[test]
+    fn cmp_w_below_the_constant_clears_c() {
+        // cmp.w r2, #0x1f4: delay_ms asking "have 500 ms passed yet?".
+        // The `blo` after it loops while C is clear.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF5B2, 0x7FFA]);
+        cpu.regs[2] = 499;
+        cpu.step(&mut bus);
+        // 499 - 500: negative, and a borrow was needed (C clear).
+        assert_eq!(cpu.xpsr >> 28, 0b1000);
+        // Only the flags change.
+        assert_eq!(cpu.regs[2], 499);
+        assert_eq!(cpu.regs[PC], 0x0040_000C);
+    }
+
+    #[test]
+    fn cmp_w_equal_to_the_constant_sets_z_and_c() {
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF5B2, 0x7FFA]); // cmp.w r2, #0x1f4
+        cpu.regs[2] = 500;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr >> 28, 0b0110);
+    }
+
+    #[test]
+    fn cmp_w_above_the_constant_sets_only_c() {
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF5B2, 0x7FFA]); // cmp.w r2, #0x1f4
+        cpu.regs[2] = 501;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr >> 28, 0b0010);
+    }
+
+    #[test]
+    fn cmp_w_can_use_a_high_register() {
+        // cmp.w r10, #0xff00ff00
+        let (mut cpu, mut bus) = cpu_with_code(&[0xF1BA, 0x2FFF]);
+        cpu.regs[10] = 0xFF00_FF00;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.xpsr >> 28, 0b0110);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use super::{CYCLES_DATA, CYCLES_MEMORY, CYCLES_REFILL, Cpu, LR, PC, SP};
 use crate::bus::Bus;
-use crate::helpers::{add_with_carry, condition_passed, lsl_c};
+use crate::helpers::{add_with_carry, condition_passed, lsl_c, lsr_c};
 
 impl Cpu {
     /// Decode and execute a 16-bit instruction located at `pc`.
@@ -56,6 +56,18 @@ impl Cpu {
         // POP, encoding T1: 1011110 P register_list  (A7.7.99)
         } else if instr >> 9 == 0b1011110 {
             self.pop(instr, pc, bus)
+        // LSR (immediate), encoding T1: 00001 imm5 Rm Rd  (A7.7.69)
+        } else if instr >> 11 == 0b00001 {
+            self.lsr_immediate(instr)
+        // STM, encoding T1: 11000 Rn register_list  (A7.7.159)
+        } else if instr >> 11 == 0b11000 {
+            self.stm(instr, pc, bus)
+        // SUB (register), encoding T1: 0001101 Rm Rn Rd  (A7.7.175)
+        } else if instr >> 9 == 0b0001101 {
+            self.sub_register(instr)
+        // WFI, encoding T1: 1011111100110000  (A7.7.263)
+        } else if instr == 0xBF30 {
+            self.wfi()
         // BX, encoding T1: 010001110 Rm 000  (A7.7.20)
         } else if instr & 0xFF87 == 0x4700 {
             self.bx(instr, pc, bus)
@@ -154,6 +166,85 @@ impl Cpu {
             self,
             "  movs r{}, #{}  -> r{} = {:#010X}", d, imm32, d, imm32
         );
+        CYCLES_DATA
+    }
+
+    /// LSRS <Rd>, <Rm>, #<imm5> -- shift right, filling with zeros, and
+    /// set N, Z and C. Shifting right by n divides an unsigned number by
+    /// 2 to the power n.
+    fn lsr_immediate(&mut self, instr: u16) -> u32 {
+        // An encoded shift amount of 0 means 32, which leaves 0.
+        let imm5 = ((instr >> 6) & 0x1F) as u32; // bits 10-6
+        let shift_n = if imm5 == 0 { 32 } else { imm5 };
+        let m = ((instr >> 3) & 0x7) as usize; // bits 5-3, source
+        let d = (instr & 0x7) as usize; // bits 2-0, destination
+
+        let (result, carry) = lsr_c(self.regs[m], shift_n);
+
+        self.regs[d] = result;
+        // A shift leaves V unchanged, so pass the current V back in.
+        let v = self.xpsr & (1 << 28) != 0;
+        self.set_nzcv(result, carry, v);
+        trace!(
+            self,
+            "  lsrs r{}, r{}, #{}  -> r{} = {:#010X}", d, m, shift_n, d, result
+        );
+        CYCLES_DATA
+    }
+
+    /// STM <Rn>!, <registers> -- "store multiple": store R0-R7 registers
+    /// at increasing addresses starting at Rn, then leave Rn pointing just
+    /// past the last one. `pc` is the address of this instruction.
+    fn stm(&mut self, instr: u16, pc: u32, bus: &mut Bus) -> u32 {
+        let n = ((instr >> 8) & 0x7) as usize; // bits 10-8, base register
+        let registers = (instr & 0xFF) as u32; // bits 7-0 select R7-R0
+        if registers == 0 {
+            // UNPREDICTABLE in the architecture; a compiler never emits it.
+            panic!("STM with an empty register list at {:#010X}", pc);
+        }
+
+        // Lowest-numbered register at the lowest address. Rn is only
+        // updated afterwards, so if it is in the list its old value is
+        // what gets stored.
+        let mut address = self.regs[n];
+        for i in 0..8 {
+            if registers & (1 << i) != 0 {
+                bus.write32(address, self.regs[i]);
+                address = address.wrapping_add(4);
+            }
+        }
+        self.regs[n] = address;
+        trace!(
+            self,
+            "  stm r{}!, {{list {:#04X}}}  -> r{} = {:#010X}", n, registers, n, address
+        );
+        // One cycle, plus one per register stored.
+        CYCLES_DATA + registers.count_ones()
+    }
+
+    /// SUBS <Rd>, <Rn>, <Rm> -- Rd = Rn - Rm, setting the flags.
+    fn sub_register(&mut self, instr: u16) -> u32 {
+        let m = ((instr >> 6) & 0x7) as usize; // bits 8-6
+        let n = ((instr >> 3) & 0x7) as usize; // bits 5-3
+        let d = (instr & 0x7) as usize; // bits 2-0
+
+        // Rn - Rm, computed as Rn + NOT(Rm) + 1
+        let (result, carry, overflow) = add_with_carry(self.regs[n], !self.regs[m], true);
+        self.regs[d] = result;
+        self.set_nzcv(result, carry, overflow);
+        trace!(
+            self,
+            "  subs r{}, r{}, r{}  -> r{} = {:#010X}", d, n, m, d, result
+        );
+        CYCLES_DATA
+    }
+
+    /// WFI -- "wait for interrupt": stop executing until an exception is
+    /// pending. Firmware uses it to idle instead of spinning in a loop.
+    /// The waiting itself is done by `Cpu::step`.
+    fn wfi(&mut self) -> u32 {
+        self.sleeping = true;
+        trace!(self, "  wfi");
         CYCLES_DATA
     }
 
@@ -538,6 +629,131 @@ mod tests {
         cpu.xpsr &= !(0b11 << 28);
         cpu.step(&mut bus);
         assert_eq!(cpu.xpsr & (0b11 << 28), 0);
+    }
+
+    #[test]
+    fn lsrs_shifts_right_and_sets_c_to_the_last_bit_out() {
+        // lsrs r2, r2, #2: delay_ms dividing the elapsed time by 4.
+        let (mut cpu, mut bus) = cpu_with_code(&[0x0892]);
+        cpu.regs[2] = 499; // 0b1_1111_0011
+        cpu.xpsr |= 1 << 28; // V set beforehand
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 124);
+        // Positive, not zero, last bit shifted out was 1, V unchanged.
+        assert_eq!(nzcv(&cpu), 0b0011);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn lsrs_fills_with_zeros_from_the_top() {
+        // lsrs r0, r1, #4
+        let (mut cpu, mut bus) = cpu_with_code(&[0x0908]);
+        cpu.regs[1] = 0x8000_0000;
+        cpu.step(&mut bus);
+        // The top bit does not spread: this is not an arithmetic shift.
+        assert_eq!(cpu.regs[0], 0x0800_0000);
+        assert_eq!(cpu.regs[1], 0x8000_0000);
+        assert_eq!(nzcv(&cpu), 0b0000);
+    }
+
+    #[test]
+    fn lsrs_to_zero_sets_z() {
+        // lsrs r0, r1, #4
+        let (mut cpu, mut bus) = cpu_with_code(&[0x0908]);
+        cpu.regs[1] = 0x8; // the single set bit is the last one shifted out
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0);
+        assert_eq!(nzcv(&cpu), 0b0110);
+    }
+
+    #[test]
+    fn lsrs_with_encoded_shift_0_shifts_by_32() {
+        // lsrs r0, r1, #32 is encoded with imm5 = 0.
+        let (mut cpu, mut bus) = cpu_with_code(&[0x0808]);
+        cpu.regs[1] = 0xFFFF_FFFF;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 0);
+        // C is bit 31 of the original value.
+        assert_eq!(nzcv(&cpu), 0b0110);
+    }
+
+    #[test]
+    fn stm_stores_one_register_and_advances_the_pointer() {
+        // stm r0!, {r2}: the startup code writing one zero into .bss.
+        let (mut cpu, mut bus) = cpu_with_code(&[0xC004]);
+        bus.write32(0x2040_0000, 0xFFFF_FFFF);
+        cpu.regs[0] = 0x2040_0000;
+        cpu.regs[2] = 0;
+        let xpsr = cpu.xpsr;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x2040_0000), 0);
+        assert_eq!(cpu.regs[0], 0x2040_0004);
+        assert_eq!(cpu.xpsr, xpsr);
+        assert_eq!(cpu.cycles, 2);
+    }
+
+    #[test]
+    fn stm_stores_several_registers_lowest_first() {
+        // stm r1!, {r0, r2, r3}
+        let (mut cpu, mut bus) = cpu_with_code(&[0xC10D]);
+        cpu.regs[1] = 0x2040_0010;
+        cpu.regs[0] = 0xA0;
+        cpu.regs[2] = 0xA2;
+        cpu.regs[3] = 0xA3;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x2040_0010), 0xA0);
+        assert_eq!(bus.read32(0x2040_0014), 0xA2);
+        assert_eq!(bus.read32(0x2040_0018), 0xA3);
+        assert_eq!(cpu.regs[1], 0x2040_001C);
+        assert_eq!(cpu.cycles, 4);
+    }
+
+    #[test]
+    fn subs_subtracts_and_sets_the_flags() {
+        // subs r2, r2, r3: the elapsed-time subtraction in delay_ms.
+        let (mut cpu, mut bus) = cpu_with_code(&[0x1AD2]);
+        cpu.regs[2] = 750;
+        cpu.regs[3] = 250;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 500);
+        assert_eq!(cpu.regs[3], 250);
+        // Positive, not zero, no borrow (C set), no overflow.
+        assert_eq!(nzcv(&cpu), 0b0010);
+    }
+
+    #[test]
+    fn subs_of_equal_values_sets_z() {
+        let (mut cpu, mut bus) = cpu_with_code(&[0x1AD2]); // subs r2, r2, r3
+        cpu.regs[2] = 42;
+        cpu.regs[3] = 42;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 0);
+        assert_eq!(nzcv(&cpu), 0b0110);
+    }
+
+    #[test]
+    fn subs_wraps_round_below_zero() {
+        // 3 - 5 wraps to 0xFFFF_FFFE. This is what makes "now - start"
+        // work in delay_ms after the millisecond counter has wrapped.
+        let (mut cpu, mut bus) = cpu_with_code(&[0x1AD2]); // subs r2, r2, r3
+        cpu.regs[2] = 3;
+        cpu.regs[3] = 5;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[2], 0xFFFF_FFFE);
+        // Negative, and a borrow was needed (C clear).
+        assert_eq!(nzcv(&cpu), 0b1000);
+    }
+
+    #[test]
+    fn subs_can_use_three_different_registers() {
+        // subs r0, r1, r2
+        let (mut cpu, mut bus) = cpu_with_code(&[0x1A88]);
+        cpu.regs[1] = 10;
+        cpu.regs[2] = 4;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs[0], 6);
+        assert_eq!(cpu.regs[1], 10);
+        assert_eq!(cpu.regs[2], 4);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Bare-metal firmware for the ATSAME70Q21: set up UART0, print a line,
-//! then start the SysTick timer and print a dot from its exception handler
-//! on every tick.
+//! then start a 1 ms SysTick and print a dot every 500 ms.
+//!
+//! The SysTick exception handler only counts milliseconds. `millis` and
+//! `delay_ms` are built on that count, and the main loop uses them.
 //!
 //! See `../firmware.md` for what each step is for. Register addresses and
 //! bit positions are from `ATSAME70Q21.svd`.
@@ -9,6 +11,7 @@
 #![no_main] // no normal main: cortex-m-rt calls our #[entry] function
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use cortex_m_rt::{entry, exception};
 use panic_halt as _; // on panic, loop forever
@@ -52,13 +55,20 @@ const SYST_CSR_ENABLE: u32 = 1 << 0; // counter runs
 const SYST_CSR_TICKINT: u32 = 1 << 1; // reaching zero raises the exception
 const SYST_CSR_CLKSOURCE: u32 = 1 << 2; // count the processor clock
 
-/// Clock cycles between SysTick exceptions. Kept short so that output
-/// appears quickly in the emulator; a real 1 ms tick at 12 MHz would be
-/// 12_000.
-const TICK_CYCLES: u32 = 1_000;
-
 // The chip starts on its internal 12 MHz oscillator.
 const CLOCK_HZ: u32 = 12_000_000;
+
+/// SysTick exceptions per second: one every millisecond.
+const TICK_HZ: u32 = 1_000;
+/// Clock cycles between SysTick exceptions.
+const TICK_CYCLES: u32 = CLOCK_HZ / TICK_HZ;
+
+/// Milliseconds since `systick_init`, counted by the SysTick handler.
+/// It wraps round to 0 after about 49.7 days.
+///
+/// An atomic, because it is shared between the handler, which writes it,
+/// and the main code, which reads it.
+static TICKS: AtomicU32 = AtomicU32::new(0);
 const BAUD: u32 = 9600;
 /// Clock divisor for UART_BRGR: clock / (16 x baud), rounded to nearest.
 const UART_CD: u32 = (CLOCK_HZ + 8 * BAUD) / (16 * BAUD);
@@ -120,11 +130,38 @@ fn systick_init() {
     );
 }
 
-/// Runs every time SysTick reaches zero. `cortex-m-rt` puts this function
-/// in the vector table as the handler for exception 15.
+/// Runs every time SysTick reaches zero, once a millisecond. `cortex-m-rt`
+/// puts this function in the vector table as the handler for exception 15.
 #[exception]
 fn SysTick() {
-    uart_write_byte(b'.');
+    // A separate load and store is enough: this handler is the only code
+    // that writes TICKS, and it cannot interrupt itself.
+    TICKS.store(TICKS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+}
+
+/// Milliseconds since `systick_init`.
+fn millis() -> u32 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Stop the processor until the next exception (the WFI instruction).
+/// Nothing is lost by sleeping: the exception that wakes it is handled
+/// first, and execution then continues after this call.
+fn wait_for_interrupt() {
+    // SAFETY: WFI reads and writes no memory and changes no register.
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) }
+}
+
+/// Wait for at least `ms` milliseconds.
+fn delay_ms(ms: u32) {
+    let start = millis();
+    // Comparing the elapsed time, rather than against a deadline, keeps
+    // working when the counter wraps round.
+    while millis().wrapping_sub(start) < ms {
+        // The count can only change when SysTick fires, so sleep until
+        // then instead of spinning.
+        wait_for_interrupt();
+    }
 }
 
 #[entry]
@@ -138,7 +175,8 @@ fn main() -> ! {
 
     systick_init();
 
-    // Nothing left to do here: from now on the only work is done by the
-    // SysTick handler, which interrupts this loop.
-    loop {}
+    loop {
+        delay_ms(500);
+        uart_write_byte(b'.');
+    }
 }

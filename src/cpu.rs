@@ -46,6 +46,9 @@ pub struct Cpu {
     pub trace: bool,
     /// Clock cycles executed since reset.
     cycles: u64,
+    /// True after WFI, until an exception becomes pending. While it is
+    /// set, `step` lets time pass without executing anything.
+    sleeping: bool,
     regs: [u32; 16],
     xpsr: u32,
     msp: u32,
@@ -79,6 +82,7 @@ impl Cpu {
         Cpu {
             trace: false,
             cycles: 0,
+            sleeping: false,
             regs: [0; 16],
             xpsr: 0,
             msp: 0,
@@ -113,8 +117,26 @@ impl Cpu {
     /// Fetch, decode and execute one instruction, then advance emulated
     /// time by the clock cycles it took. If an exception is waiting, it is
     /// taken first, and the instruction executed is then the first one of
-    /// its handler.
+    /// its handler. While the CPU is asleep (after WFI) a step executes
+    /// nothing and only lets time pass.
     pub fn step(&mut self, bus: &mut Bus) {
+        // Asleep after WFI: nothing executes until an exception is pending.
+        if self.sleeping {
+            if bus.has_pending_exception() {
+                self.sleeping = false;
+            } else {
+                // Skip straight to the moment the next exception will be
+                // raised. If nothing is going to raise one, time just
+                // creeps forward a cycle at a time, as it would on a chip
+                // that is asleep with no way to wake up.
+                let cycles = bus.cycles_until_next_exception().unwrap_or(1);
+                self.cycles += cycles as u64;
+                bus.tick(cycles);
+                trace!(self, "asleep: cycles = {} (+{})", self.cycles, cycles);
+                return;
+            }
+        }
+
         // Exceptions are taken between instructions. Until priorities are
         // implemented, a handler is never interrupted by another exception:
         // anything that becomes pending meanwhile waits for Thread mode.
