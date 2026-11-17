@@ -115,7 +115,7 @@ All offsets and bit names in this table are verified against the SVD.
 
 ## Phase 5 — As needed
 
-- [x] FPU (ARM ARM A6) for hard-float firmware: S/D registers, FPSCR, CPACR enable, extended exception frame with lazy saving, and the instructions `firmware/float-rs/` uses. FPv5 additions (`VSEL`, `VRINT*`, `VCVTA` ..., `VMAXNM`) are still to come
+- [x] FPU (ARM ARM A6) for hard-float firmware: S/D registers, FPSCR, CPACR enable, extended exception frame with lazy saving, and the instructions `firmware/float-rs/` uses. Of the FPv5 additions, `VSEL` and `VMAXNM` / `VMINNM` are done; `VRINT*` and `VCVTA` / `N` / `P` / `M` are still to come
 - [ ] GDB remote stub (`target remote`)
 - [ ] TC timers, PIO interrupts, other peripherals
 - [x] Cycle counting: every instruction reports an estimated cost in clock cycles (see `exceptionInterrupt.md`)

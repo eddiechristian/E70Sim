@@ -159,6 +159,21 @@ fn main() -> ! {
     report_int("f32 a>b", (a > b) as u32);
     report32("harmonic(10)", harmonic(black_box(10)));
 
+    // Larger and smaller of two values, and choosing between two values
+    // by a comparison. On this FPU these compile to VMAXNM, VMINNM and
+    // VSEL, with no branch.
+    let p = black_box(3.5f32);
+    let q = black_box(-1.25f32);
+    report32("f32 max", p.max(q));
+    report32("f32 min", p.min(q));
+    report64("f64 max", x.max(y));
+    report64("f64 min", x.min(y));
+    report32("f32 max nan", black_box(f32::NAN).max(q));
+    let chosen = if p > q { black_box(10.0f32) } else { black_box(20.0f32) };
+    report32("f32 select", chosen);
+    let chosen = if x > y { black_box(10.0f64) } else { black_box(20.0f64) };
+    report64("f64 select", chosen);
+
     // Second half: do floating-point work in the main code while an
     // interrupt handler that also uses the FPU keeps cutting in.
     write_reg(SYST_RVR, TICK_CYCLES - 1);

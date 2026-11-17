@@ -349,7 +349,7 @@ The FPU is off after reset, and any FPU instruction is then a UsageFault. Firmwa
 
 ### What it does
 
-1. Prints the results of `f32` and `f64` arithmetic, conversions between the two and to and from integers, and comparisons. Each result is printed as the hex bit pattern of the value, because printing a decimal number needs far more code. `core::hint::black_box` hides the inputs from the compiler; otherwise it would work the answers out at build time and no FPU instruction would run.
+1. Prints the results of `f32` and `f64` arithmetic, conversions between the two and to and from integers, comparisons, `max` and `min`, and choosing between two values by a comparison (which compiles to the branch-free `VSEL` instruction). Each result is printed as the hex bit pattern of the value, because printing a decimal number needs far more code. `core::hint::black_box` hides the inputs from the compiler; otherwise it would work the answers out at build time and no FPU instruction would run.
 2. Starts SysTick with a short period and a handler that does floating-point arithmetic of its own. Meanwhile the main code repeats one calculation and checks that the answer never changes. This tests that the FPU registers are saved and restored around the handler (see "The FPU and the exception frame" in `exceptionInterrupt.md`).
 
 Expected output:

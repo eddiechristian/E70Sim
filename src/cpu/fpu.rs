@@ -30,6 +30,7 @@ use super::exception::CONTROL_FPCA;
 use super::fault::Fault;
 use super::{CYCLES_DATA, CYCLES_MEMORY, Cpu, PC};
 use crate::bus::Bus;
+use crate::helpers::condition_passed;
 
 // System Control Space registers for the FPU.
 const CPACR: u32 = 0xE000_ED88; // Coprocessor Access Control
@@ -78,6 +79,9 @@ trait Fp:
     fn mul_add(self, a: Self, b: Self) -> Self;
     fn to_f64(self) -> f64;
     fn from_f64(value: f64) -> Self;
+    fn is_nan(self) -> bool;
+    /// True for negative numbers and for -0.0.
+    fn is_sign_negative(self) -> bool;
     /// VFPExpandImm (A6.4.1): the constant an 8-bit immediate stands for.
     fn expand_imm(imm8: u32) -> Self;
     const ZERO: Self;
@@ -109,6 +113,12 @@ impl Fp for f32 {
     }
     fn from_f64(value: f64) -> Self {
         value as f32
+    }
+    fn is_nan(self) -> bool {
+        f32::is_nan(self)
+    }
+    fn is_sign_negative(self) -> bool {
+        f32::is_sign_negative(self)
     }
     fn expand_imm(imm8: u32) -> Self {
         // sign : NOT(b) : bbbbb : cd : efgh : 19 zeros
@@ -146,6 +156,12 @@ impl Fp for f64 {
     fn from_f64(value: f64) -> Self {
         value
     }
+    fn is_nan(self) -> bool {
+        f64::is_nan(self)
+    }
+    fn is_sign_negative(self) -> bool {
+        f64::is_sign_negative(self)
+    }
     fn expand_imm(imm8: u32) -> Self {
         // sign : NOT(b) : bbbbbbbb : cd : efgh : 48 zeros
         let imm8 = imm8 as u64;
@@ -156,6 +172,30 @@ impl Fp for f64 {
     }
     const ZERO: Self = 0.0;
     const PREFIX: char = 'd';
+}
+
+/// The larger (`maximum`) or smaller of two values, the way VMAXNM and
+/// VMINNM define it (FPMaxNum / FPMinNum, A2.5.7):
+///
+/// - If exactly one is a NaN ("not a number"), the result is the other
+///   one. A NaN only comes out when both are.
+/// - +0.0 counts as larger than -0.0, although they compare equal.
+fn max_or_min_number<F: Fp>(a: F, b: F, maximum: bool) -> F {
+    if a.is_nan() {
+        return b;
+    }
+    if b.is_nan() {
+        return a;
+    }
+    if a == b {
+        // Equal values differ at most in the sign of a zero.
+        return if a.is_sign_negative() == maximum {
+            b
+        } else {
+            a
+        };
+    }
+    if (a > b) == maximum { a } else { b }
 }
 
 /// Round to an integer value in the direction FPSCR's rounding mode (or
@@ -240,7 +280,14 @@ impl Cpu {
         }
         let (hw1, hw2) = (hw1 as u32, hw2 as u32);
         let double = hw2 & (1 << 8) != 0; // sz
-        if hw1 >> 8 == 0xEE && hw2 & (1 << 4) == 0 {
+        if hw1 >> 8 == 0xFE && hw2 & (1 << 4) == 0 {
+            // Data processing added by FPv5 (A6.4, the rows with T = 1).
+            if double {
+                self.fp_data_processing_v5::<f64>(hw1, hw2, pc)
+            } else {
+                self.fp_data_processing_v5::<f32>(hw1, hw2, pc)
+            }
+        } else if hw1 >> 8 == 0xEE && hw2 & (1 << 4) == 0 {
             // Data processing (A6.4).
             if double {
                 self.fp_data_processing::<f64>(hw1, hw2, pc)
@@ -404,6 +451,59 @@ impl Cpu {
                 trace!(self, "  vcvt s{}, {}{} (to integer)", sd, p, m);
             }
             _ => self.fp_unhandled(hw1, hw2, pc),
+        }
+        CYCLES_DATA
+    }
+
+    /// The data-processing instructions FPv5 added, in precision `F`:
+    /// 11111110 opc1 Vn | Vd 101 sz N op M 0 Vm.
+    fn fp_data_processing_v5<F: Fp>(&mut self, hw1: u32, hw2: u32, pc: u32) -> u32 {
+        let d = F::index(hw2 >> 12, (hw1 >> 6) & 1);
+        let n = F::index(hw1 & 0xF, (hw2 >> 7) & 1);
+        let m = F::index(hw2 & 0xF, (hw2 >> 5) & 1);
+        let op = hw2 & (1 << 6) != 0;
+        let (vn, vm) = (F::load(self, n), F::load(self, m));
+        let p = F::PREFIX;
+
+        if hw1 & 0x80 == 0 && !op {
+            // VSEL<cond>: 11111110 0 D cc Vn  (A7.7.256). Copy Vn if the
+            // condition holds, Vm if not: an "if ... else" on the CPU's
+            // flags without a branch. Only four conditions can be
+            // encoded; a compiler gets the opposite ones by swapping
+            // the two registers.
+            let cc = (hw1 >> 4) & 3;
+            // EQ (0000), VS (0110), GE (1010) or GT (1100).
+            let cond = (cc << 2) | (((cc >> 1) ^ (cc & 1)) << 1);
+            let holds = condition_passed(cond as u16, self.xpsr);
+            (if holds { vn } else { vm }).store(self, d);
+            trace!(
+                self,
+                "  vsel<cond {:04b}> {}{}, {}{}, {}{}  -> {}",
+                cond,
+                p,
+                d,
+                p,
+                n,
+                p,
+                m,
+                if holds { "first" } else { "second" }
+            );
+        } else if hw1 & 0xB0 == 0x80 {
+            // VMAXNM / VMINNM: 11111110 1 D 00 Vn  (A7.7.237)
+            max_or_min_number(vn, vm, !op).store(self, d);
+            trace!(
+                self,
+                "  {} {}{}, {}{}, {}{}",
+                if op { "vminnm" } else { "vmaxnm" },
+                p,
+                d,
+                p,
+                n,
+                p,
+                m
+            );
+        } else {
+            self.fp_unhandled(hw1, hw2, pc);
         }
         CYCLES_DATA
     }
@@ -1108,6 +1208,115 @@ mod tests {
         assert_eq!(cpu.control & CONTROL_FPCA, 0);
         cpu.step(&mut bus);
         assert_eq!(cpu.control & CONTROL_FPCA, CONTROL_FPCA);
+    }
+
+    #[test]
+    fn vsel_picks_by_the_cpu_flags() {
+        // S1 = 1.0 is the "condition holds" value, S2 = 2.0 the other.
+        let select = |hw1: u16, flags: u32| {
+            let (mut cpu, mut bus) = fp_cpu(&[hw1, 0x0A81]);
+            cpu.xpsr |= flags << 28;
+            set_s(&mut cpu, 1, 1.0);
+            set_s(&mut cpu, 2, 2.0);
+            cpu.step(&mut bus);
+            s(&cpu, 0)
+        };
+        const N: u32 = 0b1000;
+        const Z: u32 = 0b0100;
+        const V: u32 = 0b0001;
+        // vseleq: Z set
+        assert_eq!(select(0xFE00, Z), 1.0);
+        assert_eq!(select(0xFE00, 0), 2.0);
+        // vselvs: V set
+        assert_eq!(select(0xFE10, V), 1.0);
+        assert_eq!(select(0xFE10, 0), 2.0);
+        // vselge: N equals V
+        assert_eq!(select(0xFE20, 0), 1.0);
+        assert_eq!(select(0xFE20, N | V), 1.0);
+        assert_eq!(select(0xFE20, N), 2.0);
+        // vselgt: N equals V, and Z clear
+        assert_eq!(select(0xFE30, 0), 1.0);
+        assert_eq!(select(0xFE30, Z), 2.0);
+        assert_eq!(select(0xFE30, V), 2.0);
+    }
+
+    #[test]
+    fn vsel_follows_a_floating_point_compare() {
+        // vcmp.f32 s1, s2 would need another encoding; use the pattern a
+        // compiler emits for "if s0 > s1 { s1 } else { s2 }"-style code:
+        // vcmp.f32 s0, s1 ; vmrs APSR_nzcv, fpscr ; vselgt.f32 s0, s1, s2
+        let code = [0xEEB4, 0x0A60, 0xEEF1, 0xFA10, 0xFE30, 0x0A81];
+        let run = |s0: f32| {
+            let (mut cpu, mut bus) = fp_cpu(&code);
+            set_s(&mut cpu, 0, s0);
+            set_s(&mut cpu, 1, 5.0);
+            set_s(&mut cpu, 2, -1.0);
+            for _ in 0..3 {
+                cpu.step(&mut bus);
+            }
+            s(&cpu, 0)
+        };
+        assert_eq!(run(9.0), 5.0); // 9 > 5: first
+        assert_eq!(run(3.0), -1.0); // not greater: second
+        assert_eq!(run(f32::NAN), -1.0); // unordered is not "greater"
+    }
+
+    #[test]
+    fn vsel_in_double_precision_moves_all_64_bits() {
+        // vselgt.f64 d0, d1, d2
+        let (mut cpu, mut bus) = fp_cpu(&[0xFE31, 0x0B02]);
+        set_d(&mut cpu, 1, 1.0e300);
+        set_d(&mut cpu, 2, -1.0e-300);
+        cpu.step(&mut bus); // flags clear: GT holds
+        assert_eq!(d(&cpu, 0), 1.0e300);
+    }
+
+    #[test]
+    fn vmaxnm_and_vminnm_pick_the_larger_and_smaller() {
+        // vmaxnm.f32 s0, s1, s2 ; vminnm.f32 s0, s1, s2
+        let max = |a: f32, b: f32| s0_after([0xFE80, 0x0A81], 0.0, a, b);
+        let min = |a: f32, b: f32| s0_after([0xFE80, 0x0AC1], 0.0, a, b);
+        assert_eq!(max(1.0, 2.0), 2.0);
+        assert_eq!(max(2.0, 1.0), 2.0);
+        assert_eq!(min(1.0, 2.0), 1.0);
+        assert_eq!(min(-3.0, -7.0), -7.0);
+        assert_eq!(max(f32::NEG_INFINITY, -1.0e30), -1.0e30);
+        assert_eq!(min(f32::INFINITY, 1.0e30), 1.0e30);
+    }
+
+    #[test]
+    fn vmaxnm_and_vminnm_ignore_a_single_nan() {
+        let max = |a: f32, b: f32| s0_after([0xFE80, 0x0A81], 0.0, a, b);
+        let min = |a: f32, b: f32| s0_after([0xFE80, 0x0AC1], 0.0, a, b);
+        assert_eq!(max(f32::NAN, 2.0), 2.0);
+        assert_eq!(max(2.0, f32::NAN), 2.0);
+        assert_eq!(min(f32::NAN, -2.0), -2.0);
+        assert_eq!(min(-2.0, f32::NAN), -2.0);
+        assert!(max(f32::NAN, f32::NAN).is_nan());
+        assert!(min(f32::NAN, f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn positive_zero_is_larger_than_negative_zero() {
+        let max = |a: f32, b: f32| s0_after([0xFE80, 0x0A81], 1.0, a, b);
+        let min = |a: f32, b: f32| s0_after([0xFE80, 0x0AC1], 1.0, a, b);
+        // Compare bit patterns: 0.0 == -0.0 would hide the difference.
+        assert_eq!(max(0.0, -0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(max(-0.0, 0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(min(-0.0, 0.0).to_bits(), (-0.0f32).to_bits());
+    }
+
+    #[test]
+    fn vmaxnm_and_vminnm_in_double_precision() {
+        // vmaxnm.f64 d0, d1, d2 ; vminnm.f64 d0, d1, d2
+        let (mut cpu, mut bus) = fp_cpu(&[0xFE81, 0x0B02, 0xFE81, 0x0B42]);
+        set_d(&mut cpu, 1, 0.1);
+        set_d(&mut cpu, 2, 0.2);
+        cpu.step(&mut bus);
+        assert_eq!(d(&cpu, 0), 0.2);
+        cpu.step(&mut bus);
+        assert_eq!(d(&cpu, 0), 0.1);
     }
 
     #[test]
