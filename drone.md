@@ -229,6 +229,70 @@ Three additions make the simulation more honest. All belong to the last item of 
 
 At first flight, expect the drone to be controllable but not well tuned, with a few sessions of adjustment to bring it in. A real seesaw rig (see [`Stage1-b.md`](Stage1-b.md)) is the bridge: it allows the simulated and real response to be compared on one axis, the model's parameters corrected and the gains retuned before anything leaves the ground.
 
+## Hardware options and budget
+
+No parts are bought yet. This section records what a budget of $2000 could buy, and what a drone able to lift 20 lb (about 9 kg) would involve. The prices and sizes are rough figures from memory, not quotes; check current listings before buying.
+
+### What the budget must also cover
+
+These are needed whatever the drone's size:
+
+| Item | Rough cost |
+|---|---|
+| Radio transmitter and receiver | $100–250 |
+| Battery charger and power supply | $100–200 |
+| Spare propellers, wiring, connectors, mounting hardware | $100–150 |
+
+That leaves roughly $1400–1700 for the aircraft. The flight controller is the SAME70 board plus a sensor breakout, which is cheap next to everything else.
+
+### Three options
+
+| | Small trainer | Mid-size lifter | Bare-bones 20 lb lifter |
+|---|---|---|---|
+| Payload | under 0.5 kg | 2–4 kg (4–9 lb) | about 9 kg (20 lb) |
+| Take-off weight | 1–1.5 kg | 5–8 kg | 20–25 kg |
+| Layout | quad, 7–10 inch props | quad or hexa, 15–18 inch props | quad, about 30 inch props |
+| Battery | 4S | 6S | 12S |
+| Aircraft cost | $250–400 | $700–1200 | $1500–2000 or more |
+| Fits $2000 | easily, with spares | yes, with spares | barely, with none |
+
+### The 20 lb lifter
+
+Rough sizing:
+
+- **Take-off weight:** the frame, motors and batteries needed to carry 9 kg weigh 10–15 kg themselves, so about 20–25 kg in total.
+- **Thrust:** about twice the weight to stay controllable, so 40–50 kg. On a quad that is 10–12 kg per motor, with propellers around 28–32 inches.
+- **Battery:** 12S (about 44 V) or more, for perhaps 10–20 minutes with the load.
+
+It is possible near $2000 because agricultural drone parts have become cheap. Integrated motor, ESC and propeller units rated around 10–12 kg of thrust sell for somewhere near $150–200 each, so four cost $600–800. A frame adds a few hundred, and one large 12S battery adds $400–500 or more.
+
+That lands at the budget limit, with compromises that matter at this weight:
+
+- **Four motors, not six.** A quad cannot stay up if one motor fails; a hexacopter or octocopter can.
+- **One battery.** A single flight per charge, and a charger for a pack that size is itself expensive.
+- **No spares.** One crash of a 20 kg machine can break more than the remaining budget covers.
+- **Thin thrust margin.** At full load the motors run near their limit, which leaves the controller little room to correct.
+
+Two more things change at this size:
+
+- **Safety.** Propellers of that size can cause severe injury. Testing needs tethers, distance and a kill switch.
+- **Regulation.** In the US, the FAA's limit for small unmanned aircraft is 55 lb (25 kg) total take-off weight including payload, so this design sits at the edge. Check the current rules before buying anything.
+
+### What size means for the flight code
+
+The control code is the same at every size. Only the physics parameters and the gains change.
+
+- **A large drone is slower to rotate.** More inertia means slower dynamics, which is gentler on loop rate and sensor speed than a small quad.
+- **Motor lag is larger.** Big propellers take longer to change speed, which limits how aggressive the gains can be. The motor time constant goes from 30–50 ms to perhaps 100 ms or more.
+- **Six or eight motors need a larger mixer table,** built on the same idea as the X mixer.
+- **The parameters struct covers all three options.** Swapping it shows how the same controller behaves on each before any hardware is bought.
+
+### Recommended order
+
+1. **Small trainer first,** about $350. Crashes while tuning a first flight controller are close to certain, and at this size they cost a few dollars in propellers.
+2. **Mid-size lifter next,** with the remaining $1200–1400. A 3–4 kg payload covers most practical uses, the parts are common, and there is money left for spares and a second battery.
+3. **The 20 lb lifter as a third build,** with its own budget of $3000 or more, after the code has proven itself on the smaller two.
+
 ## Phases
 
 ### Stage 1 — Host simulation, one axis
@@ -273,4 +337,4 @@ At first flight, expect the drone to be controllable but not well tuned, with a 
 - SPI peripheral model and an SPI path for the ICM-42688
 - Altitude hold (needs a barometer or range sensor)
 - Receiver input for stick commands
-- Choosing real parts and replacing the guessed physics parameters
+- Choosing real parts (see [Hardware options and budget](#hardware-options-and-budget)) and replacing the guessed physics parameters
