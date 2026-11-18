@@ -2,7 +2,7 @@
 name = "physics"
 version = "0.1.0"
 edition = "2024"
-description = "Host-side physics models for the quadcopter simulation. Stage 1: a one-axis seesaw."
+description = "Host-side physics models for the quadcopter simulation. Stage 1: a one-axis seesaw. Stage 2: a three-axis quadcopter body."
 
 [dependencies]
 rand = "0.10.4"

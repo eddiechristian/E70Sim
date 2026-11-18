@@ -9,4 +9,6 @@
 
 pub mod gyro;
 pub mod motor;
+pub mod quad;
+pub mod quat;
 pub mod seesaw;

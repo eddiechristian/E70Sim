@@ -7,4 +7,5 @@
 //! `no_std` except under `cargo test`, where the test harness needs `std`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod mixer;
 pub mod pid;
