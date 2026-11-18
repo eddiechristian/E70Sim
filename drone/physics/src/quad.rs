@@ -28,6 +28,19 @@ pub struct MotorCommands {
     pub bl: f32, // back left, spins counter-clockwise
 }
 
+/// What the accelerometer reads, in m/s²: the push felt along each body
+/// axis. Level and still it is `(0, 0, −9.80665)`, because z points down and
+/// the push holding the drone up is upwards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Accel {
+    pub x: f32, // m/s²; positive towards the nose
+    pub y: f32, // m/s²; positive towards the right side
+    pub z: f32, // m/s²; positive towards the belly
+}
+
+/// Standard gravity, in m/s².
+pub const G: f32 = 9.80665;
+
 /// The four motors, named the same way as `MotorCommands`.
 pub struct Motors {
     pub fl: Motor,
@@ -120,6 +133,23 @@ impl Quad {
     /// The true attitude as three angles.
     pub fn angles(&self) -> Angles {
         self.attitude.angles()
+    }
+
+    /// What an accelerometer at the centre reads: the push of the ball joint
+    /// that holds the body up, seen from the body's own axes. Explained in
+    /// `Stage2-b.md` in the repo root.
+    ///
+    /// With w, x, y and z the four numbers of `self.attitude`:
+    ///    ax = −G × 2 × (x×z − w×y)
+    ///    ay = −G × 2 × (y×z + w×x)
+    ///    az = −G × (1 − 2 × (x² + y²))
+    pub fn accel(&self) -> Accel {
+        let Quat { w, x, y, z } = self.attitude;
+        Accel {
+            x: -G * 2.0 * (x * z - w * y),
+            y: -G * 2.0 * (y * z + w * x),
+            z: -G * (1.0 - 2.0 * (x * x + y * y)),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -294,6 +324,94 @@ mod tests {
         };
         run(&mut quad, 0.7, 0.7, 0.7, 0.7, 0.1);
         assert_eq!(quad.rates().pitch, 0.0);
+    }
+
+    // ---- The accelerometer reading. The attitude is a private field, which
+    //      this module can turn directly with `quad.attitude.update(..)`.
+
+    // Turns the attitude of `quad` at the given rates, in °/s, for
+    // `seconds`, without going through the motors.
+    fn turn(quad: &mut Quad, roll: f32, pitch: f32, yaw: f32, seconds: f32) {
+        let rates = Rates {
+            roll: roll.to_radians(),
+            pitch: pitch.to_radians(),
+            yaw: yaw.to_radians(),
+        };
+        let steps = (seconds / DT).round() as usize;
+        for _ in 0..steps {
+            quad.attitude.update(rates, DT);
+        }
+    }
+
+    // Checks an accelerometer reading against the expected one, in m/s².
+    fn assert_accel(accel: Accel, x: f32, y: f32, z: f32) {
+        let got = [accel.x, accel.y, accel.z];
+        let expected = [x, y, z];
+        for (name, (got, expected)) in ["ax", "ay", "az"]
+            .iter()
+            .zip(got.iter().zip(expected.iter()))
+        {
+            assert!(
+                (got - expected).abs() < 0.005,
+                "{name}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_accel_level() {
+        // A new quad: (0, 0, −9.807).
+        let quad = quad();
+        assert_accel(quad.accel(), 0.0, 0.0, -9.807);
+    }
+
+    #[test]
+    fn test_accel_pitched() {
+        // Turned 30° about pitch: (4.903, 0, −8.493).
+        let mut quad = quad();
+        turn(&mut quad, 0.0, 30.0, 0.0, 1.0);
+        assert_accel(quad.accel(), 4.903, 0.0, -8.493);
+    }
+
+    #[test]
+    fn test_accel_rolled() {
+        // Turned 30° about roll: (0, −4.903, −8.493).
+        let mut quad = quad();
+        turn(&mut quad, 30.0, 0.0, 0.0, 1.0);
+        assert_accel(quad.accel(), 0.0, -4.903, -8.493);
+    }
+
+    #[test]
+    fn test_accel_negative_angles() {
+        // The signs reverse with the angles: nose down gives a negative ax,
+        // left side down a positive ay.
+        let mut quad = quad();
+        turn(&mut quad, 0.0, -30.0, 0.0, 1.0);
+        assert_accel(quad.accel(), -4.903, 0.0, -8.493);
+
+        let mut quad = self::quad();
+        turn(&mut quad, -30.0, 0.0, 0.0, 1.0);
+        assert_accel(quad.accel(), 0.0, 4.903, -8.493);
+    }
+
+    #[test]
+    fn test_accel_level_any_yaw() {
+        // Level, turned any amount about yaw: still (0, 0, −9.807).
+        let mut quad = quad();
+        turn(&mut quad, 0.0, 0.0, 77.0, 1.0);
+        assert_accel(quad.accel(), 0.0, 0.0, -9.807);
+    }
+
+    #[test]
+    fn test_accel_is_always_one_g() {
+        // Any attitude: the length √(ax² + ay² + az²) is 9.807.
+        let mut quad = quad();
+        for _ in 0..10 {
+            turn(&mut quad, 200.0, -150.0, 300.0, 0.37);
+            let accel = quad.accel();
+            let length = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
+            assert!((length - G).abs() < 0.001, "length {length}");
+        }
     }
 
     #[test]

@@ -1,19 +1,22 @@
 //! Rate loops on the quad: three PIDs, the X mixer and four motors, CSV on
-//! standard output.
+//! standard output. The estimator watches and its angles are logged next to
+//! the true ones; it is not used for control yet.
 //!
 //! This is the loop of `src/main.rs` with three axes in place of one. The
-//! parts are explained in `Stage2-a.md` in the repo root.
+//! parts are explained in `Stage2-a.md` and `Stage2-b.md` in the repo root.
 //!
 //! Run with `cargo run --bin quad > quad.csv`, then plot with
-//! `python3 plot_quad.py`. `cargo run --bin quad -- --help` lists the
+//! `python3 plot_quad.py` (rates and motors) or `python3 plot_estimator.py`
+//! (estimated against true angles). `cargo run --bin quad -- --help` lists the
 //! arguments.
 
 use clap::{Parser, ValueEnum};
+use flight::estimator::{Estimator, GyroRates};
 use flight::mixer::{MixerInput, mix};
 use flight::pid::Pid;
 use physics::gyro::Gyro;
 use physics::motor::Motor;
-use physics::quad::{Inertia, Motors, Quad};
+use physics::quad::{G, Inertia, Motors, Quad};
 
 // Time
 const DT: f32 = 0.001; // s; one step, 1 kHz
@@ -104,9 +107,22 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     noise: f32,
 
-    /// Loop delay: the PIDs see the readings from this many steps ago
+    /// Loop delay: the PIDs and the estimator see the gyro readings from
+    /// this many steps ago
     #[arg(long, default_value_t = 0)]
     delay: usize,
+
+    /// Gyro bias: a constant error on all three axes, in °/s
+    #[arg(long, default_value_t = 0.0)]
+    gyro_bias: f32,
+
+    /// Accelerometer noise: standard deviation on each axis, in m/s²
+    #[arg(long, default_value_t = 0.0)]
+    accel_noise: f32,
+
+    /// Time constant of the estimator, in seconds
+    #[arg(long, default_value_t = 1.0)]
+    estimator_tau: f32,
 
     /// Seed for the gyro noise; the same seed gives the same run
     #[arg(long, default_value_t = 1)]
@@ -178,6 +194,19 @@ fn main() {
     let mut roll_gyro = Gyro::new(noise, args.delay, args.seed);
     let mut pitch_gyro = Gyro::new(noise, args.delay, args.seed + 1);
     let mut yaw_gyro = Gyro::new(noise, args.delay, args.seed + 2);
+    for gyro in [&mut roll_gyro, &mut pitch_gyro, &mut yaw_gyro] {
+        gyro.bias = args.gyro_bias.to_radians();
+    }
+
+    // One noise source per accelerometer axis, in m/s². `Gyro` is a
+    // noise-and-delay stage for any one number. The accelerometer gets no
+    // delay: the queue of a delayed `Gyro` starts with zeros, which is not
+    // what a still accelerometer reads.
+    let mut accel_x = Gyro::new(args.accel_noise, 0, args.seed + 3);
+    let mut accel_y = Gyro::new(args.accel_noise, 0, args.seed + 4);
+    let mut accel_z = Gyro::new(args.accel_noise, 0, args.seed + 5);
+
+    let mut estimator = Estimator::new(args.estimator_tau);
 
     let mut roll_pid = rate_pid(args.kp, args.ki, args.kd, args.d_filter);
     let mut pitch_pid = rate_pid(args.kp, args.ki, args.kd, args.d_filter);
@@ -189,6 +218,7 @@ fn main() {
          roll_rate,pitch_rate,yaw_rate,\
          roll_measured,pitch_measured,yaw_measured,\
          roll_angle,pitch_angle,yaw_angle,\
+         roll_estimate,pitch_estimate,\
          roll_output,pitch_output,yaw_output,\
          fl,fr,br,bl"
     );
@@ -217,6 +247,21 @@ fn main() {
             yaw: true_angles.yaw.to_degrees(),
         };
 
+        //    The accelerometer, in m/s², and the estimator, which takes the
+        //    same gyro readings as the PIDs and the accelerometer in g.
+        let true_accel = quad.accel();
+        let accel = flight::estimator::Accel {
+            x: accel_x.read(true_accel.x) / G,
+            y: accel_y.read(true_accel.y) / G,
+            z: accel_z.read(true_accel.z) / G,
+        };
+        let gyro_rates = GyroRates {
+            roll: measured.roll,
+            pitch: measured.pitch,
+            yaw: measured.yaw,
+        };
+        let estimate = estimator.update(gyro_rates, accel, DT);
+
         // 2. Run the three PIDs.
         let output = PerAxis {
             roll: roll_pid.update(target.roll, measured.roll, DT),
@@ -242,6 +287,7 @@ fn main() {
              {:.3},{:.3},{:.3},\
              {:.3},{:.3},{:.3},\
              {:.3},{:.3},{:.3},\
+             {:.3},{:.3},\
              {:.5},{:.5},{:.5},\
              {:.5},{:.5},{:.5},{:.5}",
             target.roll,
@@ -256,6 +302,8 @@ fn main() {
             angle.roll,
             angle.pitch,
             angle.yaw,
+            estimate.roll,
+            estimate.pitch,
             output.roll,
             output.pitch,
             output.yaw,

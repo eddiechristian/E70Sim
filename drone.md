@@ -185,6 +185,33 @@ Limits:
 
 The simulation helps here because the physics model knows the true angle, which a real drone never does. Plotting the estimator's angle against the true one shows exactly how much it lags, drifts or is disturbed, before the angle loop depends on it.
 
+### Calibration before flight
+
+For a second or two after power-on the controls are locked out. The motors are off, the drone sits still, and the flight code collects sensor readings. Real flight controllers do the same; it is usually called calibration or the pre-arm check.
+
+The readings are used for three things:
+
+- **Starting angle.** The accelerometer readings are averaged and the estimator is set from the average. Without this the estimator starts from a single noisy reading, which in the Stage 2b runs was 1.4° off and took a few seconds to recover. Averaging 1000 readings cuts the noise by about 30 times, to about 0.05°.
+- **Gyro bias.** A still drone has a true rate of zero, so whatever the gyro reads on average is its bias. It is stored and subtracted from every later reading. Without this, a bias of 1 °/s makes the rate loops slowly turn the drone, because they trust the gyro.
+- **A stillness check.** If the gyro readings vary too much during the window, someone is moving the drone. The readings are discarded and the window starts again. Arming is not allowed until one clean window is in.
+
+Three points about it:
+
+- **The drone has to be still, not level.** On a slope, the averaged accelerometer correctly reports the slope as the starting angle.
+- **The motors are off, so there is no vibration.** These are the cleanest readings the sensors ever give.
+- **The bias drifts as the chip warms up.** After a few minutes the value measured at start-up is no longer exact. The estimator's slow pull towards the accelerometer covers that for roll and pitch, which is a reason to keep both mechanisms.
+
+It is built in two steps:
+
+1. **A simple version with the angle loop,** the third Stage 2 item. That is the first point where the estimate steers the drone, so a starting error would show as a lurch at the start of every run. Each simulated run begins with one second of motors off, calibrating, and then the controls are released.
+2. **The full arming logic in Stage 3.** Disarmed means motors off and calibration allowed; arming is refused until calibration has succeeded.
+
+In the code:
+
+- **`flight` crate:** a `Calibration` type that is fed gyro and accelerometer readings and reports "still collecting", "failed, the drone moved" or "done", with the starting attitude and the three gyro biases.
+- **Estimator:** a way to set the starting attitude directly. The first-reading rule stays as the fallback.
+- **Simulation:** the body sits still with the motors off during the window. It is held at its centre, so it does not fall.
+
 ## Physics model
 
 - Motor: command → rotor speed with a first-order lag (time constant around 30–50 ms).
@@ -311,15 +338,15 @@ The control code is the same at every size. Only the physics parameters and the 
 ### Stage 2 — Host simulation, self-levelling attitude
 
 - [x] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
-- [ ] Complementary filter; compare its angles with the true angles from the physics — introduced in [The estimator](#the-estimator), explained in full in [`Stage2-b.md`](Stage2-b.md)
-- [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw
+- [x] Complementary filter; compare its angles with the true angles from the physics — introduced in [The estimator](#the-estimator), explained in full in [`Stage2-b.md`](Stage2-b.md)
+- [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw; a simple start-up calibration first (see [Calibration before flight](#calibration-before-flight))
 - [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor
 
 ### Stage 3 — Host simulation, hover
 
 - [ ] Full 6DOF: gravity, translation, ground
 - [ ] Fixed hover throttle, then throttle compensated for tilt
-- [ ] Arming, motor limits, and a cut-off when tilted past a safe angle
+- [ ] Arming, motor limits, and a cut-off when tilted past a safe angle; arming is refused until [calibration](#calibration-before-flight) has succeeded
 
 ### ✅ Milestone A: stable self-levelling hover in the host simulation
 

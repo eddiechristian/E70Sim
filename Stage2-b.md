@@ -274,7 +274,7 @@ impl Estimator {
 }
 ```
 
-This is the simple version, without the terms of [Turning while tilted](#turning-while-tilted). It has not been compiled.
+This is the simple version, without the terms of [Turning while tilted](#turning-while-tilted). The real code is in `drone/flight/src/estimator.rs`; it has those terms and the check on `dt`.
 
 ### Choices to make in the code
 
@@ -289,6 +289,7 @@ This is the simple version, without the terms of [Turning while tilted](#turning
 - **`Quad::accel()`** returns the reading from the quaternion, with the formulas above. It is exact; noise is added outside it.
 - **Noise and delay** can come from the existing `Gyro`, which is a noise-and-delay stage for one number and does not care what the number is. Three more of them serve the accelerometer's axes.
 - **A gyro bias** is one new field, added to every reading. Zero by default, so every earlier run stays the same.
+- **A delay starts with zeros, which is wrong for the accelerometer.** The `Gyro` fills its queue with zeros for the readings "from before the run", which is right for a rate at rest. For the accelerometer's z axis the reading at rest is −9.807, not 0. With a delay of two steps, the estimator's first two readings would be (0, 0, 0), and its first-reading rule would start from a meaningless angle. Either run the accelerometer with no delay, or give the queue a starting value.
 
 ## Tests
 
@@ -363,9 +364,35 @@ The quad program of [Stage 2a](Stage2-a.md#in-the-simulation) gains:
 
 The estimate is not used for control yet. The rate loops run as before, and the estimator only watches. That keeps this item's question simple: is the estimate right?
 
+## Results
+
+The estimator, the accelerometer reading and the gyro bias are written, with the tests above, and the quad program runs them. `./stage2-b.sh` in `drone/sim/` saves the pictures in [`drone/sim/stage2-b/`](drone/sim/stage2-b/README.md). Each run is 3 s, with the rate loops turning the body to 50° of roll unless stated.
+
+| Run | Start | End | Wobble |
+|---|---|---|---|
+| no noise | 0° | 0° | none |
+| gyro noise 2 °/s, delay 2 steps, accelerometer noise 0.5 m/s² | 1.41° | 0.09° | 0.05° |
+| the same, target rate 0, gyro bias 1 °/s | 1.41° | 1.01° | 0.03° |
+| the same bias, τ = 0.5 s | 1.41° | 0.52° | 0.07° |
+| noise, τ = 0.05 s (α = 0.98 at 1 kHz) | 1.41° | 0.01° | 0.28° |
+| noise, τ = 5 s | 1.41° | 0.82° | 0.08° |
+
+"Start" is the error of the first estimate, "end" the average error over the last second and "wobble" its standard deviation there, all for roll.
+
+- **The formulas hold.** With no noise the estimate is exact through a turn to 50°. A bias of 1 °/s leaves 1° with τ = 1 s and half that with τ = 0.5 s.
+- **τ = 1 s is a reasonable start.** The 0.05 s that α = 0.98 would have meant gives about six times the wobble. At 5 s the estimate is quiet but has hardly begun to correct after 3 s.
+- **On the real body, turning while tilted is handled.** In the test that tilts the body about 25° and spins it up to 87 °/s of yaw, the worst error is 0.02°. With the simple version in its place the same test gives 23°.
+
+Two things that the runs showed and the plan above did not foresee:
+
+- **The first estimate is one noisy reading.** With accelerometer noise of 0.5 m/s², it starts 1.4° off, and the filter then needs a few time constants to recover. That is acceptable for these runs. Before the angle loop relies on it, the start should be the average of a number of readings taken while the drone sits still. [Calibration before flight](drone.md#calibration-before-flight) in `drone.md` describes that step, which comes with the angle loop.
+- **A gyro bias moves the drone, not only the estimate.** The rate loops trust the gyro. With a gyro reading 1 °/s too high they hold the body at −1 °/s to see zero, and the drone slowly turns. The estimator cannot fix that; a real flight controller measures the bias while still on the ground and subtracts it, in the same [calibration](drone.md#calibration-before-flight) step. The angle loop of the next item will also counter it, since it steers by the angle.
+
 ## What to expect
 
-From a trial of these formulas, with τ = 1 s:
+This section is the forecast made before the code was written, from a trial of the formulas. [Results](#results) has what the real code gave.
+
+With τ = 1 s:
 
 | Run | Result |
 |---|---|
@@ -380,7 +407,7 @@ The picture to look for is the estimate hugging the true angle through fast move
 
 ## Where this goes next
 
-- The next Stage 2 item puts an angle loop around the rate loops on roll and pitch. Its measurement is this estimate, and from then on an estimator error is a flight error.
+- The next Stage 2 item puts an angle loop around the rate loops on roll and pitch, and starts each run with a short [calibration](drone.md#calibration-before-flight). Its measurement is this estimate, and from then on an estimator error is a flight error.
 - The disturbance tests after that include a start from 30°, which the first-reading rule above makes possible.
 - Stage 3 adds movement and thrust. The accelerometer then reads thrust and drag instead of the ball joint's push, which is the hard case described under [Limits](#limits).
 - If the per-angle arithmetic proves inadequate, the Mahony filter does the same job on a quaternion, with no trouble at 90° of pitch or at ±180° of roll.

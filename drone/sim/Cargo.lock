@@ -133,6 +133,9 @@ dependencies = [
 [[package]]
 name = "flight"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "getrandom"

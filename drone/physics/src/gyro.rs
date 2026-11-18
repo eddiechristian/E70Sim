@@ -11,6 +11,7 @@ use rand_distr::{Distribution, Normal};
 pub struct Gyro {
     // Parameters
     pub noise_std: f32, // rad/s; standard deviation of the error. 0.0 means no noise
+    pub bias: f32,      // rad/s; a constant error added to every reading. 0.0 means none
 
     // State
     rng: StdRng,         // seeded, so two runs with the same seed match
@@ -23,6 +24,7 @@ impl Gyro {
     pub fn new(noise_std: f32, delay_steps: usize, seed: u64) -> Self {
         Self {
             noise_std,
+            bias: 0.0,
             rng: StdRng::seed_from_u64(seed),
             // The model starts at rest, so the readings from before the run
             // began are zeros.
@@ -34,6 +36,7 @@ impl Gyro {
     ///
     /// 1. Add noise to the true rate: one sample from a normal distribution
     ///    with mean 0 and standard deviation `noise_std` (`rand_distr::Normal`).
+    ///    Add the bias as well.
     /// 2. Put the noisy reading at the back of the queue.
     /// 3. Return the reading at the front, which is `delay_steps` old.
     pub fn read(&mut self, true_rate: f32) -> f32 {
@@ -44,7 +47,7 @@ impl Gyro {
             _ => 0.0,
         };
 
-        self.held.push_back(true_rate + noise);
+        self.held.push_back(true_rate + self.bias + noise);
         // Never empty: a reading was pushed on the line above.
         self.held.pop_front().unwrap()
     }
@@ -120,5 +123,36 @@ mod tests {
     #[test]
     fn test_different_seed_different_readings() {
         assert!(noisy_readings(7) != noisy_readings(8));
+    }
+
+    // ---- Stage 2b: the bias
+
+    #[test]
+    fn test_no_bias_by_default() {
+        // `Gyro::new` sets `bias` to 0.0: with no noise and no delay the
+        // reading is exactly the true rate.
+        let mut gyro = Gyro::new(0.0, 0, 1);
+        assert_eq!(gyro.bias, 0.0);
+        assert_eq!(gyro.read(0.5), 0.5);
+    }
+
+    #[test]
+    fn test_bias_is_added() {
+        // No noise, no delay, `bias` 0.02 rad/s: a true rate of 0.5 reads
+        // 0.52, and a true rate of 0.0 reads 0.02.
+        let mut gyro = Gyro::new(0.0, 0, 1);
+        gyro.bias = 0.02;
+        assert!((gyro.read(0.5) - 0.52).abs() < 1e-6);
+        assert!((gyro.read(0.0) - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bias_shifts_the_average_of_noisy_readings() {
+        // Noise of 2.0 around a true rate of 10.0, with a bias of 1.0: the
+        // average is 11.0.
+        let mut gyro = Gyro::new(2.0, 0, 1);
+        gyro.bias = 1.0;
+        let readings: Vec<f32> = (0..10_000).map(|_| gyro.read(10.0)).collect();
+        assert!((mean(&readings) - 11.0).abs() < 0.1);
     }
 }

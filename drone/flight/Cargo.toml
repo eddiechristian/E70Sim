@@ -5,6 +5,8 @@ edition = "2024"
 description = "Quadcopter flight code: estimator, PIDs and mixer. no_std, no hardware access."
 
 [dependencies]
+# atan2, sqrt, sin, cos and tan for f32, which core does not have.
+libm = "0.2"
 
 # This is a separate project from the emulator in the repo root.
 [workspace]

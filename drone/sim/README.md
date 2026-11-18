@@ -144,6 +144,9 @@ cargo run --bin quad -- --help
 | `--d-filter` | time constant of the D-term low-pass filter on all three axes, in s | 0.01 |
 | `--thrust-coeff` | thrust of each motor at full speed, in N | 6.0 |
 | `--noise`, `--delay`, `--seed` | as for the seesaw; each axis has its own gyro | 0, 0, 1 |
+| `--gyro-bias` | a constant error on all three gyro axes, in °/s | 0 |
+| `--accel-noise` | accelerometer noise on each axis: standard deviation in m/s² | 0 |
+| `--estimator-tau` | time constant of the estimator, in s | 1 |
 
 The body's size (arm length, the three inertias, the yaw coefficient) and the limits are constants at the top of `src/bin/quad.rs`.
 
@@ -162,7 +165,25 @@ To save pictures of a step on each axis:
 
 This runs five cases (a step on roll, pitch and yaw, then roll and yaw again with noise and delay), prints the figures for each with `measure_quad.py` and saves numbered pictures into `stage2-a/`. [`stage2-a/README.md`](stage2-a/README.md) lists them. `python3 measure_quad.py quad.csv` prints the same figures for any run.
 
-The CSV columns:
+### The estimator
+
+The estimator of [`Stage2-b.md`](../../Stage2-b.md) runs in the same program. It is given the gyro readings and an accelerometer reading every step, and its roll and pitch are logged next to the true ones. It is not used for control yet.
+
+```
+cargo run --bin quad -- --noise 2 --delay 2 --accel-noise 0.5 > quad.csv
+python3 plot_estimator.py
+python3 measure_estimator.py quad.csv
+```
+
+`plot_estimator.py` draws three panels: roll and pitch, each as the true angle and the estimate, then the error of both. `measure_estimator.py` prints the error at the start and over the last second.
+
+```
+./stage2-b.sh
+```
+
+This runs seven cases (clean, noisy, a gyro bias, and three other time constants), prints their figures and saves numbered pictures into `stage2-b/`. [`stage2-b/README.md`](stage2-b/README.md) lists them.
+
+### The quad's CSV columns
 
 | Columns | Unit | Meaning |
 |---|---|---|
@@ -171,6 +192,7 @@ The CSV columns:
 | `roll_rate`, `pitch_rate`, `yaw_rate` | °/s | the true rates |
 | `roll_measured`, `pitch_measured`, `yaw_measured` | °/s | what the PIDs were told |
 | `roll_angle`, `pitch_angle`, `yaw_angle` | ° | the true attitude |
+| `roll_estimate`, `pitch_estimate` | ° | the estimator's roll and pitch |
 | `roll_output`, `pitch_output`, `yaw_output` | throttle | what the PIDs returned |
 | `fl`, `fr`, `br`, `bl` | 0–1 | the four motor commands |
 
@@ -193,4 +215,4 @@ The CSV columns:
 cargo test
 ```
 
-The tests cover the seesaw program's `target_at` and `mix`, the quad program's `targets_at`, and the mixer and the body together (`tests/mixer_and_body.rs`). The PID, the mixer, the motor, the seesaw, the gyro, the quaternion and the body have their own tests in `../flight` and `../physics`.
+The tests cover the seesaw program's `target_at` and `mix`, the quad program's `targets_at`, the mixer and the body together (`tests/mixer_and_body.rs`), and the estimator and the body together (`tests/estimator_and_body.rs`). The PID, the mixer, the estimator, the motor, the seesaw, the gyro, the quaternion and the body have their own tests in `../flight` and `../physics`.
