@@ -1,0 +1,13 @@
+[package]
+name = "sim"
+version = "0.1.0"
+edition = "2024"
+description = "Host simulation: runs the flight code against the physics model and writes a CSV."
+
+[dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+flight = { path = "../flight" }
+physics = { path = "../physics" }
+
+# This is a separate project from the emulator in the repo root.
+[workspace]

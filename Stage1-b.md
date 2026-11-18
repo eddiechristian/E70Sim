@@ -60,6 +60,6 @@ The lack of drag is the important difference. With no controller, any imbalance 
 
 ## Where this goes next
 
-- The next Stage 1 item, `drone/sim/`, runs the PID and the seesaw together in a loop and writes a CSV to plot.
+- The next Stage 1 item, `drone/sim/`, runs the PID and the seesaw together in a loop and writes a CSV to plot. It is explained in [`Stage1-c.md`](Stage1-c.md).
 - The last Stage 1 item adds sensor noise and loop delay to this model. Motor lag is already in step 1 above.
 - Stage 2 replaces the bar with a full three-axis body and four motors, reusing the motor and thrust parts unchanged.
