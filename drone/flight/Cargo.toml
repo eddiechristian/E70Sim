@@ -1,0 +1,10 @@
+[package]
+name = "flight"
+version = "0.1.0"
+edition = "2024"
+description = "Quadcopter flight code: estimator, PIDs and mixer. no_std, no hardware access."
+
+[dependencies]
+
+# This is a separate project from the emulator in the repo root.
+[workspace]

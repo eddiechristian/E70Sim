@@ -8,3 +8,6 @@
 /firmware/hello-rs/target
 /firmware/float-rs/target
 /firmware/gyro-rs/target
+
+# Drone crates build output
+/drone/*/target
