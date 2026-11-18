@@ -62,15 +62,15 @@ Seen from above, with the nose at the top:
               back
 ```
 
-| Index | Name | Position | Spins (seen from above) |
+| Field | Name | Position | Spins (seen from above) |
 |---|---|---|---|
-| 0 | FL | front left | clockwise |
-| 1 | FR | front right | counter-clockwise |
-| 2 | BR | back right | clockwise |
-| 3 | BL | back left | counter-clockwise |
+| `fl` | FL | front left | clockwise |
+| `fr` | FR | front right | counter-clockwise |
+| `br` | BR | back right | clockwise |
+| `bl` | BL | back left | counter-clockwise |
 
 - **The X layout** means the arms sit at 45° to the nose, so there are two motors at the front and two at the back. The alternative, a plus layout, has one motor at the front.
-- **The order** goes clockwise from the front left. It is this project's own choice. The physics and the mixer are in separate crates that do not know about each other, so the order has to be written down in both and checked by a test.
+- **The motors are named, not numbered.** In the code each is a field (`fl`, `fr`, `br`, `bl`) of a struct. The physics and the mixer are in separate crates that do not know about each other, and matching motors by name means no list order has to agree between them. The numbers in the drawing only show the order going clockwise from the front left.
 - **Diagonal pairs spin the same way.** The reason is under [Yaw](#yaw) below.
 
 ## The physics, step by step
@@ -362,7 +362,7 @@ Three notes:
 - **Named fields prevent swapped arguments.** `mix(0.7, 0.05, 0.0, 0.0)` compiles whichever way round the numbers are; `MixerInput { throttle: 0.7, roll: 0.05, pitch: 0.0, yaw: 0.0 }` cannot be misread.
 
 - **The quaternion is small enough to write by hand:** a struct of four numbers and the three operations above. The estimator may want it later, so it is worth understanding. A maths crate such as `glam` is the alternative.
-- **The simulation's loop keeps its shape.** Step 1 reads three rates, step 2 runs three PIDs, step 3 calls the new mixer and step 4 steps the new body. The CSV gains columns for the extra axes and motors.
+- **The simulation's loop keeps its shape.** Step 1 reads three rates, step 2 runs three PIDs, step 3 calls the new mixer and step 4 steps the new body. The CSV gains columns for the extra axes and motors. This loop is a second program, `drone/sim/src/bin/quad.rs`, described under [In the simulation](#in-the-simulation).
 
 ## Tests
 
@@ -423,8 +423,38 @@ A trial of these equations, with throttle 0.7 and a command of 0.05 held for hal
 
 With no controller a small command tumbles the drone within half a second, as the seesaw did. Yaw moves at a sixteenth of the pace.
 
+## In the simulation
+
+The body and the mixer are wired into the simulation as a second program, next to the seesaw's:
+
+```
+cd drone/sim
+cargo run --bin quad > quad.csv
+python3 plot_quad.py
+```
+
+It is the Stage 1 loop with three of everything: three gyros, three rate PIDs, the mixer and the body. One axis, chosen with `--axis`, is asked for 50 °/s for a second, and the other two are held at 0. [`drone/sim/README.md`](drone/sim/README.md#the-quad) lists the arguments and the CSV columns.
+
+There is no angle loop yet, so this is rate control only: the drone turns at the rate asked for and stays at whatever angle it ends up at. The angle loop is a later Stage 2 item.
+
+With the default gains, a 50 °/s step gives:
+
+| Axis | Rise to 90% | Overshoot | Settled within 5% | Other two axes | Motor commands |
+|---|---|---|---|---|---|
+| Roll | 0.11 s | 0.9% | 0.13 s | stay at 0 | 0.63 to 0.77 |
+| Pitch | 0.11 s | 0.9% | 0.13 s | stay at 0 | 0.63 to 0.77 |
+| Yaw | 0.19 s | 2.6% | 0.21 s | stay at 0 | 0.40 to 1.00 |
+
+- **Roll and pitch are identical,** as they should be for a symmetric body.
+- **Yaw is slower and works the motors far harder.** Its output reaches the ±0.3 limit, and two motors reach full power for a moment. That is the weak yaw of this layout showing up in closed loop.
+- **With `--noise 2 --delay 2`** the figures barely change, and the two axes that are held at 0 wander by about 0.6 °/s.
+
+Pictures of these runs are in [`drone/sim/stage2-a/`](drone/sim/stage2-a/README.md), and `./stage2-a.sh` in `drone/sim/` regenerates them.
+
+The roll and pitch gains are the ones chosen in [`Stage1-d.md`](Stage1-d.md), divided by √2, because one unit of PID output turns the quad √2 times harder than it turned the seesaw. The yaw gain is a first guess, not a tuned value.
+
 ## Where this goes next
 
-- The next Stage 2 item is the estimator. It needs an accelerometer reading, which the body can supply once it knows which way is down: the direction of gravity seen from the drone's frame comes from the same quaternion.
+- The next Stage 2 item is the estimator, explained in [`Stage2-b.md`](Stage2-b.md). It needs an accelerometer reading, which the body can supply once it knows which way is down: the direction of gravity seen from the drone's frame comes from the same quaternion.
 - The item after puts three rate PIDs and two angle loops around this body.
 - Stage 3 adds gravity and movement. The total thrust, which this item ignores, then decides whether the drone climbs or falls.

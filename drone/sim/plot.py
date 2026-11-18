@@ -10,7 +10,7 @@ Usage:
 To compare pictures, give them the same axes:
     python3 plot.py run.csv run.png --rate-range -15 70 --command-range 0.45 0.95
 
-Needs matplotlib: pip install --user matplotlib
+Needs matplotlib: sudo apt install python3-matplotlib
 """
 
 import argparse

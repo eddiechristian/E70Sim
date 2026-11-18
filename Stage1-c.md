@@ -178,7 +178,7 @@ Anything that is not data (a note, a warning) should go to standard error with `
 
 ## The plot script
 
-The script reads `run.csv` and draws the graph. It is a separate small file, `drone/sim/plot.py`, in Python with the `matplotlib` library, which needs installing once (`pip install --user matplotlib`). A spreadsheet works too for a first look.
+The script reads `run.csv` and draws the graph. It is a separate small file, `drone/sim/plot.py`, in Python with the `matplotlib` library, which needs installing once (`sudo apt install python3-matplotlib` on Ubuntu). A spreadsheet works too for a first look.
 
 Two panels, one above the other with a shared time axis, are enough:
 

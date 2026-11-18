@@ -3,6 +3,7 @@ name = "sim"
 version = "0.1.0"
 edition = "2024"
 description = "Host simulation: runs the flight code against the physics model and writes a CSV."
+default-run = "sim" # plain `cargo run` is the seesaw; `cargo run --bin quad` is the quad
 
 [dependencies]
 clap = { version = "4.6.8", features = ["derive"] }

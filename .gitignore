@@ -14,3 +14,4 @@
 
 # Drone simulation: the default run output (the cases in drone/sim/runs are kept)
 /drone/sim/run.csv
+/drone/sim/quad.csv

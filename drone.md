@@ -175,7 +175,7 @@ angle       = 0.98 × gyro_angle + 0.02 × accel_angle
 
 The gyro drives the angle from step to step, and the accelerometer pulls it a small amount towards its own answer each time. The drift is corrected continuously, and the accelerometer's noise is diluted to 2% per step. The name comes from the two weights adding up to 1.
 
-The 0.98 is the tuning knob, and a starting value, not a tuned one. Higher trusts the gyro more: smoother, but slower to correct drift. Lower trusts the accelerometer more: quicker correction, but more noise and more disturbance from sideways acceleration.
+The 0.98 is the tuning knob, and only an illustration: its effect depends on the loop rate. [`Stage2-b.md`](Stage2-b.md#use-a-time-constant-not-α) replaces it with a time constant in seconds, starting at 1 s. Higher trusts the gyro more: smoother, but slower to correct drift. Lower trusts the accelerometer more: quicker correction, but more noise and more disturbance from sideways acceleration.
 
 Limits:
 
@@ -310,8 +310,8 @@ The control code is the same at every size. Only the physics parameters and the 
 
 ### Stage 2 — Host simulation, self-levelling attitude
 
-- [ ] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
-- [ ] Complementary filter; compare its angles with the true angles from the physics — explained in [The estimator](#the-estimator)
+- [x] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
+- [ ] Complementary filter; compare its angles with the true angles from the physics — introduced in [The estimator](#the-estimator), explained in full in [`Stage2-b.md`](Stage2-b.md)
 - [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw
 - [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor
 
