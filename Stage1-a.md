@@ -427,6 +427,6 @@ With PI, the I term keeps growing while any error remains. It stops at +1, which
 
 ## Where this goes next
 
-- The seesaw model and the rate loop that uses this PID are the next two items of [Stage 1](drone.md#stage-1--host-simulation-one-axis).
+- The seesaw model, explained in [`Stage1-b.md`](Stage1-b.md), and the rate loop that uses this PID are the next two items of [Stage 1](drone.md#stage-1--host-simulation-one-axis).
 - The D-term low-pass filter arrives with sensor noise, in the last item of Stage 1.
 - The outer angle loop in Stage 2 reuses the same `Pid` with only `Kp` set, and its output limit caps the commanded rate.

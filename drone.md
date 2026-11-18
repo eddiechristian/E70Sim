@@ -190,16 +190,53 @@ The simulation helps here because the physics model knows the true angle, which 
 - Sensor model: gyro and accelerometer readings with noise, bias and one sample of delay.
 - Disturbances: a torque kick or steady wind, to test recovery.
 
-The parameters (mass, inertia, arm length, thrust coefficient, motor lag) are guesses until parts are chosen. Keep them in one struct so a real airframe can be dropped in. The gains will need retuning on hardware; the simulation proves the structure, signs, mixer and timing.
+The parameters (mass, inertia, arm length, thrust coefficient, motor lag) are guesses until parts are chosen. Keep them in one struct so a real airframe can be dropped in.
+
+### How accurate the model is
+
+The model is accurate enough to get the code right and a first set of gains in the right range. It is not accurate enough to skip tuning on the real drone. That is the normal result for flight-controller simulation.
+
+What transfers to the real drone:
+
+- **Code correctness:** signs, axis conventions, the mixer, unit conversions, anti-windup, arming logic and timing. Most first-flight crashes come from these, and the simulation tests them exactly.
+- **Controller structure:** the cascaded loops, loop rates and estimator design stay the same.
+- **Behaviour under stress:** saturation, a weak motor, recovery from a large tilt and sensor dropouts can all be tested safely.
+- **Rough gains:** with the physical parameters measured (see the table below), simulated gains are usually within a factor of two or so of the final ones, which is a flyable starting point.
+
+What does not:
+
+- **Final gains.** These always need adjusting in flight.
+- **Vibration.** A real frame shakes, and propeller vibration reaches the gyro as noise much larger than the sensor's own. This is the biggest gap. It drives the D-term filtering and limits how high the gains can go, and a rigid-body model has none of it.
+- **Aerodynamics.** The model has thrust proportional to speed squared and nothing else. Real propellers lose thrust in forward flight, interact with each other and behave differently near the ground. For a hover this matters little.
+- **Motor and ESC detail.** A first-order lag is a decent approximation, but real motors speed up faster than they slow down, respond differently at low and high throttle, and sag as the battery drains.
+
+The model's equations are fine for a hover. Its accuracy depends almost entirely on four numbers:
+
+| Parameter | How to get it |
+|---|---|
+| Mass | weigh it |
+| Inertia | hang the drone from two strings and time its swing (a bifilar pendulum), or calculate from component masses and positions |
+| Thrust coefficient | motor manufacturer's thrust table, or a kitchen scale and a test stand |
+| Motor time constant | log the motor speed response to a step command, or use a typical 30–50 ms |
+
+With those measured, a hover simulation is good. Without them, it is only qualitatively right.
+
+Three additions make the simulation more honest. All belong to the last item of Stage 1:
+
+- **Noise well above the datasheet figure,** to stand in for vibration.
+- **Loop delay:** one or two samples of sensor and computation delay.
+- **Margin testing:** check that the gains still work with inertia and thrust each off by ±30%. Gains that only work on the exact model will not survive contact with hardware; gains that tolerate that spread usually do.
+
+At first flight, expect the drone to be controllable but not well tuned, with a few sessions of adjustment to bring it in. A real seesaw rig (see [`Stage1-b.md`](Stage1-b.md)) is the bridge: it allows the simulated and real response to be compared on one axis, the model's parameters corrected and the gains retuned before anything leaves the ground.
 
 ## Phases
 
 ### Stage 1 — Host simulation, one axis
 
 - [ ] `drone/flight/`: PID with output limits and integrator anti-windup; unit tests — explained in [`Stage1-a.md`](Stage1-a.md)
-- [ ] `drone/physics/`: one axis, two motors (a seesaw)
+- [ ] `drone/physics/`: one axis, two motors (a seesaw) — explained in [`Stage1-b.md`](Stage1-b.md)
 - [ ] `drone/sim/`: rate loop holding a target rate; CSV output and a plot script
-- [ ] Add motor lag, sensor noise and loop delay; retune
+- [ ] Add motor lag, sensor noise and loop delay; retune, and check the gains still work with inertia and thrust off by ±30% (see [How accurate the model is](#how-accurate-the-model-is))
 
 ### Stage 2 — Host simulation, self-levelling attitude
 
