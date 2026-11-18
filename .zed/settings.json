@@ -1,0 +1,19 @@
+// Project settings for Zed.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // Tell rust-analyzer explicitly which Cargo.toml files to load. The
+        // paths are relative to the folder opened in Zed (this repository's
+        // root).
+        "linkedProjects": [
+          "Cargo.toml",
+          "firmware/gyro-rs/Cargo.toml",
+          "drone/flight/Cargo.toml",
+          "drone/physics/Cargo.toml",
+          "drone/sim/Cargo.toml"
+        ]
+      }
+    }
+  }
+}
