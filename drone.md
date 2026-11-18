@@ -297,10 +297,10 @@ The control code is the same at every size. Only the physics parameters and the 
 
 ### Stage 1 — Host simulation, one axis
 
-- [ ] `drone/flight/`: PID with output limits and integrator anti-windup; unit tests — explained in [`Stage1-a.md`](Stage1-a.md)
-- [ ] `drone/physics/`: one axis, two motors (a seesaw) — explained in [`Stage1-b.md`](Stage1-b.md)
-- [ ] `drone/sim/`: rate loop holding a target rate; CSV output and a plot script — explained in [`Stage1-c.md`](Stage1-c.md)
-- [ ] Add sensor noise and loop delay (motor lag is already in the seesaw); retune, and check the gains still work with inertia and thrust off by ±30% (see [How accurate the model is](#how-accurate-the-model-is)) — noise and delay explained in [`Stage1-d.md`](Stage1-d.md)
+- [x] `drone/flight/`: PID with output limits and integrator anti-windup; unit tests — explained in [`Stage1-a.md`](Stage1-a.md)
+- [x] `drone/physics/`: one axis, two motors (a seesaw) — explained in [`Stage1-b.md`](Stage1-b.md)
+- [x] `drone/sim/`: rate loop holding a target rate; CSV output and a plot script — explained in [`Stage1-c.md`](Stage1-c.md)
+- [x] Add sensor noise and loop delay (motor lag is already in the seesaw); retune, and check the gains still work with inertia and thrust off by ±30% (see [How accurate the model is](#how-accurate-the-model-is)) — explained in [`Stage1-d.md`](Stage1-d.md)
 
 ### Stage 2 — Host simulation, self-levelling attitude
 
