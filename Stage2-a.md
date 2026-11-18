@@ -266,7 +266,7 @@ The mixer is the physics of step 2 run backwards. The physics answers "given fou
 | pitch | the pitch rate PID | positive to raise the nose |
 | yaw | the yaw rate PID | positive to turn right |
 
-The output is four motor commands, each 0.0 to 1.0, in the order FL, FR, BR, BL.
+The output is four motor commands, each 0.0 to 1.0, named by position: `fl`, `fr`, `br` and `bl`.
 
 ### The formula
 
@@ -325,7 +325,7 @@ These are tighter than Stage 1's ±0.3, and the retune has to respect them.
 
 ### Where the mixer lives
 
-In `drone/flight/`, because the firmware needs the identical function. It is a pure function with no state: four numbers in, four out. The Stage 1 `mix` in `drone/sim/` stays with the seesaw.
+In `drone/flight/`, because the firmware needs the identical function. It is a pure function with no state: four numbers in, four out, each set held in a named struct. The Stage 1 `mix` in `drone/sim/` stays with the seesaw.
 
 ## Shape of the code
 
@@ -336,15 +336,30 @@ drone/physics/
     quat        a quaternion: update from rates, normalise, convert to angles
     quad        the body: four Motors, three inertias, arm length, c,
                 the three rates and the attitude
-                    step(four motor commands, dt)
-                    rates()   -> roll, pitch and yaw rate, rad/s
-                    angles()  -> roll, pitch and yaw, rad
+                    step(MotorCommands, dt)
+                    rates()   -> Rates
+                    angles()  -> Angles
 
 drone/flight/
-    mixer       mix(throttle, roll, pitch, yaw) -> four motor commands
+    mixer       mix(MixerInput) -> MotorCommands
 ```
 
-Two notes:
+Every value that crosses a function boundary has a named type, so nothing is passed as a bare tuple or array:
+
+| Type | Crate | Fields | Unit |
+|---|---|---|---|
+| `MixerInput` | `flight` | `throttle`, `roll`, `pitch`, `yaw` | fractions of full motor command |
+| `MotorCommands` | `flight` and `physics` | `fl`, `fr`, `br`, `bl` | 0.0 to 1.0 |
+| `Motors` | `physics` | `fl`, `fr`, `br`, `bl` | four `Motor`s |
+| `Inertia` | `physics` | `ixx`, `iyy`, `izz` | kg·m² |
+| `Rates` | `physics` | `roll`, `pitch`, `yaw` | rad/s |
+| `Angles` | `physics` | `roll`, `pitch`, `yaw` | rad |
+
+`MotorCommands` exists twice because neither crate depends on the other. The simulation copies one into the other field by field, so a motor is always matched by name and never by its place in a list.
+
+Three notes:
+
+- **Named fields prevent swapped arguments.** `mix(0.7, 0.05, 0.0, 0.0)` compiles whichever way round the numbers are; `MixerInput { throttle: 0.7, roll: 0.05, pitch: 0.0, yaw: 0.0 }` cannot be misread.
 
 - **The quaternion is small enough to write by hand:** a struct of four numbers and the three operations above. The estimator may want it later, so it is worth understanding. A maths crate such as `glam` is the alternative.
 - **The simulation's loop keeps its shape.** Step 1 reads three rates, step 2 runs three PIDs, step 3 calls the new mixer and step 4 steps the new body. The CSV gains columns for the extra axes and motors.
@@ -385,15 +400,16 @@ Two notes:
 
 ### The two together
 
-These are the tests that catch a sign error or a motor order that differs between the two crates. Each one feeds the mixer's output straight into the body:
+These are the tests that catch a sign error or a spin direction that differs between the two crates. Each one copies the mixer's output into the body's `MotorCommands` by name and steps the body:
 
 | Test | Mixer input | Expected from the body |
 |---|---|---|
 | Roll agrees | roll +0.05 | roll rate positive, the others 0 |
 | Pitch agrees | pitch +0.05 | pitch rate positive, the others 0 |
 | Yaw agrees | yaw +0.05 | yaw rate positive, the others 0 |
+| Negative commands agree | roll, pitch and yaw −0.05, one at a time | that rate negative |
 
-If the motor order or a spin direction is wrong in one place, one of these fails. On a real drone the same mistake is a flip on take-off.
+If a sign or a spin direction is wrong in one place, one of these fails. On a real drone the same mistake is a flip on take-off.
 
 ## What to expect
 

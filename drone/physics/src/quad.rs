@@ -7,53 +7,66 @@
 //! positive nose up), z down (yaw, positive nose right).
 
 use crate::motor::Motor;
-use crate::quat::Quat;
+use crate::quat::{Angles, Quat, Rates};
 
-// Motor order, clockwise from the front left, seen from above. The mixer in
-// the `flight` crate uses the same order; the tests in `drone/sim/tests`
-// check that the two agree.
-pub const FL: usize = 0; // front left, spins clockwise
-pub const FR: usize = 1; // front right, spins counter-clockwise
-pub const BR: usize = 2; // back right, spins clockwise
-pub const BL: usize = 3; // back left, spins counter-clockwise
+/// How hard the body is to turn about each axis, in kg·m².
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Inertia {
+    pub ixx: f32, // kg·m²; how hard it is to roll. Start with 0.015
+    pub iyy: f32, // kg·m²; how hard it is to pitch. Start with 0.015
+    pub izz: f32, // kg·m²; how hard it is to yaw. Start with 0.025
+}
+
+/// One command per motor, each 0.0 to 1.0. The motors are named by position,
+/// seen from above. The mixer in the `flight` crate has its own type with the
+/// same four names; the tests in `drone/sim/tests` copy one into the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotorCommands {
+    pub fl: f32, // front left, spins clockwise
+    pub fr: f32, // front right, spins counter-clockwise
+    pub br: f32, // back right, spins clockwise
+    pub bl: f32, // back left, spins counter-clockwise
+}
+
+/// The four motors, named the same way as `MotorCommands`.
+pub struct Motors {
+    pub fl: Motor,
+    pub fr: Motor,
+    pub br: Motor,
+    pub bl: Motor,
+}
 
 pub struct Quad {
     // Parameters
     pub arm_length: f32, // m; centre to motor. Start with 0.2
     pub yaw_coeff: f32,  // m; reaction torque per newton of thrust (`c`). Start with 0.015
-    pub ixx: f32,        // kg·m²; how hard it is to roll. Start with 0.015
-    pub iyy: f32,        // kg·m²; how hard it is to pitch. Start with 0.015
-    pub izz: f32,        // kg·m²; how hard it is to yaw. Start with 0.025
+    pub inertia: Inertia,
 
     // Parts
-    pub motors: [Motor; 4], // in the order FL, FR, BR, BL
+    pub motors: Motors,
 
     // State
-    roll_rate: f32,  // rad/s, body frame
-    pitch_rate: f32, // rad/s, body frame
-    yaw_rate: f32,   // rad/s, body frame
+    rates: Rates, // rad/s, body frame
     attitude: Quat,
 }
 
 impl Quad {
-    /// `inertia` is `[ixx, iyy, izz]`; `motors` is in the order FL, FR, BR, BL.
-    pub fn new(arm_length: f32, yaw_coeff: f32, inertia: [f32; 3], motors: [Motor; 4]) -> Self {
+    pub fn new(arm_length: f32, yaw_coeff: f32, inertia: Inertia, motors: Motors) -> Self {
         Self {
             arm_length,
             yaw_coeff,
-            ixx: inertia[0],
-            iyy: inertia[1],
-            izz: inertia[2],
+            inertia,
             motors,
-            roll_rate: 0.0,
-            pitch_rate: 0.0,
-            yaw_rate: 0.0,
+            rates: Rates {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            },
             attitude: Quat::new(),
         }
     }
 
-    /// Advances the model by `dt` seconds with the four motor commands
-    /// (0.0 to 1.0 each, in the order FL, FR, BR, BL).
+    /// Advances the model by `dt` seconds with the four motor commands.
     ///
     /// 1. Motor commands to thrusts: step each motor and read its thrust.
     /// 2. Thrusts to three torques, with d = arm_length / √2:
@@ -67,107 +80,236 @@ impl Quad {
     ///    Work out the three accelerations from the old rates first, then
     ///    update the three rates.
     /// 4. Rates to attitude: `Quat::update`.
-    #[allow(unused_variables)] // remove once written
-    pub fn step(&mut self, commands: [f32; 4], dt: f32) {
-        todo!()
+    pub fn step(&mut self, commands: MotorCommands, dt: f32) {
+        // 1. Motor commands to thrusts.
+        self.motors.fl.step(commands.fl, dt);
+        self.motors.fr.step(commands.fr, dt);
+        self.motors.br.step(commands.br, dt);
+        self.motors.bl.step(commands.bl, dt);
+        let fl = self.motors.fl.thrust();
+        let fr = self.motors.fr.thrust();
+        let br = self.motors.br.thrust();
+        let bl = self.motors.bl.thrust();
+
+        // 2. Thrusts to three torques.
+        let d = self.arm_length / 2.0_f32.sqrt();
+        let roll_torque = d * (fl + bl - fr - br);
+        let pitch_torque = d * (fl + fr - br - bl);
+        let yaw_torque = self.yaw_coeff * (fr + bl - fl - br);
+
+        // 3. Torques to rates. All three accelerations come from the old
+        //    rates, before any rate is changed.
+        let Inertia { ixx, iyy, izz } = self.inertia;
+        let Rates { roll, pitch, yaw } = self.rates;
+        let roll_accel = (roll_torque - (izz - iyy) * pitch * yaw) / ixx;
+        let pitch_accel = (pitch_torque - (ixx - izz) * yaw * roll) / iyy;
+        let yaw_accel = (yaw_torque - (iyy - ixx) * roll * pitch) / izz;
+        self.rates.roll += roll_accel * dt;
+        self.rates.pitch += pitch_accel * dt;
+        self.rates.yaw += yaw_accel * dt;
+
+        // 4. Rates to attitude.
+        self.attitude.update(self.rates, dt);
     }
 
-    /// (roll rate, pitch rate, yaw rate) in rad/s, in the body frame: what
-    /// the three gyros read.
-    pub fn rates(&self) -> (f32, f32, f32) {
-        (self.roll_rate, self.pitch_rate, self.yaw_rate)
+    /// The three rates in the body frame: what the three gyros read.
+    pub fn rates(&self) -> Rates {
+        self.rates
     }
 
-    /// (roll, pitch, yaw) in radians: the true attitude.
-    pub fn angles(&self) -> (f32, f32, f32) {
+    /// The true attitude as three angles.
+    pub fn angles(&self) -> Angles {
         self.attitude.angles()
     }
 
     pub fn reset(&mut self) {
-        for motor in &mut self.motors {
-            motor.reset();
-        }
-        self.roll_rate = 0.0;
-        self.pitch_rate = 0.0;
-        self.yaw_rate = 0.0;
+        self.motors.fl.reset();
+        self.motors.fr.reset();
+        self.motors.br.reset();
+        self.motors.bl.reset();
+        self.rates = Rates {
+            roll: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+        };
         self.attitude = Quat::new();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)] // remove once the tests are written
     use super::*;
 
-    #[allow(dead_code)] // remove once the tests are written
     const DT: f32 = 0.001;
 
+    // An axis that should not be turning is compared with this, in rad/s.
+    // Only equal commands give exactly 0; in the other cases the thrusts
+    // cancel to within rounding.
+    const ZERO_TOLERANCE: f32 = 1e-4;
+
     // A quad with the starting values.
-    #[allow(dead_code)] // remove once the tests are written
     fn quad() -> Quad {
         Quad::new(
             0.2,
             0.015,
-            [0.015, 0.015, 0.025],
-            [
-                Motor::new(0.04, 6.0),
-                Motor::new(0.04, 6.0),
-                Motor::new(0.04, 6.0),
-                Motor::new(0.04, 6.0),
-            ],
+            Inertia {
+                ixx: 0.015,
+                iyy: 0.015,
+                izz: 0.025,
+            },
+            Motors {
+                fl: Motor::new(0.04, 6.0),
+                fr: Motor::new(0.04, 6.0),
+                br: Motor::new(0.04, 6.0),
+                bl: Motor::new(0.04, 6.0),
+            },
         )
+    }
+
+    // Steps `quad` with the same four commands for `seconds`.
+    fn run(quad: &mut Quad, fl: f32, fr: f32, br: f32, bl: f32, seconds: f32) {
+        let commands = MotorCommands { fl, fr, br, bl };
+        let steps = (seconds / DT).round() as usize;
+        for _ in 0..steps {
+            quad.step(commands, DT);
+        }
+    }
+
+    fn assert_near_zero(name: &str, rate: f32) {
+        assert!(
+            rate.abs() < ZERO_TOLERANCE,
+            "{name} rate should be 0, got {rate} rad/s"
+        );
     }
 
     #[test]
     fn test_equal_commands_no_rotation() {
         // All four at 0.7 for 1 s: all three rates exactly 0.
-        todo!()
+        let mut quad = quad();
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
+        let rates = quad.rates();
+        assert_eq!(rates.roll, 0.0);
+        assert_eq!(rates.pitch, 0.0);
+        assert_eq!(rates.yaw, 0.0);
     }
 
     #[test]
     fn test_left_stronger_roll_positive() {
         // FL and BL at 0.75, FR and BR at 0.65: roll rate positive, pitch
         // and yaw rates 0.
-        todo!()
+        let mut quad = quad();
+        run(&mut quad, 0.75, 0.65, 0.65, 0.75, 0.2);
+        let rates = quad.rates();
+        assert!(rates.roll > 1.0, "roll rate {} rad/s", rates.roll);
+        assert_near_zero("pitch", rates.pitch);
+        assert_near_zero("yaw", rates.yaw);
     }
 
     #[test]
     fn test_front_stronger_pitch_positive() {
         // FL and FR at 0.75, BR and BL at 0.65: pitch rate positive, the
         // others 0.
-        todo!()
+        let mut quad = quad();
+        run(&mut quad, 0.75, 0.75, 0.65, 0.65, 0.2);
+        let rates = quad.rates();
+        assert!(rates.pitch > 1.0, "pitch rate {} rad/s", rates.pitch);
+        assert_near_zero("roll", rates.roll);
+        assert_near_zero("yaw", rates.yaw);
     }
 
     #[test]
     fn test_counter_clockwise_stronger_yaw_positive() {
         // FR and BL at 0.75, FL and BR at 0.65: yaw rate positive, the
         // others 0.
-        todo!()
+        let mut quad = quad();
+        run(&mut quad, 0.65, 0.75, 0.65, 0.75, 0.2);
+        let rates = quad.rates();
+        assert!(rates.yaw > 0.05, "yaw rate {} rad/s", rates.yaw);
+        assert_near_zero("roll", rates.roll);
+        assert_near_zero("pitch", rates.pitch);
     }
 
     #[test]
     fn test_yaw_is_weak() {
         // The same size of command on roll and on yaw: the yaw rate is far
         // smaller.
-        todo!()
+        let mut rolling = quad();
+        run(&mut rolling, 0.75, 0.65, 0.65, 0.75, 0.2);
+        let mut yawing = quad();
+        run(&mut yawing, 0.65, 0.75, 0.65, 0.75, 0.2);
+
+        let roll_rate = rolling.rates().roll;
+        let yaw_rate = yawing.rates().yaw;
+        assert!(yaw_rate > 0.0);
+        assert!(
+            yaw_rate < roll_rate / 10.0,
+            "yaw rate {yaw_rate} rad/s, roll rate {roll_rate} rad/s"
+        );
     }
 
     #[test]
     fn test_no_drag_keeps_spinning() {
         // Push, then equal commands: the rates hold.
-        todo!()
+        let mut quad = quad();
+        run(&mut quad, 0.75, 0.65, 0.65, 0.75, 0.2);
+
+        // The motors take a moment to settle back to equal thrust, and the
+        // rate still rises while they do. Compare two readings after that.
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 0.5);
+        let settled = quad.rates().roll;
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
+        let later = quad.rates().roll;
+
+        assert!(settled > 1.0, "roll rate {settled} rad/s");
+        assert!(
+            (later - settled).abs() < 1e-3,
+            "roll rate went from {settled} to {later} rad/s"
+        );
     }
 
     #[test]
     fn test_cross_term() {
         // Roll and yaw rates together, equal commands: a pitch rate appears.
-        // The rates are private fields, which this module can set directly.
-        todo!()
+        // `rates` is a private field, which this module can set directly.
+        let mut quad = quad();
+        quad.rates = Rates {
+            roll: 1.0,
+            pitch: 0.0,
+            yaw: 1.0,
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 0.1);
+        // Pitch acceleration = −(ixx − izz) × yaw × roll / iyy
+        //                    = −(0.015 − 0.025) × 1 × 1 / 0.015 = 0.667 rad/s²,
+        // so about 0.067 rad/s after 0.1 s.
+        let pitch = quad.rates().pitch;
+        assert!((pitch - 0.067).abs() < 0.01, "pitch rate {pitch} rad/s");
+
+        // With a roll rate alone there is nothing to couple, and no pitch
+        // rate appears.
+        let mut quad = self::quad();
+        quad.rates = Rates {
+            roll: 1.0,
+            pitch: 0.0,
+            yaw: 0.0,
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 0.1);
+        assert_eq!(quad.rates().pitch, 0.0);
     }
 
     #[test]
     fn test_reset() {
         // After a reset it behaves the same as a brand-new quad.
-        todo!()
+        let mut used = quad();
+        run(&mut used, 0.75, 0.65, 0.6, 0.8, 0.3);
+        used.reset();
+        let mut fresh = quad();
+
+        assert_eq!(used.rates(), fresh.rates());
+        assert_eq!(used.angles(), fresh.angles());
+
+        run(&mut used, 0.75, 0.65, 0.6, 0.8, 0.3);
+        run(&mut fresh, 0.75, 0.65, 0.6, 0.8, 0.3);
+        assert_eq!(used.rates(), fresh.rates());
+        assert_eq!(used.angles(), fresh.angles());
     }
 }

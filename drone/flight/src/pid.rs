@@ -222,10 +222,10 @@ mod tests {
         };
         let out1 = pid.update(0.0, 0.0, 0.001);
         println!("out1: {}", out1);
-         assert!(out1 ==0.0);
+        assert!(out1 == 0.0);
         let out2 = pid.update(100.0, 0.0, 0.001);
         println!("out2: {}", out2);
-        assert!(out2 ==0.0);
+        assert!(out2 == 0.0);
     }
 
     #[test]
@@ -246,12 +246,11 @@ mod tests {
         };
         let out1 = pid.update(0.0, -1000.0, 0.001);
         println!("out1: {}", out1);
-        assert!(out1 ==10.0);
+        assert!(out1 == 10.0);
 
-        
         let out2 = pid.update(0.0, 1000.0, 0.001);
         println!("out2: {}", out2);
-        assert!(out2 ==-10.0);
+        assert!(out2 == -10.0);
     }
 
     #[test]
@@ -340,7 +339,7 @@ mod tests {
         assert!(out < 0.2);
     }
 
-     #[test]
+    #[test]
     fn test_plant_test() {
         let mut pid = Pid {
             kp: 2.0,
@@ -364,8 +363,8 @@ mod tests {
             let output = pid.update(0.0, rate, dt);
             rate += (output + disturbance - rate) * dt;
         }
-        println!("rate: {}",rate);
-        assert!((rate - -0.333).abs() < 0.01);               // PI: Kp = 2, Ki = 5, Kd = 0
+        println!("rate: {}", rate);
+        assert!((rate - -0.333).abs() < 0.01); // PI: Kp = 2, Ki = 5, Kd = 0
     }
 
     #[test]
