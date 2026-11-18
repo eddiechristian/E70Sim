@@ -7,5 +7,6 @@
 //! Units are SI throughout: radians, rad/s, newtons, metres, seconds. The
 //! flight code works in degrees and °/s; the conversion belongs to the caller.
 
+pub mod gyro;
 pub mod motor;
 pub mod seesaw;
