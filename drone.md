@@ -25,6 +25,10 @@ The flight code only ever sees the result of its previous outputs, as on a real 
 
 ## Decisions
 
+### Airframe: Mark4 V2 10 inch quad
+
+Decided 2026-11-18: the first real aircraft is a small quad on the Mark4 V2 10 inch carbon frame, flown on 4S to start. The parts list, prices and estimated physics parameters are in [`quad10.md`](quad10.md). The larger octocopter and 30 inch quad options in [`octocopter.md`](octocopter.md) are later builds.
+
 ### Sensor: ICM-42688-P instead of the BNO055
 
 The BNO055 is a poor fit for a quadcopter:
@@ -233,6 +237,8 @@ At first flight, expect the drone to be controllable but not well tuned, with a 
 
 No parts are bought yet. This section records what a budget of $2000 could buy, and what a drone able to lift 20 lb (about 9 kg) would involve. The prices and sizes are rough figures from memory, not quotes; check current listings before buying.
 
+One option is worked out in detail, with a parts list and looked-up prices: the Tarot T15 and T18 folding octocopters, in [`octocopter.md`](octocopter.md).
+
 ### What the budget must also cover
 
 These are needed whatever the drone's size:
@@ -304,7 +310,7 @@ The control code is the same at every size. Only the physics parameters and the 
 
 ### Stage 2 — Host simulation, self-levelling attitude
 
-- [ ] Three-axis rigid body with four motors and the X mixer
+- [ ] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
 - [ ] Complementary filter; compare its angles with the true angles from the physics — explained in [The estimator](#the-estimator)
 - [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw
 - [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor
