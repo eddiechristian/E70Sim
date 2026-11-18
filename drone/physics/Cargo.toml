@@ -1,0 +1,10 @@
+[package]
+name = "physics"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side physics models for the quadcopter simulation. Stage 1: a one-axis seesaw."
+
+[dependencies]
+
+# This is a separate project from the emulator in the repo root.
+[workspace]
