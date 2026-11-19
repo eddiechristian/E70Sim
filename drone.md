@@ -56,7 +56,7 @@ Consequences:
 
 Datasheet: `reference/icm42688/DS-000347-ICM-42688-P-v1.6.pdf` (110 pages). It is revision 1.6 from a third-party mirror; TDK's current revision is 1.8, which their site only serves through a browser. The register map is chapter 13 and the register descriptions are chapter 14.
 
-Check that a breakout board is in stock before committing to the part; the Bosch BMI270 is the fallback.
+The board bought for it is TDK's own evaluation board, the EV_ICM-42688-P. Its user guide is `reference/icm42688/AN-000488-EV_ICM-42688-P-User-Guide-v1.2.pdf`, and [`quad10.md`](quad10.md#the-gyro-board) has its pinout, jumper settings and the wiring to the Xplained board.
 
 The register details below are checked against the datasheet:
 
@@ -264,7 +264,7 @@ At first flight, expect the drone to be controllable but not well tuned, with a 
 
 ## Hardware options and budget
 
-No parts are bought yet. This section records what a budget of $2000 could buy, and what a drone able to lift 20 lb (about 9 kg) would involve. The prices and sizes are rough figures from memory, not quotes; check current listings before buying.
+The first aircraft has since been chosen and most of its parts bought: a Mark4 V2 10 inch quad, described in [`quad10.md`](quad10.md). This section is the earlier survey that led there. It records what a budget of $2000 could buy, and what a drone able to lift 20 lb (about 9 kg) would involve. The prices and sizes are rough figures from memory, not quotes; check current listings before buying.
 
 One option is worked out in detail, with a parts list and looked-up prices: the Tarot T15 and T18 folding octocopters, in [`octocopter.md`](octocopter.md).
 

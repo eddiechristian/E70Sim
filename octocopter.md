@@ -64,6 +64,8 @@ If the Xplained board is already on the desk, take $190 off.
 
 **The gyro breakout is oddly expensive at the moment.** The bare chip is about $2, but the boards found were $88 (Elecrow, which says the price has spiked on supply), $53 (TDK's own Pmod board at DigiKey, two weeks' lead time) and $30 (Mikroe MIKROE-4237 at DigiKey; I believe this is the "6DOF IMU 14 Click" with the ICM-42688-P on it, but the listing did not say, so confirm before ordering). The BMI270 remains the fallback.
 
+**Update:** the board bought in the end was TDK's EV_ICM-42688-P evaluation board, $34 at DigiKey. See [The gyro board](quad10.md#the-gyro-board) in `quad10.md`.
+
 ### Needed whatever the aircraft
 
 | Item | Cost | Notes |
