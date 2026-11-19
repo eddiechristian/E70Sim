@@ -349,6 +349,16 @@ The control code is the same at every size. Only the physics parameters and the 
 - [ ] Full 6DOF: gravity, translation, ground
 - [ ] Fixed hover throttle, then throttle compensated for tilt
 - [ ] Arming, motor limits, and a cut-off when tilted past a safe angle; arming is refused until [calibration](#calibration-before-flight) has succeeded
+- [ ] Fly it by hand with a gamepad (a Logitech F310, already owned): a `drone/sim/` program that runs in real time, reads the sticks and fills `Targets` from them
+  - Sticks: left stick up and down is throttle, left and right is yaw rate; right stick is pitch and roll angle. Scale full stick to a chosen limit, about ±30° and ±120 °/s, with a small dead zone round the centre
+  - Buttons: one to arm, one to disarm, which is also the motor kill
+  - The left stick springs back to the centre, unlike the throttle stick of a radio. So the centre is hover throttle, and the stick adds to or takes from it
+  - Reading it: the `gilrs` crate, in the `sim` crate only. The `flight` crate stays as it is and sees only `Targets`. Set the switch on the back of the pad to X
+  - Needs a run that keeps pace with the clock, and a live view in place of the CSV and plot: a window that draws the drone in 3D and turns it with the body's quaternion
+  - Pacing: the window draws 60 pictures a second, and the simulation runs the steps that fit in between, about 17 of 1 ms each. No sleeping for 1 ms at a time
+  - Drawing: the `macroquad` crate, in the `sim` crate only. Start with a drone made of boxes: two arms, four motors, and a mark for the nose. A model file of the real frame can replace the boxes later
+  - The body's axes are x forward, y right, z down; the window's are y up. One conversion, in one place
+  - On screen as text: the state, the four targets and the four motor commands
 
 ### ✅ Milestone A: stable self-levelling hover in the host simulation
 
@@ -371,5 +381,5 @@ The control code is the same at every size. Only the physics parameters and the 
 
 - SPI peripheral model and an SPI path for the ICM-42688
 - Altitude hold (needs a barometer or range sensor)
-- Receiver input for stick commands
+- Receiver input for stick commands on the real drone. The gamepad is wired USB and stays with the simulation; the firmware fills the same `Targets` from the receiver's channels
 - Choosing real parts (see [Hardware options and budget](#hardware-options-and-budget)) and replacing the guessed physics parameters
