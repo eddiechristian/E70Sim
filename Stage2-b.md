@@ -407,7 +407,7 @@ The picture to look for is the estimate hugging the true angle through fast move
 
 ## Where this goes next
 
-- The next Stage 2 item puts an angle loop around the rate loops on roll and pitch, and starts each run with a short [calibration](drone.md#calibration-before-flight). Its measurement is this estimate, and from then on an estimator error is a flight error.
+- The next Stage 2 item puts an angle loop around the rate loops on roll and pitch, and starts each run with a short [calibration](drone.md#calibration-before-flight). It is explained in [`Stage2-c.md`](Stage2-c.md). Its measurement is this estimate, and from then on an estimator error is a flight error.
 - The disturbance tests after that include a start from 30°, which the first-reading rule above makes possible.
 - Stage 3 adds movement and thrust. The accelerometer then reads thrust and drag instead of the ball joint's push, which is the hard case described under [Limits](#limits).
 - If the per-angle arithmetic proves inadequate, the Mahony filter does the same job on a quaternion, with no trouble at 90° of pitch or at ±180° of roll.

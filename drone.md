@@ -136,11 +136,13 @@ The two loops are controllers stacked on top of each other. The output of the ou
 The chain for one axis:
 
 ```
-target angle ─►(−)─► angle P ─► target rate ─►(−)─► rate PID ─► torque ─► mixer ─► motors
-               ▲                              ▲
-        estimated angle                   gyro rate
-        (estimator)                       (direct)
+target angle ─►(−)─► × Kp ─► target rate ─►(−)─► rate PID ─► torque ─► mixer ─► motors
+               ▲                           ▲
+        estimated angle                gyro rate
+        (estimator)                    (direct)
 ```
+
+`× Kp` is the outer loop's whole controller: a PID with only the P term. `(−)` is a subtraction, target minus measurement.
 
 Driving a car works the same way. The outer loop is the driver deciding "I'm left of the lane centre, so I should be turning right a little". The inner loop is the driver's hands moving the wheel until the car is actually turning at that rate.
 
@@ -339,7 +341,7 @@ The control code is the same at every size. Only the physics parameters and the 
 
 - [x] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
 - [x] Complementary filter; compare its angles with the true angles from the physics — introduced in [The estimator](#the-estimator), explained in full in [`Stage2-b.md`](Stage2-b.md)
-- [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw; a simple start-up calibration first (see [Calibration before flight](#calibration-before-flight))
+- [ ] Angle loop around the rate loop on roll and pitch; rate loop on yaw; a simple start-up calibration first (see [Calibration before flight](#calibration-before-flight)) — explained in [`Stage2-c.md`](Stage2-c.md)
 - [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor
 
 ### Stage 3 — Host simulation, hover
