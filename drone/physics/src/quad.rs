@@ -135,6 +135,13 @@ impl Quad {
         self.attitude.angles()
     }
 
+    /// Puts the body at the given attitude, for a run that starts tilted
+    /// (`Stage2-c.md`). The rates and the motors are left as they are: with
+    /// zero rates and equal motor commands the body then stays there.
+    pub fn set_attitude(&mut self, angles: Angles) {
+        self.attitude = Quat::from_angles(angles);
+    }
+
     /// What an accelerometer at the centre reads: the push of the ball joint
     /// that holds the body up, seen from the body's own axes. Explained in
     /// `Stage2-b.md` in the repo root.
@@ -412,6 +419,23 @@ mod tests {
             let length = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
             assert!((length - G).abs() < 0.001, "length {length}");
         }
+    }
+
+    // ---- Starting tilted
+
+    #[test]
+    fn test_set_attitude() {
+        // Set to roll 30°: `angles()` gives roll 30°, pitch 0°, yaw 0°, and
+        // the accelerometer reads (0, −4.903, −8.493), as in
+        // `test_accel_rolled`.
+        todo!()
+    }
+
+    #[test]
+    fn test_set_attitude_stays() {
+        // Set to roll 20° and pitch −10°, then equal commands for 1 s: the
+        // angles do not change and the rates stay 0.
+        todo!()
     }
 
     #[test]

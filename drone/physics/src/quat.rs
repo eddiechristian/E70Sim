@@ -39,6 +39,20 @@ impl Quat {
         }
     }
 
+    /// The attitude with the given three angles: `angles` run backwards.
+    /// Used to start the body tilted (`Stage2-c.md`).
+    ///
+    /// With cr, cp and cy the cosines of half the roll, pitch and yaw
+    /// angles, and sr, sp and sy the sines of the same halves:
+    ///    w = cr × cp × cy + sr × sp × sy
+    ///    x = sr × cp × cy − cr × sp × sy
+    ///    y = cr × sp × cy + sr × cp × sy
+    ///    z = cr × cp × sy − sr × sp × cy
+    #[allow(unused_variables)] // remove once written
+    pub fn from_angles(angles: Angles) -> Self {
+        todo!()
+    }
+
     /// Turns the attitude by the three body rates over `dt` seconds, then
     /// normalises.
     ///
@@ -192,5 +206,39 @@ mod tests {
         spin(&mut quat, 90.0, 0.0, 0.0, 0.5);
         spin(&mut quat, -90.0, 0.0, 0.0, 0.5);
         assert_angles(&quat, 0.0, 0.0, 0.0);
+    }
+
+    // ---- From three angles
+
+    #[test]
+    fn test_from_angles_level() {
+        // All three angles 0: (1, 0, 0, 0), the same as `Quat::new()`.
+        todo!()
+    }
+
+    #[test]
+    fn test_from_angles_one_axis() {
+        // Roll 30° alone, pitch 30° alone, yaw 30° alone: `angles()` gives
+        // each one back, with the other two 0.
+        todo!()
+    }
+
+    #[test]
+    fn test_from_angles_all_three() {
+        // Roll 20°, pitch −10°, yaw 45°: `angles()` gives all three back.
+        todo!()
+    }
+
+    #[test]
+    fn test_from_angles_matches_turning() {
+        // Roll 30° from angles is the same four numbers as a new quaternion
+        // turned at 30 °/s about roll for 1 s.
+        todo!()
+    }
+
+    #[test]
+    fn test_from_angles_has_length_one() {
+        // Any three angles: the length is 1.
+        todo!()
     }
 }

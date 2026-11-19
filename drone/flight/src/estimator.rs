@@ -129,6 +129,13 @@ impl Estimator {
         attitude
     }
 
+    /// Sets the estimate, in place of letting the first reading set it. The
+    /// start-up calibration calls this with the angle it averaged
+    /// (`Stage2-c.md`).
+    pub fn set_attitude(&mut self, attitude: Attitude) {
+        self.attitude = Some(attitude);
+    }
+
     /// Forgets the estimate, so that the next reading sets it again.
     pub fn reset(&mut self) {
         self.attitude = None;
@@ -433,6 +440,14 @@ mod tests {
         let accel = reading_at(-12.0, 7.0);
         assert_eq!(used.update(gyro, accel, DT), fresh.update(gyro, accel, DT));
         assert_eq!(used.update(gyro, accel, DT), fresh.update(gyro, accel, DT));
+    }
+
+    #[test]
+    fn test_set_attitude() {
+        // `set_attitude` with roll 10°, then one update with a level
+        // reading and zero rates: the estimate is still close to 10°, not
+        // the reading's 0°. The first-reading rule did not apply.
+        todo!()
     }
 
     // `dt` of 0, negative or NaN: panics in debug, one test per value.
