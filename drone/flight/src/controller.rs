@@ -7,7 +7,6 @@
 //! `Controller::update`, write the motor commands.
 
 use crate::calibration::Calibration;
-#[allow(unused_imports)] // remove once written
 use crate::calibration::CalibrationStatus;
 use crate::estimator::{Accel, Attitude, Estimator, GyroRates};
 use crate::mixer::MotorCommands;
@@ -20,7 +19,6 @@ use crate::pid::Pid;
 pub const ANGLE_LOOP_DIVIDER: u32 = 4;
 
 /// All four motors off: what `update` returns while calibrating.
-#[allow(dead_code)] // remove once `update` is written
 const MOTORS_OFF: MotorCommands = MotorCommands {
     fl: 0.0,
     fr: 0.0,
@@ -137,6 +135,7 @@ pub struct Controller {
     step: u32,                  // steps flown; picks the steps the angle loops run on
     roll_rate_target: f32,      // °/s; the roll angle loop's last answer
     pitch_rate_target: f32,     // °/s; the pitch angle loop's last answer
+    last_failure: Option<&'static str>, // why the last failed calibration window failed
 }
 
 impl Controller {
@@ -155,6 +154,7 @@ impl Controller {
             step: 0,
             roll_rate_target: 0.0,
             pitch_rate_target: 0.0,
+            last_failure: None,
         }
     }
 
@@ -194,11 +194,38 @@ impl Controller {
         targets: Targets,
         dt: f32,
     ) -> MotorCommands {
-        todo!()
+        if self.state == State::Calibrating {
+            match self.calibration.update(gyro, accel) {
+                // Nothing to do: the calibration starts its own new window.
+                CalibrationStatus::Collecting => {},
+                CalibrationStatus::Failed(reason) => self.last_failure = Some(reason),
+                CalibrationStatus::Done(result) => {
+                    self.gyro_bias = result.gyro_bias;
+                    self.estimator.set_attitude(result.attitude);
+                    self.attitude = Some(result.attitude);
+                    self.state = State::Flying;
+                }
+            }
+            return MOTORS_OFF;
+        }
+        // Flying
+        let adj_gyro_roll = gyro.roll - self.gyro_bias.roll;
+        let adj_gyro_pitch = gyro.pitch - self.gyro_bias.pitch;
+        let adj_gyro_yaw = gyro.yaw - self.gyro_bias.yaw;
+        let gyro = GyroRates { roll: adj_gyro_roll, pitch: adj_gyro_pitch, yaw: adj_gyro_yaw };
+        
+        self.attitude= Some(self.estimator.update(gyro, accel, dt));
+        
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Why the last failed calibration window failed, for the log. `None`
+    /// when no window has failed. This crate cannot print; the caller can.
+    pub fn last_failure(&self) -> Option<&'static str> {
+        self.last_failure
     }
 
     /// The latest estimate, for the log. `None` while calibrating.
@@ -238,6 +265,7 @@ impl Controller {
         self.step = 0;
         self.roll_rate_target = 0.0;
         self.pitch_rate_target = 0.0;
+        self.last_failure = None;
     }
 }
 

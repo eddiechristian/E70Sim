@@ -175,8 +175,4 @@ To verify before or during implementation:
 - Semihosting (`BKPT 0xAB` intercepted by the emulator) is an even simpler debug channel than UART if needed.
 
 
-ps aux | grep -E "falcon|sentinel|qualys|osquery|wazuh|defender|mdatp|zscaler|netskope"
 
-ls -la /etc/pki/ca-trust/source/anchors/
-
-env | grep -i proxy
