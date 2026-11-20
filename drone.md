@@ -346,9 +346,9 @@ The control code is the same at every size. Only the physics parameters and the 
 
 ### Stage 3 — Host simulation, hover
 
-- [ ] Full 6DOF: gravity, translation, ground
-- [ ] Fixed hover throttle, then throttle compensated for tilt
-- [ ] Arming, motor limits, and a cut-off when tilted past a safe angle; arming is refused until [calibration](#calibration-before-flight) has succeeded
+- [ ] Full 6DOF: gravity, translation, ground — explained in [`Stage3-a.md`](Stage3-a.md)
+- [ ] Fixed hover throttle, then throttle compensated for tilt — explained in [`Stage3-b.md`](Stage3-b.md)
+- [ ] Arming, motor limits, and a cut-off when tilted past a safe angle; arming is refused until [calibration](#calibration-before-flight) has succeeded — explained in [`Stage3-c.md`](Stage3-c.md)
 - [ ] Fly it by hand with a gamepad (a Logitech F310, already owned): a `drone/sim/` program that runs in real time, reads the sticks and fills `Targets` from them
   - Sticks: left stick up and down is throttle, left and right is yaw rate; right stick is pitch and roll angle. Scale full stick to a chosen limit, about ±30° and ±120 °/s, with a small dead zone round the centre
   - Buttons: one to arm, one to disarm, which is also the motor kill
@@ -359,6 +359,10 @@ The control code is the same at every size. Only the physics parameters and the 
   - Drawing: the `macroquad` crate, in the `sim` crate only. Start with a drone made of boxes: two arms, four motors, and a mark for the nose. A model file of the real frame can replace the boxes later
   - The body's axes are x forward, y right, z down; the window's are y up. One conversion, in one place
   - On screen as text: the state, the four targets and the four motor commands
+  - `--stage` works here as in the quad program, so any earlier stage can be flown by hand and watched. The presets move out of `src/bin/quad.rs` into a place both programs share
+    - `--stage 2a` and `2b`: the drone on its ball joint, rate loops only. The right stick asks for a roll and a pitch **rate**, not an angle, and letting go does not level it. For `2b`, draw the estimator's attitude as a second, see-through drone over the true one
+    - `--stage 2c` and `2d`: still on the joint, with the angle loops. Letting go of the stick levels it. A button gives it a kick
+    - `--stage 3a` on: it flies, falls and lands
 
 ### ✅ Milestone A: stable self-levelling hover in the host simulation
 
