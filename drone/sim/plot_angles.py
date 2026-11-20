@@ -73,11 +73,20 @@ def main():
     motors.set_ylabel("motor command (0 to 1)")
     motors.set_xlabel("time (s)")
 
+    # A kick is every step with a push on any axis (Stage2-d.md). A CSV from
+    # before the kick was added has no push columns.
+    pushes = [run[f"push_{axis}"] for axis in ["roll", "pitch", "yaw"] if f"push_{axis}" in run]
+    kicking = [t for t, *push in zip(time, *pushes) if any(push)]
+
     for panel in panels:
+        # Each is named in the top panel's legend only.
+        top = panel is panels[0]
         if calibrating:
-            # Named in the top panel's legend only.
-            label = "calibrating" if panel is panels[0] else None
+            label = "calibrating" if top else None
             panel.axvspan(calibrating[0], calibrating[-1], color="0.9", label=label)
+        if kicking:
+            label = "kick" if top else None
+            panel.axvspan(kicking[0], kicking[-1], color="tab:red", alpha=0.25, label=label)
         panel.legend(loc="upper right", fontsize="small")
         panel.grid(True)
     panels[0].set_title(args.title or f"The quad: {os.path.basename(path)}", fontsize="medium")

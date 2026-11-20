@@ -5,6 +5,9 @@
 //! angle on roll or pitch, or a step in rate on yaw. The parts are explained
 //! in `Stage2-a.md`, `Stage2-b.md` and `Stage2-c.md` in the repo root.
 //!
+//! A run can also be disturbed (`Stage2-d.md`): a kick, which is a torque on
+//! the body for a short time, and one weak motor.
+//!
 //! With `--rate-only` the program runs as it did before Stage 2c: three rate
 //! PIDs and the mixer, no angle loops and no calibration, with the estimator
 //! only watching. The Stage 2a and 2b scripts use it.
@@ -21,7 +24,7 @@ use flight::mixer::{MixerInput, mix};
 use flight::pid::Pid;
 use physics::gyro::Gyro;
 use physics::motor::Motor;
-use physics::quad::{G, Inertia, Motors, Quad};
+use physics::quad::{G, Inertia, Motors, NO_PUSH, Quad, Torques};
 use physics::quat::Angles;
 
 // Time
@@ -64,6 +67,19 @@ enum Axis {
     Roll,
     Pitch,
     Yaw,
+}
+
+/// One of the four motors, to pick the weak one.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum Corner {
+    /// Front left
+    Fl,
+    /// Front right
+    Fr,
+    /// Back right
+    Br,
+    /// Back left
+    Bl,
 }
 
 /// One value per axis, in the flight code's units: °/s for rates and
@@ -120,7 +136,7 @@ struct Args {
     kp: f32,
 
     /// Roll and pitch rate loop integral gain
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.003)]
     ki: f32,
 
     /// Roll and pitch rate loop derivative gain
@@ -132,7 +148,7 @@ struct Args {
     yaw_kp: f32,
 
     /// Yaw integral gain
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.02)]
     yaw_ki: f32,
 
     /// Yaw derivative gain
@@ -147,6 +163,35 @@ struct Args {
     /// Thrust of each motor at full speed, in newtons
     #[arg(long, default_value_t = 6.0)]
     thrust_coeff: f32,
+
+    /// A kick: a torque about roll, in N·m, for a short time. The three
+    /// kicks can be given together. Not with --rate-only
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    kick_roll: f32,
+
+    /// A kick about pitch, in N·m
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    kick_pitch: f32,
+
+    /// A kick about yaw, in N·m
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    kick_yaw: f32,
+
+    /// When the kick starts, in seconds from the start of the run
+    #[arg(long, default_value_t = 2.0)]
+    kick_at: f32,
+
+    /// How long the kick lasts, in seconds
+    #[arg(long, default_value_t = 0.05)]
+    kick_for: f32,
+
+    /// One motor that is weaker than the other three, from the start
+    #[arg(long, value_enum)]
+    weak_motor: Option<Corner>,
+
+    /// How much weaker the weak motor is, as a percentage of its thrust
+    #[arg(long, default_value_t = 10.0)]
+    weak_by: f32,
 
     /// Gyro noise: standard deviation in °/s
     #[arg(long, default_value_t = 0.0)]
@@ -192,6 +237,39 @@ fn targets_at(time: f32, axis: Axis, target: f32) -> Targets {
         }
     }
     targets
+}
+
+/// The push on the body during step number `step`: the three kicks while
+/// the kick lasts, and nothing at any other time. The kick is counted in
+/// whole steps, so that rounding cannot make it a step longer or shorter.
+fn push_at(step: u32, args: &Args) -> Torques {
+    let first = (args.kick_at / DT).round() as u32;
+    let count = (args.kick_for / DT).round() as u32;
+    if (first..first + count).contains(&step) {
+        Torques {
+            roll: args.kick_roll,
+            pitch: args.kick_pitch,
+            yaw: args.kick_yaw,
+        }
+    } else {
+        NO_PUSH
+    }
+}
+
+/// The four motors. All have `--thrust-coeff`, but for the one named by
+/// `--weak-motor`, which has `--weak-by` percent less.
+fn motors(args: &Args) -> Motors {
+    let motor = |corner: Corner| {
+        let weak = args.weak_motor == Some(corner);
+        let by = if weak { args.weak_by / 100.0 } else { 0.0 };
+        Motor::new(MOTOR_TIME_CONSTANT, args.thrust_coeff * (1.0 - by))
+    };
+    Motors {
+        fl: motor(Corner::Fl),
+        fr: motor(Corner::Fr),
+        br: motor(Corner::Br),
+        bl: motor(Corner::Bl),
+    }
 }
 
 /// With `--rate-only`: the three target rates in °/s at `time` seconds,
@@ -339,7 +417,6 @@ fn one_g_long(accel: Accel) -> Accel {
 fn main() {
     let args = Args::parse();
 
-    let motor = || Motor::new(MOTOR_TIME_CONSTANT, args.thrust_coeff);
     let mut quad = Quad::new(
         ARM_LENGTH,
         YAW_COEFF,
@@ -348,12 +425,7 @@ fn main() {
             iyy: IYY,
             izz: IZZ,
         },
-        Motors {
-            fl: motor(),
-            fr: motor(),
-            br: motor(),
-            bl: motor(),
-        },
+        motors(&args),
     );
     quad.set_attitude(Angles {
         roll: args.start_roll.to_radians(),
@@ -390,7 +462,8 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
          roll_target,pitch_target,yaw_target,\
          roll_rate,pitch_rate,yaw_rate,\
          roll_measured,pitch_measured,yaw_measured,\
-         fl,fr,br,bl"
+         fl,fr,br,bl,\
+         push_roll,push_pitch,push_yaw"
     );
 
     for step in 0..STEPS {
@@ -439,7 +512,9 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
             );
         }
 
-        // 3. Step the body.
+        // 3. Step the body, with the kick if this is its time.
+        let push = push_at(step, args);
+        quad.push = push;
         quad.step(to_body(commands), DT);
 
         // 4. Print one CSV line. There is no estimate while calibrating.
@@ -455,7 +530,8 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
              {:.2},{:.2},{:.2},\
              {:.3},{:.3},{:.3},\
              {:.3},{:.3},{:.3},\
-             {:.5},{:.5},{:.5},{:.5}",
+             {:.5},{:.5},{:.5},{:.5},\
+             {:.3},{:.3},{:.3}",
             targets.roll,
             targets.pitch,
             readings.angle.roll,
@@ -476,6 +552,9 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
             commands.fr,
             commands.br,
             commands.bl,
+            push.roll,
+            push.pitch,
+            push.yaw,
         );
     }
 }
@@ -650,6 +729,120 @@ mod tests {
         // `--help`. They must stay the same as `Gains::default()`.
         let args = Args::parse_from(["quad"]);
         assert_eq!(gains(&args), Gains::default());
+    }
+
+    // ---- The kick and the weak motor
+
+    #[test]
+    fn test_no_kick_unless_asked_for() {
+        let args = Args::parse_from(["quad"]);
+        for step in 0..STEPS {
+            assert_eq!(push_at(step, &args), NO_PUSH);
+        }
+    }
+
+    #[test]
+    fn test_kick_starts_and_ends_on_time() {
+        // The defaults: from 2.0 s for 0.05 s, which is steps 2000 to 2049.
+        let args = Args::parse_from(["quad", "--kick-roll", "0.3"]);
+        let kick = Torques {
+            roll: 0.3,
+            ..NO_PUSH
+        };
+        assert_eq!(push_at(1999, &args), NO_PUSH);
+        assert_eq!(push_at(2000, &args), kick);
+        assert_eq!(push_at(2049, &args), kick);
+        assert_eq!(push_at(2050, &args), NO_PUSH);
+        let pushed = (0..STEPS).filter(|&step| push_at(step, &args) == kick);
+        assert_eq!(pushed.count(), 50);
+
+        // Moved and made longer: steps 1200 to 1299.
+        let args = Args::parse_from([
+            "quad",
+            "--kick-roll",
+            "0.3",
+            "--kick-at",
+            "1.2",
+            "--kick-for",
+            "0.1",
+        ]);
+        assert_eq!(push_at(1199, &args), NO_PUSH);
+        assert_eq!(push_at(1200, &args), kick);
+        assert_eq!(push_at(1299, &args), kick);
+        assert_eq!(push_at(1300, &args), NO_PUSH);
+    }
+
+    #[test]
+    fn test_kicks_can_be_given_together() {
+        let args = Args::parse_from([
+            "quad",
+            "--kick-roll",
+            "0.3",
+            "--kick-pitch",
+            "-0.3",
+            "--kick-yaw",
+            "0.1",
+        ]);
+        assert_eq!(
+            push_at(2000, &args),
+            Torques {
+                roll: 0.3,
+                pitch: -0.3,
+                yaw: 0.1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_kick_comes_after_the_calibration() {
+        let args = Args::parse_from(["quad"]);
+        assert!(args.kick_at > CALIBRATION_STEPS as f32 * DT);
+        assert!(args.kick_at + args.kick_for < STEPS as f32 * DT);
+    }
+
+    // The thrust of each motor of `motors` at full speed, in newtons, in
+    // the order FL, FR, BR, BL.
+    fn full_thrusts(motors: &mut Motors) -> [f32; 4] {
+        let mut thrusts = [0.0; 4];
+        let each = [
+            &mut motors.fl,
+            &mut motors.fr,
+            &mut motors.br,
+            &mut motors.bl,
+        ];
+        for (thrust, motor) in thrusts.iter_mut().zip(each) {
+            // Two seconds at a command of 1.0 is 50 time constants.
+            for _ in 0..2000 {
+                motor.step(1.0, DT);
+            }
+            *thrust = motor.thrust();
+        }
+        thrusts
+    }
+
+    fn assert_thrusts(got: [f32; 4], expected: [f32; 4]) {
+        for (got, expected) in got.iter().zip(expected) {
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_four_good_motors_unless_asked_for() {
+        let args = Args::parse_from(["quad"]);
+        assert_thrusts(full_thrusts(&mut motors(&args)), [6.0; 4]);
+    }
+
+    #[test]
+    fn test_only_the_chosen_motor_is_weak() {
+        // 10% weak unless `--weak-by` says otherwise: 5.4 N against 6.0 N.
+        let args = Args::parse_from(["quad", "--weak-motor", "fr"]);
+        assert_thrusts(full_thrusts(&mut motors(&args)), [6.0, 5.4, 6.0, 6.0]);
+
+        let args = Args::parse_from(["quad", "--weak-motor", "bl", "--weak-by", "20"]);
+        assert_thrusts(full_thrusts(&mut motors(&args)), [6.0, 6.0, 6.0, 4.8]);
     }
 
     #[test]

@@ -76,17 +76,18 @@ pub struct Gains {
 }
 
 impl Default for Gains {
-    /// The rate gains are those of Stage 2a, the estimator's time constant
-    /// that of Stage 2b and the angle gain that of Stage 2c.
+    /// The rate loops' P and D gains are those of Stage 2a, the estimator's
+    /// time constant that of Stage 2b, the angle gain that of Stage 2c and
+    /// the rate loops' I gains those of Stage 2d.
     fn default() -> Self {
         Self {
             angle_kp: 6.0,
             rate_limit: 200.0,
             rate_kp: 0.0014,
-            rate_ki: 0.0,
+            rate_ki: 0.003,
             rate_kd: 0.00003,
             yaw_kp: 0.01,
-            yaw_ki: 0.0,
+            yaw_ki: 0.02,
             yaw_kd: 0.0,
             d_filter: 0.01,
             out_limit: 0.3,
@@ -333,11 +334,22 @@ mod tests {
         }
     }
 
+    // The default gains with the rate loops' I terms off. These tests check
+    // one step of the chain by its arithmetic: angle error × angle `Kp` ×
+    // rate `Kp`. An I term would add a little to every figure.
+    fn gains() -> Gains {
+        Gains {
+            rate_ki: 0.0,
+            yaw_ki: 0.0,
+            ..Gains::default()
+        }
+    }
+
     // A controller that has just finished calibrating, with the same gyro
     // and accelerometer reading on every step. The next update is the
     // first one flown.
     fn calibrated(gyro: GyroRates, accel: Accel) -> Controller {
-        let mut controller = Controller::new(Gains::default());
+        let mut controller = Controller::new(gains());
         for _ in 0..CALIBRATION_STEPS {
             controller.update(gyro, accel, LEVEL_TARGETS, DT);
         }

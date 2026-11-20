@@ -151,10 +151,14 @@ cargo run --bin quad -- --help
 | `--start-roll`, `--start-pitch` | the angle the body starts at, in degrees | 0, 0 |
 | `--no-calibration` | fly without what the calibration finds; see below | off |
 | `--rate-only` | run as before Stage 2c; see [Rate loops only](#rate-loops-only) | off |
-| `--kp`, `--ki`, `--kd` | roll and pitch rate loop gains | 0.0014, 0, 0.00003 |
-| `--yaw-kp`, `--yaw-ki`, `--yaw-kd` | yaw rate loop gains | 0.01, 0, 0 |
+| `--kp`, `--ki`, `--kd` | roll and pitch rate loop gains | 0.0014, 0.003, 0.00003 |
+| `--yaw-kp`, `--yaw-ki`, `--yaw-kd` | yaw rate loop gains | 0.01, 0.02, 0 |
 | `--d-filter` | time constant of the D-term low-pass filter on all three axes, in s | 0.01 |
 | `--thrust-coeff` | thrust of each motor at full speed, in N | 6.0 |
+| `--kick-roll`, `--kick-pitch`, `--kick-yaw` | a kick: a torque about that axis, in N·m; see [Disturbances](#disturbances) | 0, 0, 0 |
+| `--kick-at`, `--kick-for` | when the kick starts and how long it lasts, in s | 2.0, 0.05 |
+| `--weak-motor` | one motor that is weaker than the others: `fl`, `fr`, `br` or `bl` | none |
+| `--weak-by` | how much weaker, as a percentage of its thrust | 10 |
 | `--noise`, `--delay`, `--seed` | as for the seesaw; each axis has its own gyro | 0, 0, 1 |
 | `--gyro-bias` | a constant error on all three gyro axes, in °/s | 0 |
 | `--accel-noise` | accelerometer noise on each axis: standard deviation in m/s² | 0 |
@@ -170,6 +174,7 @@ Where the default rate gains come from:
 
 - **Roll and pitch** use the gains chosen in `Stage1-d.md` (`--kp 0.002 --kd 0.00004`), divided by √2. One unit of PID output turns the quad √2 times harder than it turned the seesaw: four motors at 0.14 m from the axis, against two motors at 0.2 m.
 - **Yaw** needs a much larger gain, because the same command turns the body about 16 times more slowly. Even so, a 50 °/s yaw step drives the output to its limit for a moment.
+- **The two `Ki` values** were chosen in [`Stage2-d.md`](../../Stage2-d.md#results), to hold the drone level with one weak motor. The Stage 2a, 2b and 2c scripts pass `--ki 0 --yaw-ki 0`, so that they still make the pictures of those stages.
 
 `plot_angles.py` draws six panels: the angle and the rate of roll, the same for pitch, the yaw rate, then the four motor commands. The calibration is shaded. It takes the same two optional arguments as `plot.py`: the file to read and a picture to save.
 
@@ -180,6 +185,30 @@ Where the default rate gains come from:
 ```
 
 This runs ten cases (a step on each axis, the real sensors with and without calibration, a tilted start, two other angle gains and two 45° steps), prints their figures and saves numbered pictures into `stage2-c/`. [`stage2-c/README.md`](stage2-c/README.md) lists them.
+
+### Disturbances
+
+The run can be disturbed in three ways, explained in [`Stage2-d.md`](../../Stage2-d.md). Use `--target 0` with them, so that the only thing happening is the disturbance.
+
+```
+cargo run --bin quad -- --target 0 --kick-roll 0.3 > quad.csv
+cargo run --bin quad -- --target 0 --kick-roll 0.3 --kick-pitch 0.3 > quad.csv
+cargo run --bin quad -- --target 0 --start-roll 30 > quad.csv
+cargo run --bin quad -- --target 0 --weak-motor fr > quad.csv
+python3 measure_disturbance.py quad.csv
+```
+
+- **A kick** is a torque on the body for a short time. The three kick arguments can be given together, which makes a push about an axis between them. It is not available with `--rate-only`. `plot_angles.py` shades it red.
+- **A tilted start** is `--start-roll` and `--start-pitch`, as before.
+- **A weak motor** is weak from the start of the run. Add `--ki 0 --yaw-ki 0` to see the drone hang about 1° off level without the I terms.
+
+`measure_disturbance.py` prints the largest roll and pitch off level, how long until both stay within 1° of level, the angles and the yaw rate at the end, and how far the nose has turned. Times are counted from the start of the kick, or from the moment the motors start when there is no kick.
+
+```
+./stage2-d.sh
+```
+
+This runs sixteen cases (seven kicks, two tilted starts, a weak motor with and without the I terms, and steps with and without them), prints their figures and saves numbered pictures into `stage2-d/`. [`stage2-d/README.md`](stage2-d/README.md) lists them.
 
 ### The quad's CSV columns
 
@@ -195,6 +224,7 @@ This runs ten cases (a step on each axis, the real sensors with and without cali
 | `roll_rate`, `pitch_rate`, `yaw_rate` | °/s | the true rates |
 | `roll_measured`, `pitch_measured`, `yaw_measured` | °/s | what the gyro says, bias included |
 | `fl`, `fr`, `br`, `bl` | 0–1 | the four motor commands |
+| `push_roll`, `push_pitch`, `push_yaw` | N·m | the kick on the body during that step; 0 when there is none |
 
 ### Rate loops only
 

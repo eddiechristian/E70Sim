@@ -41,6 +41,22 @@ pub struct Accel {
 /// Standard gravity, in m/s².
 pub const G: f32 = 9.80665;
 
+/// A torque on each axis from outside the drone, in N·m: a gust, a bump, a
+/// hand. Explained in `Stage2-d.md` in the repo root.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Torques {
+    pub roll: f32,  // N·m; positive pushes the right side down
+    pub pitch: f32, // N·m; positive pushes the nose up
+    pub yaw: f32,   // N·m; positive pushes the nose right
+}
+
+/// No push on any axis.
+pub const NO_PUSH: Torques = Torques {
+    roll: 0.0,
+    pitch: 0.0,
+    yaw: 0.0,
+};
+
 /// The four motors, named the same way as `MotorCommands`.
 pub struct Motors {
     pub fl: Motor,
@@ -58,6 +74,12 @@ pub struct Quad {
     // Parts
     pub motors: Motors,
 
+    /// Added to the motors' torques on every step, until it is changed.
+    /// Zero unless a test or the simulation sets it. The body knows nothing
+    /// about time: the caller sets the push at the start of a kick and sets
+    /// it back to `NO_PUSH` at the end.
+    pub push: Torques,
+
     // State
     rates: Rates, // rad/s, body frame
     attitude: Quat,
@@ -70,6 +92,7 @@ impl Quad {
             yaw_coeff,
             inertia,
             motors,
+            push: NO_PUSH,
             rates: Rates {
                 roll: 0.0,
                 pitch: 0.0,
@@ -86,6 +109,8 @@ impl Quad {
     ///    roll torque  = d × (T_FL + T_BL − T_FR − T_BR)
     ///    pitch torque = d × (T_FL + T_FR − T_BR − T_BL)
     ///    yaw torque   = yaw_coeff × (T_FR + T_BL − T_FL − T_BR)
+    ///    Then add the push (`Stage2-d.md`): each of the three torques gets
+    ///    its part of `self.push`.
     /// 3. Torques to rates, with the cross term (Euler's rotation equations):
     ///    roll rate  += (roll torque  − (izz − iyy) × pitch rate × yaw rate)   / ixx × dt
     ///    pitch rate += (pitch torque − (ixx − izz) × yaw rate   × roll rate)  / iyy × dt
@@ -106,9 +131,10 @@ impl Quad {
 
         // 2. Thrusts to three torques.
         let d = self.arm_length / 2.0_f32.sqrt();
-        let roll_torque = d * (fl + bl - fr - br);
-        let pitch_torque = d * (fl + fr - br - bl);
-        let yaw_torque = self.yaw_coeff * (fr + bl - fl - br);
+        //    The push from outside is added to what the motors give.
+        let roll_torque = d * (fl + bl - fr - br) + self.push.roll;
+        let pitch_torque = d * (fl + fr - br - bl) + self.push.pitch;
+        let yaw_torque = self.yaw_coeff * (fr + bl - fl - br) + self.push.yaw;
 
         // 3. Torques to rates. All three accelerations come from the old
         //    rates, before any rate is changed.
@@ -170,6 +196,7 @@ impl Quad {
             yaw: 0.0,
         };
         self.attitude = Quat::new();
+        self.push = NO_PUSH;
     }
 }
 
@@ -458,6 +485,138 @@ mod tests {
         assert!((angles.pitch.to_degrees() + 10.0).abs() < 0.01);
         assert!(angles.yaw.to_degrees().abs() < 0.01);
 
+        let rates = quad.rates();
+        assert_eq!(rates.roll, 0.0);
+        assert_eq!(rates.pitch, 0.0);
+        assert_eq!(rates.yaw, 0.0);
+    }
+
+    // ---- The push. Named after the table in `Stage2-d.md`.
+
+    // The standard kick of Stage 2d.
+    const KICK: f32 = 0.3; // N·m
+    const KICK_FOR: f32 = 0.05; // s
+
+    // A rate that a push should have given is compared with this, in rad/s.
+    const PUSH_TOLERANCE: f32 = 1e-3;
+
+    #[test]
+    fn test_no_push_no_change() {
+        // Push zero, all four at 0.7 for 1 s: the rates stay exactly 0, as
+        // in `test_equal_commands_no_rotation`.
+        let mut quad = quad();
+        assert_eq!(quad.push, NO_PUSH);
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
+        let rates = quad.rates();
+        assert_eq!(rates.roll, 0.0);
+        assert_eq!(rates.pitch, 0.0);
+        assert_eq!(rates.yaw, 0.0);
+    }
+
+    #[test]
+    fn test_roll_push() {
+        // 0.3 N·m about roll for 0.05 s, all four at 0.7:
+        // change in rate = torque × time / inertia = 0.3 × 0.05 / 0.015,
+        // so the roll rate is 1 rad/s. Pitch and yaw rates are 0.
+        let mut quad = quad();
+        quad.push = Torques {
+            roll: KICK,
+            ..NO_PUSH
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+        let rates = quad.rates();
+        assert!(
+            (rates.roll - 1.0).abs() < PUSH_TOLERANCE,
+            "roll rate {} rad/s",
+            rates.roll
+        );
+        assert_near_zero("pitch", rates.pitch);
+        assert_near_zero("yaw", rates.yaw);
+
+        // A push the other way turns it the other way.
+        let mut quad = self::quad();
+        quad.push = Torques {
+            roll: -KICK,
+            ..NO_PUSH
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+        let roll = quad.rates().roll;
+        assert!(
+            (roll + 1.0).abs() < PUSH_TOLERANCE,
+            "roll rate {roll} rad/s"
+        );
+    }
+
+    #[test]
+    fn test_pitch_and_yaw_push() {
+        // The same about pitch, and then about yaw on a new quad: that axis
+        // alone turns, at torque × time / inertia. Pitch gives 1 rad/s and
+        // yaw 0.3 × 0.05 / 0.025 = 0.6 rad/s.
+        let mut quad = quad();
+        quad.push = Torques {
+            pitch: KICK,
+            ..NO_PUSH
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+        let rates = quad.rates();
+        assert!(
+            (rates.pitch - 1.0).abs() < PUSH_TOLERANCE,
+            "pitch rate {} rad/s",
+            rates.pitch
+        );
+        assert_near_zero("roll", rates.roll);
+        assert_near_zero("yaw", rates.yaw);
+
+        let mut quad = self::quad();
+        quad.push = Torques {
+            yaw: KICK,
+            ..NO_PUSH
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+        let rates = quad.rates();
+        assert!(
+            (rates.yaw - 0.6).abs() < PUSH_TOLERANCE,
+            "yaw rate {} rad/s",
+            rates.yaw
+        );
+        assert_near_zero("roll", rates.roll);
+        assert_near_zero("pitch", rates.pitch);
+    }
+
+    #[test]
+    fn test_push_stops() {
+        // A roll push for 0.05 s, then `NO_PUSH` for 1 s: the roll rate
+        // stays where the push left it, since the model has no drag.
+        let mut quad = quad();
+        quad.push = Torques {
+            roll: KICK,
+            ..NO_PUSH
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+        let pushed = quad.rates().roll;
+        assert!(pushed > 0.9, "roll rate {pushed} rad/s");
+
+        quad.push = NO_PUSH;
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
+        let later = quad.rates().roll;
+        assert_eq!(later, pushed);
+    }
+
+    #[test]
+    fn test_reset_clears_push() {
+        // A push set, then `reset()`: the push is `NO_PUSH`, and equal
+        // commands leave the rates at 0.
+        let mut quad = quad();
+        quad.push = Torques {
+            roll: KICK,
+            pitch: -KICK,
+            yaw: KICK,
+        };
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, KICK_FOR);
+
+        quad.reset();
+        assert_eq!(quad.push, NO_PUSH);
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
         let rates = quad.rates();
         assert_eq!(rates.roll, 0.0);
         assert_eq!(rates.pitch, 0.0);
