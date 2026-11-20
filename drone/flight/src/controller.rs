@@ -2,7 +2,11 @@
 //! and the mixer, run in the right order. Sensor readings and targets in,
 //! four motor commands out.
 //!
-//! Explained in `Stage2-c.md` in the repo root. The simulation, and later
+//! Explained in `Stage2-c.md` in the repo root. The throttle, and raising it
+//! in a tilt, is explained in `Stage3-b.md`.
+//!
+//! This crate is `no_std`, so `cos` and `sqrt` are not methods of `f32`
+//! here. Use `libm::cosf(x)` and `libm::sqrtf(x)`, which take radians. The simulation, and later
 //! the firmware, does three things each step: read the sensors, call
 //! `Controller::update`, write the motor commands.
 
@@ -73,12 +77,18 @@ pub struct Gains {
 
     // The estimator.
     pub estimator_time_constant: f32, // s
+
+    // The throttle (`Stage3-b.md`).
+    pub hover_throttle: f32, // 0.0 to 1.0; the command that holds the drone's weight
+    pub tilt_compensation: bool, // more throttle in a tilt
+    pub tilt_compensation_limit: f32, // °; no more is added past this tilt. Start with 45
 }
 
 impl Default for Gains {
     /// The rate loops' P and D gains are those of Stage 2a, the angle gain
-    /// that of Stage 2c, the rate loops' I gains those of Stage 2d and the
-    /// estimator's time constant that of Stage 3a.
+    /// that of Stage 2c, the rate loops' I gains those of Stage 2d, the
+    /// estimator's time constant that of Stage 3a and the throttle settings
+    /// those of Stage 3b.
     fn default() -> Self {
         Self {
             angle_kp: 6.0,
@@ -93,8 +103,34 @@ impl Default for Gains {
             out_limit: 0.3,
             i_limit: 0.1,
             estimator_time_constant: 10.0,
+            // The simulated drone's: 1.2 kg on four motors of 6 N. The
+            // simulation sets it from the body it flies.
+            hover_throttle: 0.7002,
+            tilt_compensation: true,
+            tilt_compensation_limit: 45.0,
         }
     }
+}
+
+/// `throttle` raised to make up for the lift lost at this attitude
+/// (`Stage3-b.md`). Tilted, only part of the thrust still points up:
+///    lift = thrust × cos(tilt), and cos(tilt) = cos(roll) × cos(pitch)
+/// Thrust goes with the square of the command, so the command needs the
+/// square root of what the thrust needs:
+///    throttle / √(cos(roll) × cos(pitch))
+///
+/// Past `limit` degrees of tilt no more is added: when the product of the
+/// two cosines is below cos(limit), use cos(limit) in its place.
+///
+/// `attitude` is in degrees, and so is `limit`; `libm::cosf` takes radians.
+fn compensate_for_tilt(throttle: f32, attitude: Attitude, limit: f32) -> f32 {
+    // How much of the thrust still points up: 1 when level, 0 on its side.
+    let upright = libm::cosf(attitude.roll.to_radians()) * libm::cosf(attitude.pitch.to_radians());
+    // Its value at the limit. Taking the larger of the two stops the
+    // compensation there, and keeps the square root away from zero and from
+    // the negative values of a drone that is upside down.
+    let least = libm::cosf(limit.to_radians());
+    throttle / libm::sqrtf(upright.max(least))
 }
 
 /// An angle PID: P only, with its output, a target rate, kept within the
@@ -126,6 +162,10 @@ pub struct Controller {
     pitch_rate_pid: Pid,
     yaw_rate_pid: Pid,
 
+    // Settings, from the gains
+    tilt_compensation: bool,
+    tilt_compensation_limit: f32, // °
+
     // State
     state: State,
     gyro_bias: GyroRates,       // °/s; from the calibration, zero until then
@@ -133,6 +173,7 @@ pub struct Controller {
     step: u32,                  // steps flown; picks the steps the angle loops run on
     roll_rate_target: f32,      // °/s; the roll angle loop's last answer
     pitch_rate_target: f32,     // °/s; the pitch angle loop's last answer
+    throttle: f32,              // what last went to the mixer; 0 while calibrating
     last_failure: Option<&'static str>, // why the last failed calibration window failed
 }
 
@@ -146,12 +187,15 @@ impl Controller {
             roll_rate_pid: rate_pid(gains.rate_kp, gains.rate_ki, gains.rate_kd, &gains),
             pitch_rate_pid: rate_pid(gains.rate_kp, gains.rate_ki, gains.rate_kd, &gains),
             yaw_rate_pid: rate_pid(gains.yaw_kp, gains.yaw_ki, gains.yaw_kd, &gains),
+            tilt_compensation: gains.tilt_compensation,
+            tilt_compensation_limit: gains.tilt_compensation_limit,
             state: State::Calibrating,
             gyro_bias: ZERO_RATES,
             attitude: None,
             step: 0,
             roll_rate_target: 0.0,
             pitch_rate_target: 0.0,
+            throttle: 0.0,
             last_failure: None,
         }
     }
@@ -179,8 +223,9 @@ impl Controller {
     ///    step, on every call.
     /// 4. Run the three rate PIDs: roll and pitch with the stored rate
     ///    targets as setpoints, yaw with `targets.yaw_rate`.
-    /// 5. Mix `targets.throttle` with the three outputs and return the
-    ///    result.
+    /// 5. Raise `targets.throttle` for the tilt, with `compensate_for_tilt`
+    ///    and the estimate of this step, if the gains ask for it.
+    /// 6. Mix the throttle with the three outputs and return the result.
     ///
     /// A bad `dt` is passed through: the PIDs and the estimator guard
     /// against it themselves.
@@ -240,8 +285,17 @@ impl Controller {
             .yaw_rate_pid
             .update(targets.yaw_rate, gyro_minus_bias.yaw, dt);
 
+        // The throttle, raised for the tilt. The answer is not clamped
+        // here: a command above 1.0 is the mixer's business.
+        let throttle = if self.tilt_compensation {
+            compensate_for_tilt(targets.throttle, attitude, self.tilt_compensation_limit)
+        } else {
+            targets.throttle
+        };
+        self.throttle = throttle;
+
         mix(MixerInput {
-            throttle: targets.throttle,
+            throttle,
             roll,
             pitch,
             yaw,
@@ -280,6 +334,13 @@ impl Controller {
         self.pitch_rate_target
     }
 
+    /// The throttle that last went to the mixer, for the log: what the
+    /// targets asked for, raised for the tilt if the gains ask for that.
+    /// Zero while calibrating, when the motors are off.
+    pub fn throttle(&self) -> f32 {
+        self.throttle
+    }
+
     /// Back to `Calibrating`, with everything cleared. The gains are kept.
     pub fn reset(&mut self) {
         self.calibration.reset();
@@ -295,6 +356,7 @@ impl Controller {
         self.step = 0;
         self.roll_rate_target = 0.0;
         self.pitch_rate_target = 0.0;
+        self.throttle = 0.0;
         self.last_failure = None;
     }
 }
@@ -334,13 +396,16 @@ mod tests {
         }
     }
 
-    // The default gains with the rate loops' I terms off. These tests check
-    // one step of the chain by its arithmetic: angle error × angle `Kp` ×
-    // rate `Kp`. An I term would add a little to every figure.
+    // The default gains with the rate loops' I terms and the tilt
+    // compensation off. These tests check one step of the chain by its
+    // arithmetic: angle error × angle `Kp` × rate `Kp`. An I term would add
+    // a little to every figure, and the compensation would raise the
+    // throttle of every test that is tilted.
     fn gains() -> Gains {
         Gains {
             rate_ki: 0.0,
             yaw_ki: 0.0,
+            tilt_compensation: false,
             ..Gains::default()
         }
     }
@@ -349,7 +414,12 @@ mod tests {
     // and accelerometer reading on every step. The next update is the
     // first one flown.
     fn calibrated(gyro: GyroRates, accel: Accel) -> Controller {
-        let mut controller = Controller::new(gains());
+        calibrated_with(gains(), gyro, accel)
+    }
+
+    // The same with the given gains.
+    fn calibrated_with(gains: Gains, gyro: GyroRates, accel: Accel) -> Controller {
+        let mut controller = Controller::new(gains);
         for _ in 0..CALIBRATION_STEPS {
             controller.update(gyro, accel, LEVEL_TARGETS, DT);
         }
@@ -560,5 +630,180 @@ mod tests {
         let commands = controller.update(ZERO_RATES, LEVEL, LEVEL_TARGETS, DT);
         assert_eq!(commands, MOTORS_OFF);
         assert_eq!(controller.state(), State::Calibrating);
+    }
+
+    // ---- The tilt compensation. Named after the table in `Stage3-b.md`.
+
+    // The limit the tests use, in degrees.
+    const LIMIT: f32 = 45.0;
+
+    // An attitude at the given roll and pitch, in degrees.
+    fn attitude_at(roll: f32, pitch: f32) -> Attitude {
+        Attitude { roll, pitch }
+    }
+
+    // What the throttle is multiplied by at the given roll and pitch.
+    fn multiplier(roll: f32, pitch: f32) -> f32 {
+        compensate_for_tilt(1.0, attitude_at(roll, pitch), LIMIT)
+    }
+
+    // Multipliers are compared to four decimal places.
+    fn assert_multiplier(roll: f32, pitch: f32, expected: f32) {
+        let got = multiplier(roll, pitch);
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "roll {roll}°, pitch {pitch}°: got × {got}, expected × {expected}"
+        );
+    }
+
+    // The first commands flown by a controller calibrated at 30° of roll,
+    // with a level target, a throttle of 0.5 and no rotation, with the tilt
+    // compensation on or off.
+    fn first_commands_at_30(tilt_compensation: bool) -> MotorCommands {
+        let gains = Gains {
+            tilt_compensation,
+            tilt_compensation_limit: LIMIT,
+            ..gains()
+        };
+        let accel = reading_at(30.0, 0.0);
+        let mut controller = calibrated_with(gains, ZERO_RATES, accel);
+        let targets = Targets {
+            throttle: 0.5,
+            ..LEVEL_TARGETS
+        };
+        controller.update(ZERO_RATES, accel, targets, DT)
+    }
+
+    fn average(commands: MotorCommands) -> f32 {
+        (commands.fl + commands.fr + commands.br + commands.bl) / 4.0
+    }
+
+    #[test]
+    fn test_level_changes_nothing() {
+        // Roll 0°, pitch 0°: the throttle that went in.
+        for throttle in [0.0, 0.3, 0.7002, 1.0] {
+            let out = compensate_for_tilt(throttle, attitude_at(0.0, 0.0), LIMIT);
+            assert_eq!(out, throttle);
+        }
+    }
+
+    #[test]
+    fn test_compensates_for_roll() {
+        // Roll 30°: × 1.0746, which is 1 / √(cos 30°).
+        assert_multiplier(30.0, 0.0, 1.0746);
+        // A small tilt needs very little, and a larger one more.
+        assert_multiplier(10.0, 0.0, 1.0077);
+        assert_multiplier(20.0, 0.0, 1.0316);
+
+        // It multiplies whatever throttle it is given.
+        let out = compensate_for_tilt(0.7, attitude_at(30.0, 0.0), LIMIT);
+        assert!((out - 0.7 * 1.0746).abs() < 1e-4, "got {out}");
+    }
+
+    #[test]
+    fn test_compensates_for_pitch() {
+        // Pitch 30°: the same.
+        assert_multiplier(0.0, 30.0, 1.0746);
+        assert_eq!(multiplier(0.0, 30.0), multiplier(30.0, 0.0));
+    }
+
+    #[test]
+    fn test_the_sign_does_not_matter() {
+        // Roll −30°: the same as roll 30°.
+        assert_multiplier(-30.0, 0.0, 1.0746);
+        assert_multiplier(0.0, -30.0, 1.0746);
+        assert_eq!(multiplier(-20.0, 10.0), multiplier(20.0, -10.0));
+    }
+
+    #[test]
+    fn test_compensates_for_both() {
+        // Roll 20° and pitch 20°: × 1.0642, which is
+        // 1 / √(cos 20° × cos 20°).
+        assert_multiplier(20.0, 20.0, 1.0642);
+        // More than for either alone.
+        assert!(multiplier(20.0, 20.0) > multiplier(20.0, 0.0));
+    }
+
+    #[test]
+    fn test_no_more_past_the_limit() {
+        // Roll 60°, limit 45°: × 1.1892, as at 45°. So is roll 50° with
+        // pitch 50°.
+        assert_multiplier(45.0, 0.0, 1.1892);
+        assert_multiplier(60.0, 0.0, 1.1892);
+        assert_multiplier(50.0, 50.0, 1.1892);
+        // On its side and upside down, where the cosine is zero and then
+        // negative: still the same, and still a number.
+        assert_multiplier(90.0, 0.0, 1.1892);
+        assert_multiplier(180.0, 0.0, 1.1892);
+
+        // A lower limit stops it sooner.
+        let out = compensate_for_tilt(1.0, attitude_at(30.0, 0.0), 20.0);
+        assert!((out - 1.0316).abs() < 1e-4, "got {out}");
+    }
+
+    #[test]
+    fn test_zero_stays_zero() {
+        // Throttle 0, any tilt: 0.
+        for (roll, pitch) in [(0.0, 0.0), (30.0, -20.0), (80.0, 0.0), (180.0, 0.0)] {
+            let out = compensate_for_tilt(0.0, attitude_at(roll, pitch), LIMIT);
+            assert_eq!(out, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_off_leaves_the_throttle_alone() {
+        // `tilt_compensation` false, calibrated at 30° of roll, throttle
+        // 0.5, zero rates: the four commands average 0.5, as before this
+        // item.
+        //
+        // The angle loop asks for 6 × (0 − 30) = −180 °/s and the rate loop
+        // answers 0.0014 × −180 = −0.252, so the right motors get
+        // 0.5 + 0.252 and the left ones 0.5 − 0.252.
+        let commands = first_commands_at_30(false);
+        assert_commands(commands, 0.248, 0.752, 0.752, 0.248);
+        assert!((average(commands) - 0.5).abs() < TOLERANCE);
+    }
+
+    #[test]
+    fn test_on_raises_the_throttle_in_the_controller() {
+        // The same with `tilt_compensation` true: the four commands average
+        // 0.5 × 1.0746 = 0.537. The differences between them, which are the
+        // loops' work, are the same as with it off.
+        let off = first_commands_at_30(false);
+        let on = first_commands_at_30(true);
+        let raised = 0.5 * 1.0746;
+
+        // `throttle()` reports it: 0 while calibrating, then what went to
+        // the mixer.
+        let accel = reading_at(30.0, 0.0);
+        let mut controller = Controller::new(Gains {
+            tilt_compensation: true,
+            ..gains()
+        });
+        let targets = Targets {
+            throttle: 0.5,
+            ..LEVEL_TARGETS
+        };
+        for _ in 0..CALIBRATION_STEPS {
+            controller.update(ZERO_RATES, accel, targets, DT);
+            assert_eq!(controller.throttle(), 0.0);
+        }
+        controller.update(ZERO_RATES, accel, targets, DT);
+        assert!((controller.throttle() - raised).abs() < 1e-4);
+        controller.reset();
+        assert_eq!(controller.throttle(), 0.0);
+
+        assert!(
+            (average(on) - raised).abs() < 1e-4,
+            "the four average {}",
+            average(on)
+        );
+
+        // All four went up by the same amount.
+        let lift = raised - 0.5;
+        assert!((on.fl - off.fl - lift).abs() < 1e-4);
+        assert!((on.fr - off.fr - lift).abs() < 1e-4);
+        assert!((on.br - off.br - lift).abs() < 1e-4);
+        assert!((on.bl - off.bl - lift).abs() < 1e-4);
     }
 }

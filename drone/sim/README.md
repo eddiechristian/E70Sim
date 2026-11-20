@@ -150,11 +150,13 @@ With `--support joint` the body hangs on the ball joint of Stage 2 and goes nowh
 
 | Argument | Meaning | Default |
 |---|---|---|
-| `--stage` | run as the program ran at that stage: `2a`, `2b`, `2c`, `2d` or `3a`; see [Running an earlier stage](#running-an-earlier-stage) | the latest |
+| `--stage` | run as the program ran at that stage: `2a`, `2b`, `2c`, `2d`, `3a` or `3b`; see [Running an earlier stage](#running-an-earlier-stage) | the latest |
 | `--support` | what holds the body up: `free` or `joint` | `free` |
 | `--mass` | mass of a free body, in kg | 1.2 |
 | `--drag` | drag on a free body, in N per m/s of speed | 0.4 |
 | `--takeoff-throttle` | throttle of a free body while it climbs | 0.76 |
+| `--throttle-error` | how far off the hover throttle is after the climb, as a fraction: 0.01 is 1% too much | 0 |
+| `--no-tilt-compensation` | leave the throttle alone in a tilt, as before Stage 3b | off |
 | `--axis` | which axis gets the step: `roll`, `pitch` or `yaw` | `roll` |
 | `--target` | the step: an angle in degrees for roll and pitch, a rate in °/s for yaw | 20, or 50 for yaw |
 | `--angle-kp` | angle loop gain for roll and pitch, in °/s per degree | 6 |
@@ -186,17 +188,24 @@ Where the default rate gains come from:
 - **Roll and pitch** use the gains chosen in `Stage1-d.md` (`--kp 0.002 --kd 0.00004`), divided by √2. One unit of PID output turns the quad √2 times harder than it turned the seesaw: four motors at 0.14 m from the axis, against two motors at 0.2 m.
 - **Yaw** needs a much larger gain, because the same command turns the body about 16 times more slowly. Even so, a 50 °/s yaw step drives the output to its limit for a moment.
 - **The two `Ki` values** were chosen in [`Stage2-d.md`](../../Stage2-d.md#results), to hold the drone level with one weak motor. Stages 2a, 2b and 2c had none; `--stage` gives those stages back.
+- **The throttle is raised in a tilt,** since [`Stage3-b.md`](../../Stage3-b.md#results), to make up for the lift the tilt takes away. The hover throttle the controller is told about is worked out from the body that is flown, so `--mass` and `--thrust-coeff` change it.
 - **The estimator's time constant** was 1 s through Stage 2. [`Stage3-a.md`](../../Stage3-a.md#results) made it 10 s, because a flying drone's accelerometer misleads the estimator while the drone speeds up.
 
-`plot_flight.py` draws six panels for a free run: the height; how far north and east the drone is from where it started; its three speeds; the roll and the pitch angle, each with its target and the controller's estimate; and the four motor commands with the throttle. The calibration is shaded.
+`plot_flight.py` draws six panels for a free run: the height; how far north and east the drone is from where it started; its three speeds; the roll and the pitch angle, each with its target and the controller's estimate; and the four motor commands with two throttle lines, the one asked for and the one that went to the mixer. The calibration is shaded.
 
-`measure_flight.py` prints the figures of a free run: when the drone left the ground, its height when the step starts and at the end, how far it has drifted over the ground, and when it came back to the ground if it did. For a step in roll or pitch it adds the true angle reached, the largest error of the estimate, the angle left over after the step, the speed reached and the change in height.
+`measure_flight.py` prints the figures of a free run: when the drone left the ground, its height when the step starts and at the end, how far it has drifted over the ground, and when it came back to the ground if it did. For a step in roll or pitch it adds the true angle reached, the largest error of the estimate, the angle left over after the step, the speed reached, the change in height over the step and the rate of climb at its end.
 
 ```
 ./stage3-a.sh
 ```
 
 This runs fifteen cases (a hover, tilts on both axes, other time constants and drags, the real sensors, a 20° tilt that hits the ground, and hovers with a gyro bias left in), prints their figures and saves numbered pictures into `stage3-a/`. [`stage3-a/README.md`](stage3-a/README.md) lists them.
+
+```
+./stage3-b.sh
+```
+
+This runs twelve cases (a hover with the right throttle and with one 1.4% out each way, and tilts of 10°, 20° and 30° with and without the tilt compensation), prints their figures and saves numbered pictures into `stage3-b/`. [`stage3-b/README.md`](stage3-b/README.md) lists them.
 
 The rest of this section is about runs on the joint.
 
@@ -226,13 +235,14 @@ cargo run --bin quad -- --stage 2c --ki 0.001 > quad.csv
 | `2b` | the same, with the estimator watching | the same as `2a` |
 | `2c` | the whole controller, with no I term in the rate loops | `--ki 0`, `--yaw-ki 0` |
 | `2d` | the rate loops have their I terms | nothing more |
-| `3a` | the body is free, and the estimator's time constant is longer | nothing: it is today's program |
+| `3a` | the body is free, and the estimator's time constant is longer | `--no-tilt-compensation` |
+| `3b` | the throttle is raised in a tilt | nothing: it is today's program |
 
-Every stage before `3a` also sets `--support joint` and `--estimator-tau 1`.
+Every stage before `3a` also sets `--support joint` and `--estimator-tau 1`, and every stage before `3b` sets `--no-tilt-compensation`.
 
 - **Without `--stage` the program runs as the latest stage.**
 - **An argument given as well wins over the stage,** whichever comes first. The third line above is Stage 2c with a small `Ki`.
-- **Each stage's script passes its own stage,** so `./stage2-a.sh` to `./stage3-a.sh` keep giving the figures of their stage when a later one changes a default.
+- **Each stage's script passes its own stage,** so `./stage2-a.sh` to `./stage3-b.sh` keep giving the figures of their stage when a later one changes a default.
 - **The output is the same as it was at that stage,** but for columns added to the CSV since. The scripts read columns by name, so new ones do not disturb them.
 - **Plot a `2a` or `2b` run with `plot_quad.py` or `plot_estimator.py`,** as for `--rate-only`, and a `2c` or `2d` run with `plot_angles.py`.
 
@@ -288,6 +298,7 @@ This runs sixteen cases (seven kicks, two tilted starts, a weak motor with and w
 | `accel_x`, `accel_y`, `accel_z` | g | what the accelerometer says, along the body's axes |
 | `on_ground` | | 1 while the ground holds a free body, 0 in the air and on the joint |
 | `throttle` | 0–1 | the throttle asked for |
+| `throttle_mixed` | 0–1 | the throttle that went to the mixer: the one asked for, raised in a tilt. 0 while calibrating |
 
 ### Rate loops only
 

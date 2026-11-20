@@ -89,12 +89,22 @@ fn quad() -> Quad {
     )
 }
 
-// The gains chosen so far, with the estimator's time constant as it was
-// before this item: 1 s. The test that shows the problem uses it.
+// The gains chosen so far, without the tilt compensation, which came after
+// this item (`Stage3-b.md`). These tests are about a drone that loses lift
+// when it tilts.
+fn gains() -> Gains {
+    Gains {
+        tilt_compensation: false,
+        ..Gains::default()
+    }
+}
+
+// The same with the estimator's time constant as it was before this item:
+// 1 s. The test that shows the problem uses it.
 fn gains_with_short_tau() -> Gains {
     Gains {
         estimator_time_constant: 1.0,
-        ..Gains::default()
+        ..gains()
     }
 }
 
@@ -110,7 +120,7 @@ struct Flight {
 // A flight with the chosen gains, no tilt and true sensors.
 fn flight(seconds: f32) -> Flight {
     Flight {
-        gains: Gains::default(),
+        gains: gains(),
         pitch_target: 0.0,
         gyro_bias: 0.0,
         seconds,

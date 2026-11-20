@@ -118,6 +118,9 @@ enum Stage {
     /// constant
     #[value(name = "3a")]
     S3a,
+    /// More throttle in a tilt, to make up for the lift lost
+    #[value(name = "3b")]
+    S3b,
 }
 
 /// What holds the body up, for `--support`.
@@ -142,6 +145,7 @@ struct Preset {
     yaw_ki: f32,
     support: SupportArg,
     estimator_tau: f32,
+    tilt_compensation: bool,
 }
 
 /// What `stage` used.
@@ -154,6 +158,7 @@ fn preset(stage: Stage) -> Preset {
             yaw_ki: 0.0,
             support: SupportArg::Joint,
             estimator_tau: 1.0,
+            tilt_compensation: false,
         },
         // Before the rate loops had an I term.
         Stage::S2c => Preset {
@@ -162,6 +167,7 @@ fn preset(stage: Stage) -> Preset {
             yaw_ki: 0.0,
             support: SupportArg::Joint,
             estimator_tau: 1.0,
+            tilt_compensation: false,
         },
         // Before the joint was taken away.
         Stage::S2d => Preset {
@@ -170,15 +176,26 @@ fn preset(stage: Stage) -> Preset {
             yaw_ki: 0.02,
             support: SupportArg::Joint,
             estimator_tau: 1.0,
+            tilt_compensation: false,
         },
-        // These are also the defaults of the arguments below, and a test
-        // checks that they stay the same.
+        // Before the throttle was raised in a tilt.
         Stage::S3a => Preset {
             rate_only: false,
             ki: 0.003,
             yaw_ki: 0.02,
             support: SupportArg::Free,
             estimator_tau: 10.0,
+            tilt_compensation: false,
+        },
+        // These are also the defaults of the arguments below, and a test
+        // checks that they stay the same.
+        Stage::S3b => Preset {
+            rate_only: false,
+            ki: 0.003,
+            yaw_ki: 0.02,
+            support: SupportArg::Free,
+            estimator_tau: 10.0,
+            tilt_compensation: true,
         },
     }
 }
@@ -237,6 +254,16 @@ struct Args {
     /// The motors still stay off for the first second
     #[arg(long)]
     no_calibration: bool,
+
+    /// Leave the throttle alone in a tilt, as before Stage 3b. Without
+    /// this it is raised to make up for the lift the tilt takes away
+    #[arg(long)]
+    no_tilt_compensation: bool,
+
+    /// How far off the hover throttle of a free body is, as a fraction:
+    /// 0.01 flies with 1% too much
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    throttle_error: f32,
 
     /// Run as before Stage 2c: rate loops only, with --target a rate on
     /// any axis, no calibration, and a 3 s run with the step at 0.5 s
@@ -387,6 +414,9 @@ where
         if !given("estimator_tau") {
             args.estimator_tau = preset.estimator_tau;
         }
+        if !given("no_tilt_compensation") {
+            args.no_tilt_compensation = !preset.tilt_compensation;
+        }
     }
     args
 }
@@ -401,12 +431,13 @@ fn run_for(support: SupportArg) -> Run {
 
 /// The throttle asked for at `time` seconds. On the joint it is `THROTTLE`
 /// throughout. A free body gets `--takeoff-throttle` until the climb is
-/// over and `hover`, the body's hover command, after that.
+/// over. After that it gets `hover`, the body's hover command, made wrong
+/// by `--throttle-error` if that is given.
 fn throttle_at(time: f32, args: &Args, hover: f32) -> f32 {
     match args.support {
         SupportArg::Joint => THROTTLE,
         SupportArg::Free if time < FREE_RUN.climb_until => args.takeoff_throttle,
-        SupportArg::Free => hover,
+        SupportArg::Free => hover * (1.0 + args.throttle_error),
     }
 }
 
@@ -496,6 +527,10 @@ fn gains(args: &Args) -> Gains {
         out_limit: OUT_LIMIT,
         i_limit: I_LIMIT,
         estimator_time_constant: args.estimator_tau,
+        tilt_compensation: !args.no_tilt_compensation,
+        // The hover throttle is the default's until `run_controller` has a
+        // body to ask. The limit of the compensation is not an argument.
+        ..Gains::default()
     }
 }
 
@@ -651,14 +686,19 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
         Axis::Roll | Axis::Pitch => DEFAULT_ANGLE_TARGET,
         Axis::Yaw => DEFAULT_RATE_TARGET,
     });
-    let mut controller = Controller::new(gains(args));
     let run = run_for(args.support);
-    // Zero on the joint, which has no mass; `throttle_at` does not use it
-    // there.
+    // The hover command of the body that is flown, so that `--mass` and
+    // `--thrust-coeff` change it too. On the joint, which has no mass, the
+    // gains keep their default and `throttle_at` does not use `hover`.
+    let mut gains = gains(args);
     let hover = match quad.support {
         Support::Joint => 0.0,
         Support::Free => quad.hover_command(),
     };
+    if quad.support == Support::Free {
+        gains.hover_throttle = hover;
+    }
+    let mut controller = Controller::new(gains);
 
     // With `--no-calibration`: the one accelerometer reading the controller
     // is shown while it calibrates.
@@ -677,7 +717,7 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
          north,east,height,\
          north_speed,east_speed,climb,\
          accel_x,accel_y,accel_z,\
-         on_ground,throttle"
+         on_ground,throttle,throttle_mixed"
     );
 
     for step in 0..run.steps {
@@ -754,7 +794,7 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
              {:.3},{:.3},{:.3},\
              {:.3},{:.3},{:.3},\
              {:.4},{:.4},{:.4},\
-             {on_ground},{:.4}",
+             {on_ground},{:.4},{:.4}",
             targets.roll,
             targets.pitch,
             readings.angle.roll,
@@ -788,6 +828,7 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
             readings.accel.y,
             readings.accel.z,
             targets.throttle,
+            controller.throttle(),
         );
     }
 }
@@ -1053,7 +1094,7 @@ mod tests {
 
     // The stage the program runs as when `--stage` is not given. Change it
     // when a new stage is added.
-    const LATEST: Stage = Stage::S3a;
+    const LATEST: Stage = Stage::S3b;
 
     // The settings a stage's preset covers, as the program ends up with
     // them.
@@ -1064,6 +1105,7 @@ mod tests {
             yaw_ki: args.yaw_ki,
             support: args.support,
             estimator_tau: args.estimator_tau,
+            tilt_compensation: !args.no_tilt_compensation,
         }
     }
 
@@ -1113,6 +1155,7 @@ mod tests {
                 rate_ki: 0.0,
                 yaw_ki: 0.0,
                 estimator_time_constant: 1.0,
+                tilt_compensation: false,
                 ..Gains::default()
             }
         );
@@ -1129,17 +1172,59 @@ mod tests {
             gains(&args),
             Gains {
                 estimator_time_constant: 1.0,
+                tilt_compensation: false,
                 ..Gains::default()
             }
         );
     }
 
     #[test]
-    fn test_stage_3a_is_free_with_todays_gains() {
+    fn test_stage_3a_is_free_with_no_tilt_compensation() {
         let args = parse_args(["quad", "--stage", "3a"]);
         assert!(!args.rate_only);
         assert_eq!(args.support, SupportArg::Free);
+        assert_eq!(
+            gains(&args),
+            Gains {
+                tilt_compensation: false,
+                ..Gains::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_stage_3b_has_todays_gains() {
+        let args = parse_args(["quad", "--stage", "3b"]);
+        assert_eq!(args.support, SupportArg::Free);
         assert_eq!(gains(&args), Gains::default());
+        assert!(Gains::default().tilt_compensation);
+    }
+
+    #[test]
+    fn test_tilt_compensation_can_be_turned_off() {
+        let args = parse_args(["quad", "--no-tilt-compensation"]);
+        assert!(!gains(&args).tilt_compensation);
+        let args = parse_args(["quad", "--stage", "3b", "--no-tilt-compensation"]);
+        assert!(!gains(&args).tilt_compensation);
+        // An earlier stage has it off without being told.
+        let args = parse_args(["quad", "--stage", "2d"]);
+        assert!(!gains(&args).tilt_compensation);
+    }
+
+    #[test]
+    fn test_throttle_error_makes_the_hover_throttle_wrong() {
+        let hover = 0.7002;
+        let args = parse_args(["quad", "--throttle-error", "0.014"]);
+        // Not while it climbs.
+        assert_eq!(throttle_at(2.0, &args, hover), 0.76);
+        assert!((throttle_at(4.0, &args, hover) - 0.7100).abs() < 1e-4);
+
+        let args = parse_args(["quad", "--throttle-error", "-0.014"]);
+        assert!((throttle_at(4.0, &args, hover) - 0.6904).abs() < 1e-4);
+
+        // Not on the joint.
+        let args = parse_args(["quad", "--stage", "2d", "--throttle-error", "0.1"]);
+        assert_eq!(throttle_at(4.0, &args, hover), THROTTLE);
     }
 
     #[test]

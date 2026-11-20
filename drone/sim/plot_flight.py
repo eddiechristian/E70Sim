@@ -77,7 +77,11 @@ def main():
 
     for motor in MOTORS:
         motors.plot(time, run[motor], label=motor)
-    motors.plot(time, run["throttle"], label="throttle", color="gray", linestyle="--")
+    motors.plot(time, run["throttle"], label="throttle asked for", color="gray", linestyle="--")
+    # What went to the mixer, raised for the tilt (Stage3-b.md). A CSV from
+    # before that was added has no such column.
+    if "throttle_mixed" in run:
+        motors.plot(time, run["throttle_mixed"], label="throttle to the mixer", color="black", linestyle=":")
     motors.set_ylabel("motor command (0 to 1)")
     motors.set_xlabel("time (s)")
 

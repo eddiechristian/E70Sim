@@ -26,6 +26,8 @@ The rest are for the step in roll or pitch, and empty for a run without one:
               the end of the run, when the target is level again
     speed     speed over the ground at the end of the step, in m/s
     height    change of height over the step, in metres
+    rate      how fast it is climbing at the end of the step, in m/s; negative
+              is sinking
 """
 
 import csv
@@ -83,13 +85,14 @@ def measure(run):
             "after": largest(r[angle] for r in after),
             "speed": math.hypot(step[-1]["north_speed"], step[-1]["east_speed"]),
             "height": step[-1]["height"] - step[0]["height"],
+            "rate": step[-1]["climb"],
         })
     return figures
 
 
 def main():
     print(f"{'file':26s} {'lift':>6s} {'top':>6s} {'end':>6s} {'climb':>6s} {'drift':>6s} {'landed':>7s}"
-          f" {'axis':>5s} {'asked':>6s} {'reached':>7s} {'error':>6s} {'after':>6s} {'speed':>6s} {'height':>7s}")
+          f" {'axis':>5s} {'asked':>6s} {'reached':>7s} {'error':>6s} {'after':>6s} {'speed':>6s} {'height':>7s} {'rate':>6s}")
     for path in sys.argv[1:]:
         f = measure(read_run(path))
         landed = "-" if math.isnan(f["landed"]) else f"{f['landed']:.2f}s"
@@ -97,7 +100,7 @@ def main():
                 f"{f['drift']:6.2f} {landed:>7s}")
         if "asked" in f:
             line += (f" {f['axis']:>5s} {f['asked']:6.1f} {f['reached']:7.2f} {f['error']:6.2f} "
-                     f"{f['after']:6.2f} {f['speed']:6.2f} {f['height']:7.2f}")
+                     f"{f['after']:6.2f} {f['speed']:6.2f} {f['height']:7.2f} {f['rate']:6.2f}")
         print(line)
 
 
