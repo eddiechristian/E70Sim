@@ -2,7 +2,7 @@
 """Plot the estimator's angles against the true ones, from quad.csv.
 
 Usage:
-    cargo run --bin quad > quad.csv
+    cargo run --bin quad -- --rate-only > quad.csv
     python3 plot_estimator.py [quad.csv] [picture.png]
 
 Needs matplotlib: sudo apt install python3-matplotlib

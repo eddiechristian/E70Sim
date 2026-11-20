@@ -1,6 +1,6 @@
 # sim
 
-Runs the rate PID from `../flight` against the seesaw from `../physics` and writes the result as CSV. `plot.py` turns the CSV into a graph. A second program does the same for the three-axis quad; see [The quad](#the-quad).
+Runs the rate PID from `../flight` against the seesaw from `../physics` and writes the result as CSV. `plot.py` turns the CSV into a graph. A second program runs the three-axis quad with the whole controller; see [The quad](#the-quad).
 
 The design is explained in [`Stage1-c.md`](../../Stage1-c.md) in the repo root.
 
@@ -120,27 +120,39 @@ This runs the eleven cases of the retune in [`Stage1-d.md`](../../Stage1-d.md#th
 
 ## The quad
 
-A second program runs the three-axis body from [`Stage2-a.md`](../../Stage2-a.md) in the same loop: three rate PIDs, the X mixer and four motors. It leaves the seesaw program and its scripts as they are.
+A second program runs the three-axis body in the whole loop of [`Stage2-c.md`](../../Stage2-c.md): sensors, the `Controller` from `../flight`, four motors and the body. It leaves the seesaw program and its scripts as they are.
 
 ```
 cargo run --bin quad > quad.csv
-python3 plot_quad.py
+python3 plot_angles.py
+python3 measure_angles.py quad.csv
 ```
 
-Plain `cargo run` is still the seesaw. The quad's run is the same shape: every target is 0, then one axis is asked for 50 °/s from 0.5 s to 1.5 s, then 0 again.
+Plain `cargo run` is still the seesaw. The quad's run is 5 s:
+
+- **0 to 1 s:** the calibration, with the motors off.
+- **1 to 1.5 s:** flying, with every target 0.
+- **1.5 to 3.5 s:** the step. Roll or pitch is asked for an angle of 20°, or yaw for a rate of 50 °/s.
+- **3.5 to 5 s:** every target 0 again.
 
 ```
-cargo run --bin quad -- --axis yaw > quad.csv
-cargo run --bin quad -- --axis pitch --noise 2 --delay 2 > quad.csv
+cargo run --bin quad -- --axis pitch --target -20 > quad.csv
+cargo run --bin quad -- --noise 2 --delay 2 --accel-noise 0.5 --gyro-bias 1 > quad.csv
+cargo run --bin quad -- --start-roll 20 --target 0 > quad.csv
 cargo run --bin quad -- --help
 ```
 
 | Argument | Meaning | Default |
 |---|---|---|
 | `--axis` | which axis gets the step: `roll`, `pitch` or `yaw` | `roll` |
-| `--target` | target rate during the step, in °/s | 50 |
-| `--kp`, `--ki`, `--kd` | roll and pitch gains | 0.0014, 0, 0.00003 |
-| `--yaw-kp`, `--yaw-ki`, `--yaw-kd` | yaw gains | 0.01, 0, 0 |
+| `--target` | the step: an angle in degrees for roll and pitch, a rate in °/s for yaw | 20, or 50 for yaw |
+| `--angle-kp` | angle loop gain for roll and pitch, in °/s per degree | 6 |
+| `--rate-limit` | the angle loops ask for no more than this rate, in °/s | 200 |
+| `--start-roll`, `--start-pitch` | the angle the body starts at, in degrees | 0, 0 |
+| `--no-calibration` | fly without what the calibration finds; see below | off |
+| `--rate-only` | run as before Stage 2c; see [Rate loops only](#rate-loops-only) | off |
+| `--kp`, `--ki`, `--kd` | roll and pitch rate loop gains | 0.0014, 0, 0.00003 |
+| `--yaw-kp`, `--yaw-ki`, `--yaw-kd` | yaw rate loop gains | 0.01, 0, 0 |
 | `--d-filter` | time constant of the D-term low-pass filter on all three axes, in s | 0.01 |
 | `--thrust-coeff` | thrust of each motor at full speed, in N | 6.0 |
 | `--noise`, `--delay`, `--seed` | as for the seesaw; each axis has its own gyro | 0, 0, 1 |
@@ -148,29 +160,64 @@ cargo run --bin quad -- --help
 | `--accel-noise` | accelerometer noise on each axis: standard deviation in m/s² | 0 |
 | `--estimator-tau` | time constant of the estimator, in s | 1 |
 
-The body's size (arm length, the three inertias, the yaw coefficient) and the limits are constants at the top of `src/bin/quad.rs`.
+The body's size (arm length, the three inertias, the yaw coefficient) and the limits are constants at the top of `src/bin/quad.rs`. The gain defaults are the same as `Gains::default()` in the flight crate, and a test checks that they stay so.
 
-Where the default gains come from:
+With `--no-calibration` the motors still stay off for the first second, but the controller then starts as it would with no calibration: the gyro bias is taken as zero, and the starting angle comes from one accelerometer reading. Compare a run with and without it, with `--gyro-bias 1 --accel-noise 0.5`, to see what the calibration is worth.
+
+If a calibration window fails, the program says why on standard error and the controller tries again; the motors stay off until one passes.
+
+Where the default rate gains come from:
 
 - **Roll and pitch** use the gains chosen in `Stage1-d.md` (`--kp 0.002 --kd 0.00004`), divided by √2. One unit of PID output turns the quad √2 times harder than it turned the seesaw: four motors at 0.14 m from the axis, against two motors at 0.2 m.
 - **Yaw** needs a much larger gain, because the same command turns the body about 16 times more slowly. Even so, a 50 °/s yaw step drives the output to its limit for a moment.
 
-`plot_quad.py` draws four panels: the target, true and measured rate of each axis, then the four motor commands. It takes the same two optional arguments as `plot.py`: the file to read and a picture to save.
+`plot_angles.py` draws six panels: the angle and the rate of roll, the same for pitch, the yaw rate, then the four motor commands. The calibration is shaded. It takes the same two optional arguments as `plot.py`: the file to read and a picture to save.
 
-To save pictures of a step on each axis:
+`measure_angles.py` prints the figures of an angle step: rise time, overshoot, settling time, the largest rate the angle loop asked for, how far the angle is from its target at the end of the step and at the end of the run, the largest error of the estimate, and how long a tilted start takes to come within 1° of its target.
+
+```
+./stage2-c.sh
+```
+
+This runs ten cases (a step on each axis, the real sensors with and without calibration, a tilted start, two other angle gains and two 45° steps), prints their figures and saves numbered pictures into `stage2-c/`. [`stage2-c/README.md`](stage2-c/README.md) lists them.
+
+### The quad's CSV columns
+
+| Columns | Unit | Meaning |
+|---|---|---|
+| `time` | s | step number × 0.001 |
+| `state` | | 0 while calibrating, 1 while flying |
+| `roll_angle_target`, `pitch_angle_target` | ° | the angles asked for |
+| `roll_angle`, `pitch_angle`, `yaw_angle` | ° | the true attitude |
+| `roll_estimate`, `pitch_estimate` | ° | the controller's estimate; `NaN` while calibrating |
+| `roll_target`, `pitch_target` | °/s | the rates the angle loops ask for |
+| `yaw_target` | °/s | the yaw rate asked for |
+| `roll_rate`, `pitch_rate`, `yaw_rate` | °/s | the true rates |
+| `roll_measured`, `pitch_measured`, `yaw_measured` | °/s | what the gyro says, bias included |
+| `fl`, `fr`, `br`, `bl` | 0–1 | the four motor commands |
+
+### Rate loops only
+
+With `--rate-only` the program runs as it did in [`Stage2-a.md`](../../Stage2-a.md) and [`Stage2-b.md`](../../Stage2-b.md): three rate PIDs and the mixer, no angle loops and no calibration. The estimator is given the readings every step and its angles are logged, but it is not used for control.
+
+```
+cargo run --bin quad -- --rate-only > quad.csv
+python3 plot_quad.py
+python3 measure_quad.py quad.csv
+```
+
+The run is 3 s: every target is 0, then one axis is asked for a rate of 50 °/s from 0.5 s to 1.5 s, then 0 again. `--target` is a rate on any axis. `--angle-kp`, `--rate-limit` and `--no-calibration` do nothing here.
+
+`plot_quad.py` draws four panels: the target, true and measured rate of each axis, then the four motor commands.
 
 ```
 ./stage2-a.sh
 ```
 
-This runs five cases (a step on roll, pitch and yaw, then roll and yaw again with noise and delay), prints the figures for each with `measure_quad.py` and saves numbered pictures into `stage2-a/`. [`stage2-a/README.md`](stage2-a/README.md) lists them. `python3 measure_quad.py quad.csv` prints the same figures for any run.
-
-### The estimator
-
-The estimator of [`Stage2-b.md`](../../Stage2-b.md) runs in the same program. It is given the gyro readings and an accelerometer reading every step, and its roll and pitch are logged next to the true ones. It is not used for control yet.
+This runs five cases (a step on roll, pitch and yaw, then roll and yaw again with noise and delay), prints the figures for each with `measure_quad.py` and saves numbered pictures into `stage2-a/`. [`stage2-a/README.md`](stage2-a/README.md) lists them.
 
 ```
-cargo run --bin quad -- --noise 2 --delay 2 --accel-noise 0.5 > quad.csv
+cargo run --bin quad -- --rate-only --noise 2 --delay 2 --accel-noise 0.5 > quad.csv
 python3 plot_estimator.py
 python3 measure_estimator.py quad.csv
 ```
@@ -183,7 +230,7 @@ python3 measure_estimator.py quad.csv
 
 This runs seven cases (clean, noisy, a gyro bias, and three other time constants), prints their figures and saves numbered pictures into `stage2-b/`. [`stage2-b/README.md`](stage2-b/README.md) lists them.
 
-### The quad's CSV columns
+The CSV has other columns in this mode:
 
 | Columns | Unit | Meaning |
 |---|---|---|
@@ -215,4 +262,4 @@ This runs seven cases (clean, noisy, a gyro bias, and three other time constants
 cargo test
 ```
 
-The tests cover the seesaw program's `target_at` and `mix`, the quad program's `targets_at`, the mixer and the body together (`tests/mixer_and_body.rs`), and the estimator and the body together (`tests/estimator_and_body.rs`). The PID, the mixer, the estimator, the motor, the seesaw, the gyro, the quaternion and the body have their own tests in `../flight` and `../physics`.
+The tests cover the seesaw program's `target_at` and `mix`, the quad program's targets and default gains, the mixer and the body together (`tests/mixer_and_body.rs`), the estimator and the body together (`tests/estimator_and_body.rs`), and the controller and the body together (`tests/controller_and_body.rs`). The PID, the mixer, the estimator, the calibration, the controller, the motor, the seesaw, the gyro, the quaternion and the body have their own tests in `../flight` and `../physics`.

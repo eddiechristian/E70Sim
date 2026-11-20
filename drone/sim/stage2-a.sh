@@ -13,11 +13,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo build --quiet --bin quad
 
-# name, then the arguments of the run
+# name, then the arguments of the run. Every run has --rate-only as well:
+# these cases are from before the angle loops and the calibration.
 run_case() {
     name=$1
     shift
-    cargo run --quiet --bin quad -- "$@" > "$tmp/$name.csv"
+    cargo run --quiet --bin quad -- --rate-only "$@" > "$tmp/$name.csv"
     python3 plot_quad.py "$tmp/$name.csv" "stage2-a/$name.png" --title "$name:  $*"
 }
 

@@ -1,31 +1,47 @@
-//! Rate loops on the quad: three PIDs, the X mixer and four motors, CSV on
-//! standard output. The estimator watches and its angles are logged next to
-//! the true ones; it is not used for control yet.
+//! The quad in the whole loop: sensors, the `Controller` of the flight
+//! crate, four motors and the body, CSV on standard output.
 //!
-//! This is the loop of `src/main.rs` with three axes in place of one. The
-//! parts are explained in `Stage2-a.md` and `Stage2-b.md` in the repo root.
+//! The run is one second of calibration with the motors off, then a step in
+//! angle on roll or pitch, or a step in rate on yaw. The parts are explained
+//! in `Stage2-a.md`, `Stage2-b.md` and `Stage2-c.md` in the repo root.
+//!
+//! With `--rate-only` the program runs as it did before Stage 2c: three rate
+//! PIDs and the mixer, no angle loops and no calibration, with the estimator
+//! only watching. The Stage 2a and 2b scripts use it.
 //!
 //! Run with `cargo run --bin quad > quad.csv`, then plot with
-//! `python3 plot_quad.py` (rates and motors) or `python3 plot_estimator.py`
-//! (estimated against true angles). `cargo run --bin quad -- --help` lists the
+//! `python3 plot_angles.py`. `cargo run --bin quad -- --help` lists the
 //! arguments.
 
 use clap::{Parser, ValueEnum};
-use flight::estimator::{Estimator, GyroRates};
+use flight::calibration::CALIBRATION_STEPS;
+use flight::controller::{Controller, Gains, State, Targets};
+use flight::estimator::{Accel, Estimator, GyroRates};
 use flight::mixer::{MixerInput, mix};
 use flight::pid::Pid;
 use physics::gyro::Gyro;
 use physics::motor::Motor;
 use physics::quad::{G, Inertia, Motors, Quad};
+use physics::quat::Angles;
 
 // Time
 const DT: f32 = 0.001; // s; one step, 1 kHz
-const STEPS: u32 = 3000; // 3 simulated seconds
 
-// The run: every target 0, then `--target` on the chosen axis from
-// STEP_START to STEP_END, then 0 again.
-const STEP_START: f32 = 0.5; // s
-const STEP_END: f32 = 1.5; // s
+// The run: the calibration takes the first second, with the motors off.
+// Then every target is 0, then `--target` on the chosen axis from STEP_START
+// to STEP_END, then 0 again.
+const STEPS: u32 = 5000; // 5 simulated seconds
+const STEP_START: f32 = 1.5; // s
+const STEP_END: f32 = 3.5; // s
+
+// The run with `--rate-only`: no calibration, so everything is earlier.
+const RATE_ONLY_STEPS: u32 = 3000; // 3 simulated seconds
+const RATE_ONLY_STEP_START: f32 = 0.5; // s
+const RATE_ONLY_STEP_END: f32 = 1.5; // s
+
+// The step when `--target` is not given.
+const DEFAULT_ANGLE_TARGET: f32 = 20.0; // °; roll and pitch
+const DEFAULT_RATE_TARGET: f32 = 50.0; // °/s; yaw, and all three with `--rate-only`
 
 // Mixer
 const THROTTLE: f32 = 0.7; // shared by all four motors, 0.0 to 1.0
@@ -59,26 +75,55 @@ struct PerAxis {
     yaw: f32,
 }
 
-/// Rate loops on the quad. Writes CSV to standard output.
+/// The quad in the whole loop. Writes CSV to standard output.
 #[derive(Parser)]
 struct Args {
     /// Which axis gets the step
     #[arg(long, value_enum, default_value_t = Axis::Roll)]
     axis: Axis,
 
-    /// Target rate during the step, in °/s
-    #[arg(long, default_value_t = 50.0)]
-    target: f32,
+    /// Target during the step: an angle in degrees for roll and pitch
+    /// [default: 20], a rate in °/s for yaw and with --rate-only
+    /// [default: 50]
+    #[arg(long, allow_negative_numbers = true)]
+    target: Option<f32>,
 
-    /// Roll and pitch proportional gain, in throttle per °/s
+    /// Angle loop gain for roll and pitch, in °/s per degree
+    #[arg(long, default_value_t = 6.0)]
+    angle_kp: f32,
+
+    /// The angle loops ask for no more than this rate, in °/s
+    #[arg(long, default_value_t = 200.0)]
+    rate_limit: f32,
+
+    /// Fly without what the calibration finds: the gyro bias is taken as
+    /// zero and the starting angle comes from one accelerometer reading.
+    /// The motors still stay off for the first second
+    #[arg(long)]
+    no_calibration: bool,
+
+    /// Run as before Stage 2c: rate loops only, with --target a rate on
+    /// any axis, no calibration, and a 3 s run with the step at 0.5 s
+    #[arg(long)]
+    rate_only: bool,
+
+    /// Roll the body starts at, in degrees
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    start_roll: f32,
+
+    /// Pitch the body starts at, in degrees
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    start_pitch: f32,
+
+    /// Roll and pitch rate loop proportional gain, in throttle per °/s
     #[arg(long, default_value_t = 0.0014)]
     kp: f32,
 
-    /// Roll and pitch integral gain
+    /// Roll and pitch rate loop integral gain
     #[arg(long, default_value_t = 0.0)]
     ki: f32,
 
-    /// Roll and pitch derivative gain
+    /// Roll and pitch rate loop derivative gain
     #[arg(long, default_value_t = 0.00003)]
     kd: f32,
 
@@ -107,8 +152,8 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     noise: f32,
 
-    /// Loop delay: the PIDs and the estimator see the gyro readings from
-    /// this many steps ago
+    /// Loop delay: the flight code sees the gyro readings from this many
+    /// steps ago
     #[arg(long, default_value_t = 0)]
     delay: usize,
 
@@ -129,15 +174,35 @@ struct Args {
     seed: u64,
 }
 
-/// The three target rates in °/s at `time` seconds: `target` on `axis`
-/// during the step, and 0 everywhere else.
-fn targets_at(time: f32, axis: Axis, target: f32) -> PerAxis {
+/// What the controller is asked for at `time` seconds: level, no yaw and
+/// the shared throttle, with `target` on `axis` during the step. For roll
+/// and pitch the target is an angle in degrees; for yaw it is a rate in °/s.
+fn targets_at(time: f32, axis: Axis, target: f32) -> Targets {
+    let mut targets = Targets {
+        roll: 0.0,
+        pitch: 0.0,
+        yaw_rate: 0.0,
+        throttle: THROTTLE,
+    };
+    if (STEP_START..STEP_END).contains(&time) {
+        match axis {
+            Axis::Roll => targets.roll = target,
+            Axis::Pitch => targets.pitch = target,
+            Axis::Yaw => targets.yaw_rate = target,
+        }
+    }
+    targets
+}
+
+/// With `--rate-only`: the three target rates in °/s at `time` seconds,
+/// `target` on `axis` during the step and 0 everywhere else.
+fn rate_targets_at(time: f32, axis: Axis, target: f32) -> PerAxis {
     let mut targets = PerAxis {
         roll: 0.0,
         pitch: 0.0,
         yaw: 0.0,
     };
-    if (STEP_START..STEP_END).contains(&time) {
+    if (RATE_ONLY_STEP_START..RATE_ONLY_STEP_END).contains(&time) {
         match axis {
             Axis::Roll => targets.roll = target,
             Axis::Pitch => targets.pitch = target,
@@ -147,7 +212,25 @@ fn targets_at(time: f32, axis: Axis, target: f32) -> PerAxis {
     targets
 }
 
-/// A rate PID with the limits and the D-term filter set.
+/// The controller's gains and limits, from the arguments.
+fn gains(args: &Args) -> Gains {
+    Gains {
+        angle_kp: args.angle_kp,
+        rate_limit: args.rate_limit,
+        rate_kp: args.kp,
+        rate_ki: args.ki,
+        rate_kd: args.kd,
+        yaw_kp: args.yaw_kp,
+        yaw_ki: args.yaw_ki,
+        yaw_kd: args.yaw_kd,
+        d_filter: args.d_filter,
+        out_limit: OUT_LIMIT,
+        i_limit: I_LIMIT,
+        estimator_time_constant: args.estimator_tau,
+    }
+}
+
+/// With `--rate-only`: a rate PID with the limits and the D-term filter set.
 fn rate_pid(kp: f32, ki: f32, kd: f32, d_filter: f32) -> Pid {
     let mut pid = Pid::new(kp, ki, kd);
     pid.out_min = -OUT_LIMIT;
@@ -165,6 +248,91 @@ fn to_body(commands: flight::mixer::MotorCommands) -> physics::quad::MotorComman
         fr: commands.fr,
         br: commands.br,
         bl: commands.bl,
+    }
+}
+
+/// The gyro and the accelerometer: the body's true values in, what the
+/// flight code is told out.
+struct Sensors {
+    // One gyro per axis, each with its own noise. They work in rad/s, as
+    // the rest of the physics crate does.
+    roll_gyro: Gyro,
+    pitch_gyro: Gyro,
+    yaw_gyro: Gyro,
+
+    // One noise source per accelerometer axis, in m/s². `Gyro` is a
+    // noise-and-delay stage for any one number. The accelerometer gets no
+    // delay: the queue of a delayed `Gyro` starts with zeros, which is not
+    // what a still accelerometer reads.
+    accel_x: Gyro,
+    accel_y: Gyro,
+    accel_z: Gyro,
+}
+
+/// One step's readings, and the true values next to them for the log.
+struct Readings {
+    rate: PerAxis,     // °/s; the true rates
+    measured: PerAxis, // °/s; what the gyro says
+    angle: PerAxis,    // °; the true attitude
+    accel: Accel,      // g; what the accelerometer says
+}
+
+impl Sensors {
+    fn new(args: &Args) -> Self {
+        let noise = args.noise.to_radians();
+        let mut roll_gyro = Gyro::new(noise, args.delay, args.seed);
+        let mut pitch_gyro = Gyro::new(noise, args.delay, args.seed + 1);
+        let mut yaw_gyro = Gyro::new(noise, args.delay, args.seed + 2);
+        for gyro in [&mut roll_gyro, &mut pitch_gyro, &mut yaw_gyro] {
+            gyro.bias = args.gyro_bias.to_radians();
+        }
+        Self {
+            roll_gyro,
+            pitch_gyro,
+            yaw_gyro,
+            accel_x: Gyro::new(args.accel_noise, 0, args.seed + 3),
+            accel_y: Gyro::new(args.accel_noise, 0, args.seed + 4),
+            accel_z: Gyro::new(args.accel_noise, 0, args.seed + 5),
+        }
+    }
+
+    fn read(&mut self, quad: &Quad) -> Readings {
+        let true_rates = quad.rates();
+        let true_angles = quad.angles();
+        let true_accel = quad.accel();
+        Readings {
+            rate: PerAxis {
+                roll: true_rates.roll.to_degrees(),
+                pitch: true_rates.pitch.to_degrees(),
+                yaw: true_rates.yaw.to_degrees(),
+            },
+            measured: PerAxis {
+                roll: self.roll_gyro.read(true_rates.roll).to_degrees(),
+                pitch: self.pitch_gyro.read(true_rates.pitch).to_degrees(),
+                yaw: self.yaw_gyro.read(true_rates.yaw).to_degrees(),
+            },
+            angle: PerAxis {
+                roll: true_angles.roll.to_degrees(),
+                pitch: true_angles.pitch.to_degrees(),
+                yaw: true_angles.yaw.to_degrees(),
+            },
+            accel: Accel {
+                x: self.accel_x.read(true_accel.x) / G,
+                y: self.accel_y.read(true_accel.y) / G,
+                z: self.accel_z.read(true_accel.z) / G,
+            },
+        }
+    }
+}
+
+/// `accel` scaled to a length of 1 g. Its direction, and so the angles it
+/// gives, do not change.
+fn one_g_long(accel: Accel) -> Accel {
+    let length = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
+    Accel {
+        x: accel.x / length,
+        y: accel.y / length,
+        z: accel.z / length,
     }
 }
 
@@ -187,25 +355,136 @@ fn main() {
             bl: motor(),
         },
     );
+    quad.set_attitude(Angles {
+        roll: args.start_roll.to_radians(),
+        pitch: args.start_pitch.to_radians(),
+        yaw: 0.0,
+    });
+    let mut sensors = Sensors::new(&args);
 
-    // One gyro per axis, each with its own noise. They work in rad/s, as the
-    // rest of the physics crate does.
-    let noise = args.noise.to_radians();
-    let mut roll_gyro = Gyro::new(noise, args.delay, args.seed);
-    let mut pitch_gyro = Gyro::new(noise, args.delay, args.seed + 1);
-    let mut yaw_gyro = Gyro::new(noise, args.delay, args.seed + 2);
-    for gyro in [&mut roll_gyro, &mut pitch_gyro, &mut yaw_gyro] {
-        gyro.bias = args.gyro_bias.to_radians();
+    if args.rate_only {
+        run_rate_only(&args, &mut quad, &mut sensors);
+    } else {
+        run_controller(&args, &mut quad, &mut sensors);
     }
+}
 
-    // One noise source per accelerometer axis, in m/s². `Gyro` is a
-    // noise-and-delay stage for any one number. The accelerometer gets no
-    // delay: the queue of a delayed `Gyro` starts with zeros, which is not
-    // what a still accelerometer reads.
-    let mut accel_x = Gyro::new(args.accel_noise, 0, args.seed + 3);
-    let mut accel_y = Gyro::new(args.accel_noise, 0, args.seed + 4);
-    let mut accel_z = Gyro::new(args.accel_noise, 0, args.seed + 5);
+/// The whole loop: each step reads the sensors, calls the controller and
+/// steps the body with the motor commands it returns.
+fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
+    let step_target = args.target.unwrap_or(match args.axis {
+        Axis::Roll | Axis::Pitch => DEFAULT_ANGLE_TARGET,
+        Axis::Yaw => DEFAULT_RATE_TARGET,
+    });
+    let mut controller = Controller::new(gains(args));
 
+    // With `--no-calibration`: the one accelerometer reading the controller
+    // is shown while it calibrates.
+    let mut first_accel = None;
+
+    println!(
+        "time,state,\
+         roll_angle_target,pitch_angle_target,\
+         roll_angle,pitch_angle,yaw_angle,\
+         roll_estimate,pitch_estimate,\
+         roll_target,pitch_target,yaw_target,\
+         roll_rate,pitch_rate,yaw_rate,\
+         roll_measured,pitch_measured,yaw_measured,\
+         fl,fr,br,bl"
+    );
+
+    for step in 0..STEPS {
+        let time = step as f32 * DT;
+        let targets = targets_at(time, args.axis, step_target);
+
+        // 1. Read the sensors.
+        let readings = sensors.read(quad);
+        let mut sensor_gyro = GyroRates {
+            roll: readings.measured.roll,
+            pitch: readings.measured.pitch,
+            yaw: readings.measured.yaw,
+        };
+        let mut sensor_accel = readings.accel;
+
+        //    Without calibration the controller would take the gyro bias as
+        //    zero and its starting angle from the first accelerometer
+        //    reading. Showing it a gyro reading of zero and that one
+        //    accelerometer reading while it calibrates gives exactly that.
+        //    The reading is made 1 g long so that noise on it cannot fail
+        //    the calibration's check of its length.
+        if args.no_calibration && controller.state() == State::Calibrating {
+            sensor_gyro = GyroRates {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            };
+            sensor_accel = *first_accel.get_or_insert(one_g_long(readings.accel));
+        }
+
+        // 2. Call the controller. The state logged is the one it was in
+        //    when it worked out the commands.
+        let state = match controller.state() {
+            State::Calibrating => 0,
+            State::Flying => 1,
+        };
+        let commands = controller.update(sensor_gyro, sensor_accel, targets, DT);
+
+        //    A calibration window that failed: say why. The controller has
+        //    started a new one.
+        if controller.state() == State::Calibrating && (step + 1) % CALIBRATION_STEPS == 0 {
+            eprintln!(
+                "calibration failed at {:.3} s: {}",
+                time + DT,
+                controller.last_failure().unwrap_or("no reason given")
+            );
+        }
+
+        // 3. Step the body.
+        quad.step(to_body(commands), DT);
+
+        // 4. Print one CSV line. There is no estimate while calibrating.
+        let (roll_estimate, pitch_estimate) = match controller.attitude() {
+            Some(attitude) => (attitude.roll, attitude.pitch),
+            None => (f32::NAN, f32::NAN),
+        };
+        println!(
+            "{time:.3},{state},\
+             {:.1},{:.1},\
+             {:.3},{:.3},{:.3},\
+             {:.3},{:.3},\
+             {:.2},{:.2},{:.2},\
+             {:.3},{:.3},{:.3},\
+             {:.3},{:.3},{:.3},\
+             {:.5},{:.5},{:.5},{:.5}",
+            targets.roll,
+            targets.pitch,
+            readings.angle.roll,
+            readings.angle.pitch,
+            readings.angle.yaw,
+            roll_estimate,
+            pitch_estimate,
+            controller.roll_rate_target(),
+            controller.pitch_rate_target(),
+            targets.yaw_rate,
+            readings.rate.roll,
+            readings.rate.pitch,
+            readings.rate.yaw,
+            readings.measured.roll,
+            readings.measured.pitch,
+            readings.measured.yaw,
+            commands.fl,
+            commands.fr,
+            commands.br,
+            commands.bl,
+        );
+    }
+}
+
+/// The loop as it was before Stage 2c: three rate PIDs and the mixer, held
+/// here and not in a `Controller`. The estimator watches and its angles are
+/// logged; it is not used for control.
+fn run_rate_only(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
+    let step_target = args.target.unwrap_or(DEFAULT_RATE_TARGET);
     let mut estimator = Estimator::new(args.estimator_tau);
 
     let mut roll_pid = rate_pid(args.kp, args.ki, args.kd, args.d_filter);
@@ -223,38 +502,18 @@ fn main() {
          fl,fr,br,bl"
     );
 
-    for step in 0..STEPS {
+    for step in 0..RATE_ONLY_STEPS {
         let time = step as f32 * DT;
-        let target = targets_at(time, args.axis, args.target);
+        let target = rate_targets_at(time, args.axis, step_target);
 
-        // 1. Read the three gyros. `rate` is the true rate and `measured` is
-        //    what the PIDs are told, both in °/s.
-        let true_rates = quad.rates();
-        let rate = PerAxis {
-            roll: true_rates.roll.to_degrees(),
-            pitch: true_rates.pitch.to_degrees(),
-            yaw: true_rates.yaw.to_degrees(),
-        };
-        let measured = PerAxis {
-            roll: roll_gyro.read(true_rates.roll).to_degrees(),
-            pitch: pitch_gyro.read(true_rates.pitch).to_degrees(),
-            yaw: yaw_gyro.read(true_rates.yaw).to_degrees(),
-        };
-        let true_angles = quad.angles();
-        let angle = PerAxis {
-            roll: true_angles.roll.to_degrees(),
-            pitch: true_angles.pitch.to_degrees(),
-            yaw: true_angles.yaw.to_degrees(),
-        };
-
-        //    The accelerometer, in m/s², and the estimator, which takes the
-        //    same gyro readings as the PIDs and the accelerometer in g.
-        let true_accel = quad.accel();
-        let accel = flight::estimator::Accel {
-            x: accel_x.read(true_accel.x) / G,
-            y: accel_y.read(true_accel.y) / G,
-            z: accel_z.read(true_accel.z) / G,
-        };
+        // 1. Read the sensors. The estimator takes the same gyro readings
+        //    as the PIDs.
+        let Readings {
+            rate,
+            measured,
+            angle,
+            accel,
+        } = sensors.read(quad);
         let gyro_rates = GyroRates {
             roll: measured.roll,
             pitch: measured.pitch,
@@ -325,13 +584,24 @@ mod tests {
         yaw: 0.0,
     };
 
+    const LEVEL: Targets = Targets {
+        roll: 0.0,
+        pitch: 0.0,
+        yaw_rate: 0.0,
+        throttle: THROTTLE,
+    };
+
+    const AXES: [Axis; 3] = [Axis::Roll, Axis::Pitch, Axis::Yaw];
+
+    // ---- The controller's targets
+
     #[test]
-    fn test_targets_are_zero_outside_the_step() {
-        for axis in [Axis::Roll, Axis::Pitch, Axis::Yaw] {
-            assert_eq!(targets_at(0.0, axis, 50.0), ZERO);
-            assert_eq!(targets_at(STEP_START - 0.001, axis, 50.0), ZERO);
-            assert_eq!(targets_at(STEP_END, axis, 50.0), ZERO);
-            assert_eq!(targets_at(STEP_END + 1.0, axis, 50.0), ZERO);
+    fn test_targets_are_level_outside_the_step() {
+        for axis in AXES {
+            assert_eq!(targets_at(0.0, axis, 20.0), LEVEL);
+            assert_eq!(targets_at(STEP_START - 0.001, axis, 20.0), LEVEL);
+            assert_eq!(targets_at(STEP_END, axis, 20.0), LEVEL);
+            assert_eq!(targets_at(STEP_END + 1.0, axis, 20.0), LEVEL);
         }
     }
 
@@ -339,26 +609,101 @@ mod tests {
     fn test_only_the_chosen_axis_gets_the_step() {
         let time = (STEP_START + STEP_END) / 2.0;
         assert_eq!(
-            targets_at(time, Axis::Roll, 50.0),
+            targets_at(time, Axis::Roll, 20.0),
+            Targets {
+                roll: 20.0,
+                ..LEVEL
+            }
+        );
+        assert_eq!(
+            targets_at(time, Axis::Pitch, 20.0),
+            Targets {
+                pitch: 20.0,
+                ..LEVEL
+            }
+        );
+        // On yaw the target is a rate.
+        assert_eq!(
+            targets_at(time, Axis::Yaw, -30.0),
+            Targets {
+                yaw_rate: -30.0,
+                ..LEVEL
+            }
+        );
+    }
+
+    #[test]
+    fn test_step_starts_and_ends_on_time() {
+        assert_eq!(targets_at(STEP_START, Axis::Roll, 20.0).roll, 20.0);
+        assert_eq!(targets_at(STEP_END - 0.001, Axis::Roll, 20.0).roll, 20.0);
+    }
+
+    #[test]
+    fn test_step_starts_after_the_calibration() {
+        assert!(STEP_START > CALIBRATION_STEPS as f32 * DT);
+        assert!(STEP_END < STEPS as f32 * DT);
+    }
+
+    #[test]
+    fn test_default_gains_are_the_flight_crates() {
+        // The arguments' defaults are written out a second time above, for
+        // `--help`. They must stay the same as `Gains::default()`.
+        let args = Args::parse_from(["quad"]);
+        assert_eq!(gains(&args), Gains::default());
+    }
+
+    #[test]
+    fn test_one_g_long() {
+        let accel = one_g_long(Accel {
+            x: 0.0,
+            y: 0.6,
+            z: -1.2,
+        });
+        assert!((accel.y - 0.4472).abs() < 1e-4);
+        assert!((accel.z + 0.8944).abs() < 1e-4);
+    }
+
+    // ---- With `--rate-only`
+
+    #[test]
+    fn test_rate_targets_are_zero_outside_the_step() {
+        for axis in AXES {
+            assert_eq!(rate_targets_at(0.0, axis, 50.0), ZERO);
+            assert_eq!(
+                rate_targets_at(RATE_ONLY_STEP_START - 0.001, axis, 50.0),
+                ZERO
+            );
+            assert_eq!(rate_targets_at(RATE_ONLY_STEP_END, axis, 50.0), ZERO);
+            assert_eq!(rate_targets_at(RATE_ONLY_STEP_END + 1.0, axis, 50.0), ZERO);
+        }
+    }
+
+    #[test]
+    fn test_only_the_chosen_axis_gets_the_rate_step() {
+        let time = (RATE_ONLY_STEP_START + RATE_ONLY_STEP_END) / 2.0;
+        assert_eq!(
+            rate_targets_at(time, Axis::Roll, 50.0),
             PerAxis { roll: 50.0, ..ZERO }
         );
         assert_eq!(
-            targets_at(time, Axis::Pitch, 50.0),
+            rate_targets_at(time, Axis::Pitch, 50.0),
             PerAxis {
                 pitch: 50.0,
                 ..ZERO
             }
         );
         assert_eq!(
-            targets_at(time, Axis::Yaw, -20.0),
+            rate_targets_at(time, Axis::Yaw, -20.0),
             PerAxis { yaw: -20.0, ..ZERO }
         );
     }
 
     #[test]
-    fn test_step_starts_and_ends_on_time() {
-        assert_eq!(targets_at(STEP_START, Axis::Roll, 50.0).roll, 50.0);
-        assert_eq!(targets_at(STEP_END - 0.001, Axis::Roll, 50.0).roll, 50.0);
+    fn test_rate_step_starts_and_ends_on_time() {
+        let start = rate_targets_at(RATE_ONLY_STEP_START, Axis::Roll, 50.0);
+        let end = rate_targets_at(RATE_ONLY_STEP_END - 0.001, Axis::Roll, 50.0);
+        assert_eq!(start.roll, 50.0);
+        assert_eq!(end.roll, 50.0);
     }
 
     #[test]

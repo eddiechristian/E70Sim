@@ -429,9 +429,11 @@ The body and the mixer are wired into the simulation as a second program, next t
 
 ```
 cd drone/sim
-cargo run --bin quad > quad.csv
+cargo run --bin quad -- --rate-only > quad.csv
 python3 plot_quad.py
 ```
+
+`--rate-only` runs the program as it was at this stage. Without it the program now runs the whole loop of [Stage 2c](Stage2-c.md#in-the-simulation), with the angle loops and the calibration.
 
 It is the Stage 1 loop with three of everything: three gyros, three rate PIDs, the mixer and the body. One axis, chosen with `--axis`, is asked for 50 °/s for a second, and the other two are held at 0. [`drone/sim/README.md`](drone/sim/README.md#the-quad) lists the arguments and the CSV columns.
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Plot quad.csv from the quad rate loop simulation.
+"""Plot the rates and the motors of quad.csv, from the quad simulation.
 
 Usage:
-    cargo run --bin quad > quad.csv
+    cargo run --bin quad -- --rate-only > quad.csv
     python3 plot_quad.py [quad.csv] [picture.png]
+
+For a run with the angle loops, plot_angles.py shows the angles as well.
 
 Needs matplotlib: sudo apt install python3-matplotlib
 """

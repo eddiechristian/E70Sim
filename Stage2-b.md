@@ -362,7 +362,7 @@ The quad program of [Stage 2a](Stage2-a.md#in-the-simulation) gains:
 - **CSV columns:** `roll_estimate` and `pitch_estimate`, next to the true `roll_angle` and `pitch_angle` that are already there.
 - **A plot** of estimate against truth for roll and pitch. This is the "compare its angles with the true angles" of the checklist item.
 
-The estimate is not used for control yet. The rate loops run as before, and the estimator only watches. That keeps this item's question simple: is the estimate right?
+The estimate is not used for control yet. The rate loops run as before, and the estimator only watches. Since [Stage 2c](Stage2-c.md#in-the-simulation) the program runs this way only with `--rate-only`. That keeps this item's question simple: is the estimate right?
 
 ## Results
 

@@ -2,7 +2,7 @@
 
 A 50 °/s step on each axis of the quad, with the other two axes held at 0. Explained in [`Stage2-a.md`](../../../Stage2-a.md#in-the-simulation).
 
-Regenerate with `./stage2-a.sh` from `drone/sim/`. All five use the default gains: roll and pitch `Kp` 0.0014 and `Kd` 0.00003, yaw `Kp` 0.01, and a D-term filter of 0.01 s. The last two add `--noise 2 --delay 2` with the default seed.
+Regenerate with `./stage2-a.sh` from `drone/sim/`. The script runs the quad program with `--rate-only`: the loop as it was in Stage 2a, with no angle loops and no calibration. All five use the default gains: roll and pitch `Kp` 0.0014 and `Kd` 0.00003, yaw `Kp` 0.01, and a D-term filter of 0.01 s. The last two add `--noise 2 --delay 2` with the default seed.
 
 | Picture | Rise | Overshoot | Settle | Other axes | Motor jitter | Motor commands | What it shows |
 |---|---|---|---|---|---|---|---|

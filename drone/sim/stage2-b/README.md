@@ -2,7 +2,7 @@
 
 The estimator's roll and pitch against the true angles of the body, while the rate loops run. Explained in [`Stage2-b.md`](../../../Stage2-b.md#results).
 
-Regenerate with `./stage2-b.sh` from `drone/sim/`. Every run is 3 s. All but the first use `--noise 2 --delay 2 --accel-noise 0.5` (gyro noise of 2 °/s, a delay of two steps, accelerometer noise of 0.5 m/s²) and the default seed. The time constant is 1 s unless the name says otherwise.
+Regenerate with `./stage2-b.sh` from `drone/sim/`. The script runs the quad program with `--rate-only`: the rate loops alone, with the estimator only watching. Every run is 3 s. All but the first use `--noise 2 --delay 2 --accel-noise 0.5` (gyro noise of 2 °/s, a delay of two steps, accelerometer noise of 0.5 m/s²) and the default seed. The time constant is 1 s unless the name says otherwise.
 
 | Picture | Roll: start | Roll: end | Roll: wobble | Pitch: end | What it shows |
 |---|---|---|---|---|---|

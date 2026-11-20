@@ -294,15 +294,56 @@ These need no body. They check the `Controller` from outside, by feeding it read
 
 ## In the simulation
 
-The quad program changes shape. It no longer holds PIDs, a mixer and an estimator of its own; it holds one `Controller`.
+The quad program changed shape. Each step it reads the sensors, calls one `Controller` and steps the body; it no longer runs PIDs, a mixer and an estimator of its own.
 
-- **The run:** one second of calibration with the motors off, then the targets apply. The step is now a step in **angle**: the chosen axis is asked for 20° from 1.5 s to 3.5 s, then level again.
-- **`--axis`** takes `roll` or `pitch` for an angle step, or `yaw` for the rate step it had before.
-- **New arguments:** `--angle-kp`, `--rate-limit`, and `--no-calibration` to see what calibration is worth.
-- **CSV columns:** `roll_angle_target` and `pitch_angle_target`; the rate targets, which the angle loop now sets; and `state`, which is 0 while calibrating and 1 while flying.
-- **The plot** gains the angle panels, so one picture shows the angle following its target, the rate following the angle loop's demand, and the motors.
+```
+cd drone/sim
+cargo run --bin quad > quad.csv
+python3 plot_angles.py
+python3 measure_angles.py quad.csv
+```
 
-The Stage 2a and 2b pictures were made by the rate-only program. Their scripts will need the old behaviour, so the program keeps a `--rate-only` switch that bypasses the angle loops and takes rate targets as before.
+- **The run:** one second of calibration with the motors off, then the targets apply. The step is a step in **angle**: the chosen axis is asked for 20° from 1.5 s to 3.5 s, then level again. The run is 5 s.
+- **`--axis`** takes `roll` or `pitch` for an angle step, or `yaw` for a rate step of 50 °/s. `--target` changes the size of either.
+- **`--angle-kp` and `--rate-limit`** set the angle loops.
+- **`--start-roll` and `--start-pitch`** start the body tilted, in degrees.
+- **`--no-calibration`** shows what the calibration is worth. The motors still stay off for the first second, but the controller then starts as it would with no calibration: the gyro bias taken as zero, and the starting angle from one accelerometer reading.
+- **CSV columns:** `roll_angle_target` and `pitch_angle_target`; the rate targets, which the angle loops now set; and `state`, which is 0 while calibrating and 1 while flying. The estimate columns are `NaN` while calibrating.
+- **`plot_angles.py`** draws six panels: the angle and the rate of roll, the same for pitch, the yaw rate, and the motors. One picture shows the angle following its target and the rate following what the angle loop asks for. The calibration is shaded.
+- **`measure_angles.py`** prints the rise time, overshoot and settling time of the angle step, and how well the angle is held afterwards.
+
+The Stage 2a and 2b pictures were made by the rate-only program. Their scripts need the old behaviour, so the program keeps a `--rate-only` switch: three rate PIDs and the mixer held in the program, rate targets as before, no calibration, and the old 3 s run. Its output is the same, byte for byte, as before the change.
+
+[`drone/sim/README.md`](drone/sim/README.md#the-quad) lists all the arguments and the CSV columns.
+
+## Results
+
+The calibration, the controller and the tilted start are written, with the tests above, and the quad program runs the whole loop. `./stage2-c.sh` in `drone/sim/` saves the pictures in [`drone/sim/stage2-c/`](drone/sim/stage2-c/README.md). Each run is 5 s, with a step of 20° of roll from 1.5 s to 3.5 s unless stated.
+
+| Run | Rise to 90% | Overshoot | Settled within 5% | Off target at the end of the step |
+|---|---|---|---|---|
+| no noise | 0.284 s | 0.1% | 0.326 s | 0° |
+| the same about pitch | 0.284 s | 0.1% | 0.326 s | 0° |
+| real: gyro noise 2 °/s, delay 2 steps, accelerometer noise 0.5 m/s², gyro bias 1 °/s | 0.283 s | 0.5% | 0.328 s | 0.10° |
+| real, with no calibration | 0.353 s | never arrives | never | 1.23° |
+| angle `Kp` 3 | 0.675 s | none | 0.856 s | 0.09° |
+| angle `Kp` 12 | 0.161 s | 18% | 0.344 s | 0° |
+| a step of 45° | 0.315 s | 0.1% | 0.359 s | 0° |
+| a step of 45°, rate limit 100 °/s | 0.488 s | none | 0.540 s | 0° |
+
+"Off target" is the largest distance of the true angle from the target over the last 0.5 s of the step.
+
+- **The figures are the ones the trial gave.** The real controller matches the table in [What to expect](#what-to-expect) below: 0.28 s, 0.1% and 0.33 s at `Kp` = 6, and 18% of overshoot at `Kp` = 12.
+- **`Kp` = 6 stays.** Half of it is more than twice as slow. Twice it rises sooner but overshoots, and settles no sooner.
+- **Noise, delay and bias barely show, once calibrated.** The real run differs from the clean one by 0.4% of overshoot and 0.1° of wobble.
+- **The calibration is worth about a degree.** Without it the drone holds 18.8° when asked for 20°, and about −1° when asked for level. The estimate starts 1.4° off, from one noisy reading, and the bias then holds it about 1° from the truth. The controller steers the estimate onto the target, so it is the true angle that is wrong.
+- **A tilted start is handled.** Starting at 20° of roll, with the real sensors, the calibration finds the angle and the drone is within 1° of level 0.33 s after the motors start.
+- **The rate limit does what it should.** A 45° step is asked for 200 °/s for part of the way. With the limit at 100 °/s it takes half as long again and does not overshoot.
+
+Two things that the runs showed and the plan above did not foresee:
+
+- **Without calibration the drone also yaws, at −1 °/s.** Yaw has no angle loop. Its rate loop sees the biased gyro read zero and is content, so the drone turns steadily, and nothing in this controller would ever notice. Calibration is the only thing that stops it: with the bias removed, the true yaw rate stays at 0. A gyro's bias drifts as it warms up, so on the real drone a slow yaw drift will come back during a flight. Holding a heading needs a compass or another reference, which is outside Stage 2.
+- **The yaw step still drives two motors to full.** A 50 °/s yaw step puts the two counter-clockwise motors at 1.0 for a moment and the other two at 0.4, as it did in Stage 2a. While a motor is at its limit the mixer cannot give roll and pitch what they ask for. The yaw gain and a limit on the yaw rate asked for are still to tune.
 
 ## What to expect
 
