@@ -347,6 +347,25 @@ The CSV has other columns in this mode:
 | `roll_output`, `pitch_output`, `yaw_output` | throttle | what the PIDs returned |
 | `fl`, `fr`, `br`, `bl` | 0–1 | the four motor commands |
 
+## Looking at the drone
+
+```
+cargo run --release --bin view
+```
+
+This opens a window that draws the drone in 3D. There is no flight code or physics in it yet: the keys turn the drone, with the same quaternion the physics uses, and the mouse moves the camera.
+
+| Key | What it does |
+|---|---|
+| W, S | pitch the nose down, up |
+| A, D | roll left, right |
+| Q, E | yaw left, right |
+| R | level again |
+| drag with the left button | move the camera round the drone |
+| wheel | move the camera nearer or farther |
+
+The drone is the model file [`models/x500.stl`](models/x500.stl); [`models/README.md`](models/README.md) says where it comes from and how to draw another with `--model`. `--picture view.png` saves the first picture and stops. The model has a quarter of a million triangles; they are sent to the graphics card once, and it draws 60 pictures a second.
+
 ## The seesaw's CSV columns
 
 | Column | Unit | Meaning |

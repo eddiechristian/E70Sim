@@ -8,6 +8,7 @@ default-run = "sim" # plain `cargo run` is the seesaw; `cargo run --bin quad` is
 [dependencies]
 clap = { version = "4.6.8", features = ["derive"] }
 flight = { path = "../flight" }
+macroquad = { version = "0.4.16", default-features = false } # no sound
 physics = { path = "../physics" }
 
 # This is a separate project from the emulator in the repo root.
