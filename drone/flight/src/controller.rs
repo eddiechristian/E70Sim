@@ -76,9 +76,9 @@ pub struct Gains {
 }
 
 impl Default for Gains {
-    /// The rate loops' P and D gains are those of Stage 2a, the estimator's
-    /// time constant that of Stage 2b, the angle gain that of Stage 2c and
-    /// the rate loops' I gains those of Stage 2d.
+    /// The rate loops' P and D gains are those of Stage 2a, the angle gain
+    /// that of Stage 2c, the rate loops' I gains those of Stage 2d and the
+    /// estimator's time constant that of Stage 3a.
     fn default() -> Self {
         Self {
             angle_kp: 6.0,
@@ -92,7 +92,7 @@ impl Default for Gains {
             d_filter: 0.01,
             out_limit: 0.3,
             i_limit: 0.1,
-            estimator_time_constant: 1.0,
+            estimator_time_constant: 10.0,
         }
     }
 }

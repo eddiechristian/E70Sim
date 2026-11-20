@@ -3,6 +3,8 @@
 //! Step 4 of the physics in `Stage2-a.md` in the repo root. Three angles
 //! break down at 90° of pitch; a quaternion has no bad attitudes.
 
+use crate::vec3::Vec3;
+
 /// Rotation rates about the three body axes, in rad/s: what the three gyros
 /// read.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +97,50 @@ impl Quat {
     /// √(w² + x² + y² + z²). Should stay at 1; the tests check it.
     pub fn length(&self) -> f32 {
         (self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+    }
+
+    /// A vector given along the body's axes, along the world's
+    /// (`Stage3-a.md`). The body's z axis, `(0, 0, 1)`, comes out as where
+    /// the belly points: straight down when level.
+    ///
+    /// With `v` the vector and w, x, y and z the four numbers:
+    ///    world x = (1 − 2×(y² + z²)) × v.x + 2×(x×y − w×z) × v.y + 2×(x×z + w×y) × v.z
+    ///    world y = 2×(x×y + w×z) × v.x + (1 − 2×(x² + z²)) × v.y + 2×(y×z − w×x) × v.z
+    ///    world z = 2×(x×z − w×y) × v.x + 2×(y×z + w×x) × v.y + (1 − 2×(x² + y²)) × v.z
+    pub fn to_world(&self, v: Vec3) -> Vec3 {
+        let (w, x, y, z) = (self.w, self.x, self.y, self.z);
+        Vec3 {
+            x: (1.0 - 2.0 * (y * y + z * z)) * v.x
+                + 2.0 * (x * y - w * z) * v.y
+                + 2.0 * (x * z + w * y) * v.z,
+            y: 2.0 * (x * y + w * z) * v.x
+                + (1.0 - 2.0 * (x * x + z * z)) * v.y
+                + 2.0 * (y * z - w * x) * v.z,
+            z: 2.0 * (x * z - w * y) * v.x
+                + 2.0 * (y * z + w * x) * v.y
+                + (1.0 - 2.0 * (x * x + y * y)) * v.z,
+        }
+    }
+
+    /// The other way: a vector given along the world's axes, along the
+    /// body's. The nine numbers are the same as in `to_world`, with rows and
+    /// columns changed over:
+    ///    body x = (1 − 2×(y² + z²)) × v.x + 2×(x×y + w×z) × v.y + 2×(x×z − w×y) × v.z
+    ///    body y = 2×(x×y − w×z) × v.x + (1 − 2×(x² + z²)) × v.y + 2×(y×z + w×x) × v.z
+    ///    body z = 2×(x×z + w×y) × v.x + 2×(y×z − w×x) × v.y + (1 − 2×(x² + y²)) × v.z
+    pub fn to_body(&self, v: Vec3) -> Vec3 {
+        let (w, x, y, z) = (self.w, self.x, self.y, self.z);
+        Vec3 {
+            x: (1.0 - 2.0 * (y * y + z * z)) * v.x
+                + 2.0 * (x * y + w * z) * v.y
+                + 2.0 * (x * z - w * y) * v.z,
+            y: 2.0 * (x * y - w * z) * v.x
+                + (1.0 - 2.0 * (x * x + z * z)) * v.y
+                + 2.0 * (y * z + w * x) * v.z,
+            z: 2.0 * (x * z + w * y) * v.x
+                + 2.0 * (y * z - w * x) * v.y
+                + (1.0 - 2.0 * (x * x + y * y)) * v.z,
+        }
     }
 
     /// The attitude as three angles, for the log and plots.
@@ -283,6 +329,137 @@ mod tests {
                 (length - 1.0).abs() < 1e-6,
                 "roll {roll}°, pitch {pitch}°, yaw {yaw}°: length {length}"
             );
+        }
+    }
+
+    // ---- Turning a vector. Named after the table in `Stage3-a.md`.
+
+    // A quaternion at the given three angles, in degrees.
+    fn quat_at(roll: f32, pitch: f32, yaw: f32) -> Quat {
+        Quat::from_angles(Angles {
+            roll: roll.to_radians(),
+            pitch: pitch.to_radians(),
+            yaw: yaw.to_radians(),
+        })
+    }
+
+    // Vectors are compared part by part.
+    const VECTOR_TOLERANCE: f32 = 1e-3;
+
+    fn assert_vec(got: Vec3, x: f32, y: f32, z: f32) {
+        let near = |a: f32, b: f32| (a - b).abs() < VECTOR_TOLERANCE;
+        assert!(
+            near(got.x, x) && near(got.y, y) && near(got.z, z),
+            "got {got:?}, expected ({x}, {y}, {z})"
+        );
+    }
+
+    // The body's three axes, and the same three names for the world's.
+    const X: Vec3 = Vec3 {
+        x: 1.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    const Z: Vec3 = Vec3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+
+    // A few attitudes and vectors with nothing special about them.
+    const ATTITUDES: [(f32, f32, f32); 4] = [
+        (10.0, 0.0, 0.0),
+        (20.0, -35.0, 50.0),
+        (-120.0, 15.0, -170.0),
+        (5.0, 80.0, 90.0),
+    ];
+    const VECTORS: [Vec3; 3] = [
+        Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        Vec3 {
+            x: -0.5,
+            y: 0.0,
+            z: 9.8,
+        },
+        Vec3 {
+            x: 4.0,
+            y: -7.0,
+            z: -1.5,
+        },
+    ];
+
+    #[test]
+    fn test_level_changes_nothing() {
+        // A new quaternion, any vector: the same vector from `to_world` and
+        // from `to_body`.
+        let level = Quat::new();
+        for v in VECTORS {
+            assert_vec(level.to_world(v), v.x, v.y, v.z);
+            assert_vec(level.to_body(v), v.x, v.y, v.z);
+        }
+    }
+
+    #[test]
+    fn test_nose_up_tilts_the_z_axis_back() {
+        // 30° of pitch: the body's z axis, (0, 0, 1), is (0.5, 0, 0.866) in
+        // the world. Thrust pushes the other way, up and backwards.
+        let nose_up = quat_at(0.0, 30.0, 0.0);
+        assert_vec(nose_up.to_world(Z), 0.5, 0.0, 0.866);
+        // Nose down tilts it forward.
+        let nose_down = quat_at(0.0, -30.0, 0.0);
+        assert_vec(nose_down.to_world(Z), -0.5, 0.0, 0.866);
+    }
+
+    #[test]
+    fn test_right_side_down_tilts_the_z_axis_left() {
+        // 30° of roll: the body's z axis is (0, −0.5, 0.866) in the world.
+        // Thrust pushes up and to the right.
+        let right_down = quat_at(30.0, 0.0, 0.0);
+        assert_vec(right_down.to_world(Z), 0.0, -0.5, 0.866);
+        let left_down = quat_at(-30.0, 0.0, 0.0);
+        assert_vec(left_down.to_world(Z), 0.0, 0.5, 0.866);
+    }
+
+    #[test]
+    fn test_yaw_turns_north_to_east() {
+        // 90° of yaw: the body's x axis, (1, 0, 0), is (0, 1, 0) in the
+        // world.
+        let facing_east = quat_at(0.0, 0.0, 90.0);
+        assert_vec(facing_east.to_world(X), 0.0, 1.0, 0.0);
+        // And the other way: seen from that body, north is to its left.
+        assert_vec(facing_east.to_body(X), 0.0, -1.0, 0.0);
+        // Yaw leaves the z axis alone.
+        assert_vec(facing_east.to_world(Z), 0.0, 0.0, 1.0);
+    }
+
+    #[test]
+    fn test_to_world_and_back() {
+        // Any attitude, any vector: `to_body(to_world(v))` is `v` again.
+        for (roll, pitch, yaw) in ATTITUDES {
+            let quat = quat_at(roll, pitch, yaw);
+            for v in VECTORS {
+                let back = quat.to_body(quat.to_world(v));
+                assert_vec(back, v.x, v.y, v.z);
+                let back = quat.to_world(quat.to_body(v));
+                assert_vec(back, v.x, v.y, v.z);
+            }
+        }
+    }
+
+    #[test]
+    fn test_turning_keeps_the_length() {
+        // Any attitude, any vector: the same length before and after, both
+        // ways.
+        for (roll, pitch, yaw) in ATTITUDES {
+            let quat = quat_at(roll, pitch, yaw);
+            for v in VECTORS {
+                let length = v.length();
+                assert!((quat.to_world(v).length() - length).abs() < VECTOR_TOLERANCE);
+                assert!((quat.to_body(v).length() - length).abs() < VECTOR_TOLERANCE);
+            }
         }
     }
 }

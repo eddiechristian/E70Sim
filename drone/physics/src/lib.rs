@@ -12,3 +12,4 @@ pub mod motor;
 pub mod quad;
 pub mod quat;
 pub mod seesaw;
+pub mod vec3;

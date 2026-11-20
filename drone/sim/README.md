@@ -124,32 +124,42 @@ A second program runs the three-axis body in the whole loop of [`Stage2-c.md`](.
 
 ```
 cargo run --bin quad > quad.csv
-python3 plot_angles.py
-python3 measure_angles.py quad.csv
+python3 plot_flight.py
+python3 measure_flight.py quad.csv
 ```
 
-Plain `cargo run` is still the seesaw. The quad's run is 5 s:
+Plain `cargo run` is still the seesaw. Since [Stage 3a](../../Stage3-a.md) the quad's body is free: it has a weight, it stands on the ground, and it flies. Its run is 12 s:
 
-- **0 to 1 s:** the calibration, with the motors off.
-- **1 to 1.5 s:** flying, with every target 0.
-- **1.5 to 3.5 s:** the step. Roll or pitch is asked for an angle of 20°, or yaw for a rate of 50 °/s.
-- **3.5 to 5 s:** every target 0 again.
+- **0 to 1 s:** the calibration, standing on the ground with the motors off.
+- **1 to 3 s:** the climb, at `--takeoff-throttle`, with every other target 0.
+- **3 to 5 s:** the hover command, which holds the drone's weight. It goes on climbing, more and more slowly: nothing holds a height.
+- **5 to 9 s:** the step. Roll or pitch is asked for an angle of 20°, or yaw for a rate of 50 °/s. A tilt sends the drone sideways.
+- **9 to 12 s:** every target 0 again.
 
 ```
-cargo run --bin quad -- --axis pitch --target -20 > quad.csv
+cargo run --bin quad -- --target 0 > quad.csv
+cargo run --bin quad -- --axis pitch --target -10 > quad.csv
+cargo run --bin quad -- --axis pitch --target -10 --estimator-tau 1 > quad.csv
 cargo run --bin quad -- --noise 2 --delay 2 --accel-noise 0.5 --gyro-bias 1 > quad.csv
-cargo run --bin quad -- --start-roll 20 --target 0 > quad.csv
 cargo run --bin quad -- --help
 ```
 
+The first hovers with no step. The second flies forward, nose down. The third is the same with the estimator's old time constant, and shows the drone tilting twice as far as it is asked to.
+
+With `--support joint` the body hangs on the ball joint of Stage 2 and goes nowhere. The run is then 5 s, with the step from 1.5 s to 3.5 s and the throttle at 0.7 throughout. Plot it with `plot_angles.py` and measure it with `measure_angles.py`. `--stage 2d` and the stages before it do this for you.
+
 | Argument | Meaning | Default |
 |---|---|---|
-| `--stage` | run as the program ran at that stage: `2a`, `2b`, `2c` or `2d`; see [Running an earlier stage](#running-an-earlier-stage) | the latest |
+| `--stage` | run as the program ran at that stage: `2a`, `2b`, `2c`, `2d` or `3a`; see [Running an earlier stage](#running-an-earlier-stage) | the latest |
+| `--support` | what holds the body up: `free` or `joint` | `free` |
+| `--mass` | mass of a free body, in kg | 1.2 |
+| `--drag` | drag on a free body, in N per m/s of speed | 0.4 |
+| `--takeoff-throttle` | throttle of a free body while it climbs | 0.76 |
 | `--axis` | which axis gets the step: `roll`, `pitch` or `yaw` | `roll` |
 | `--target` | the step: an angle in degrees for roll and pitch, a rate in °/s for yaw | 20, or 50 for yaw |
 | `--angle-kp` | angle loop gain for roll and pitch, in °/s per degree | 6 |
 | `--rate-limit` | the angle loops ask for no more than this rate, in °/s | 200 |
-| `--start-roll`, `--start-pitch` | the angle the body starts at, in degrees | 0, 0 |
+| `--start-roll`, `--start-pitch` | the angle the body starts at, in degrees. A free body starts on the ground, so this is a slope | 0, 0 |
 | `--no-calibration` | fly without what the calibration finds; see below | off |
 | `--rate-only` | run as before Stage 2c; see [Rate loops only](#rate-loops-only) | off |
 | `--kp`, `--ki`, `--kd` | roll and pitch rate loop gains | 0.0014, 0.003, 0.00003 |
@@ -163,7 +173,7 @@ cargo run --bin quad -- --help
 | `--noise`, `--delay`, `--seed` | as for the seesaw; each axis has its own gyro | 0, 0, 1 |
 | `--gyro-bias` | a constant error on all three gyro axes, in °/s | 0 |
 | `--accel-noise` | accelerometer noise on each axis: standard deviation in m/s² | 0 |
-| `--estimator-tau` | time constant of the estimator, in s | 1 |
+| `--estimator-tau` | time constant of the estimator, in s | 10 |
 
 The body's size (arm length, the three inertias, the yaw coefficient) and the limits are constants at the top of `src/bin/quad.rs`. The gain defaults are the same as `Gains::default()` in the flight crate, and a test checks that they stay so.
 
@@ -176,6 +186,19 @@ Where the default rate gains come from:
 - **Roll and pitch** use the gains chosen in `Stage1-d.md` (`--kp 0.002 --kd 0.00004`), divided by √2. One unit of PID output turns the quad √2 times harder than it turned the seesaw: four motors at 0.14 m from the axis, against two motors at 0.2 m.
 - **Yaw** needs a much larger gain, because the same command turns the body about 16 times more slowly. Even so, a 50 °/s yaw step drives the output to its limit for a moment.
 - **The two `Ki` values** were chosen in [`Stage2-d.md`](../../Stage2-d.md#results), to hold the drone level with one weak motor. Stages 2a, 2b and 2c had none; `--stage` gives those stages back.
+- **The estimator's time constant** was 1 s through Stage 2. [`Stage3-a.md`](../../Stage3-a.md#results) made it 10 s, because a flying drone's accelerometer misleads the estimator while the drone speeds up.
+
+`plot_flight.py` draws six panels for a free run: the height; how far north and east the drone is from where it started; its three speeds; the roll and the pitch angle, each with its target and the controller's estimate; and the four motor commands with the throttle. The calibration is shaded.
+
+`measure_flight.py` prints the figures of a free run: when the drone left the ground, its height when the step starts and at the end, how far it has drifted over the ground, and when it came back to the ground if it did. For a step in roll or pitch it adds the true angle reached, the largest error of the estimate, the angle left over after the step, the speed reached and the change in height.
+
+```
+./stage3-a.sh
+```
+
+This runs fifteen cases (a hover, tilts on both axes, other time constants and drags, the real sensors, a 20° tilt that hits the ground, and hovers with a gyro bias left in), prints their figures and saves numbered pictures into `stage3-a/`. [`stage3-a/README.md`](stage3-a/README.md) lists them.
+
+The rest of this section is about runs on the joint.
 
 `plot_angles.py` draws six panels: the angle and the rate of roll, the same for pitch, the yaw rate, then the four motor commands. The calibration is shaded. It takes the same two optional arguments as `plot.py`: the file to read and a picture to save.
 
@@ -202,13 +225,16 @@ cargo run --bin quad -- --stage 2c --ki 0.001 > quad.csv
 | `2a` | three rate loops and the mixer | `--rate-only`, `--ki 0`, `--yaw-ki 0` |
 | `2b` | the same, with the estimator watching | the same as `2a` |
 | `2c` | the whole controller, with no I term in the rate loops | `--ki 0`, `--yaw-ki 0` |
-| `2d` | the rate loops have their I terms | nothing: it is today's program |
+| `2d` | the rate loops have their I terms | nothing more |
+| `3a` | the body is free, and the estimator's time constant is longer | nothing: it is today's program |
+
+Every stage before `3a` also sets `--support joint` and `--estimator-tau 1`.
 
 - **Without `--stage` the program runs as the latest stage.**
 - **An argument given as well wins over the stage,** whichever comes first. The third line above is Stage 2c with a small `Ki`.
-- **Each stage's script passes its own stage,** so `./stage2-a.sh` to `./stage2-d.sh` keep giving the figures of their stage when a later one changes a default.
+- **Each stage's script passes its own stage,** so `./stage2-a.sh` to `./stage3-a.sh` keep giving the figures of their stage when a later one changes a default.
 - **The output is the same as it was at that stage,** but for columns added to the CSV since. The scripts read columns by name, so new ones do not disturb them.
-- **Plot a `2a` or `2b` run with `plot_quad.py` or `plot_estimator.py`,** as for `--rate-only`.
+- **Plot a `2a` or `2b` run with `plot_quad.py` or `plot_estimator.py`,** as for `--rate-only`, and a `2c` or `2d` run with `plot_angles.py`.
 
 Stage 1 is the seesaw, which is the other program: plain `cargo run`, with `./run_cases.sh` and `./stage1-d.sh`. It has not changed since Stage 1 and needs no `--stage`.
 
@@ -218,15 +244,17 @@ For the code itself as it was at a stage, and not only its behaviour, check out 
 
 ### Disturbances
 
-The run can be disturbed in three ways, explained in [`Stage2-d.md`](../../Stage2-d.md). Use `--target 0` with them, so that the only thing happening is the disturbance.
+The run can be disturbed in three ways, explained in [`Stage2-d.md`](../../Stage2-d.md). Use `--target 0` with them, so that the only thing happening is the disturbance. The examples are on the joint, as Stage 2d was:
 
 ```
-cargo run --bin quad -- --target 0 --kick-roll 0.3 > quad.csv
-cargo run --bin quad -- --target 0 --kick-roll 0.3 --kick-pitch 0.3 > quad.csv
-cargo run --bin quad -- --target 0 --start-roll 30 > quad.csv
-cargo run --bin quad -- --target 0 --weak-motor fr > quad.csv
+cargo run --bin quad -- --stage 2d --target 0 --kick-roll 0.3 > quad.csv
+cargo run --bin quad -- --stage 2d --target 0 --kick-roll 0.3 --kick-pitch 0.3 > quad.csv
+cargo run --bin quad -- --stage 2d --target 0 --start-roll 30 > quad.csv
+cargo run --bin quad -- --stage 2d --target 0 --weak-motor fr > quad.csv
 python3 measure_disturbance.py quad.csv
 ```
+
+The same arguments work on a free body, where a kick or a weak motor also sends the drone sideways. The kick still comes at 2.0 s unless `--kick-at` says otherwise, which is in the middle of the climb.
 
 - **A kick** is a torque on the body for a short time. The three kick arguments can be given together, which makes a push about an axis between them. It is not available with `--rate-only`. `plot_angles.py` shades it red.
 - **A tilted start** is `--start-roll` and `--start-pitch`, as before.
@@ -255,6 +283,11 @@ This runs sixteen cases (seven kicks, two tilted starts, a weak motor with and w
 | `roll_measured`, `pitch_measured`, `yaw_measured` | °/s | what the gyro says, bias included |
 | `fl`, `fr`, `br`, `bl` | 0–1 | the four motor commands |
 | `push_roll`, `push_pitch`, `push_yaw` | N·m | the kick on the body during that step; 0 when there is none |
+| `north`, `east`, `height` | m | where a free body is, from where it started; 0 on the joint |
+| `north_speed`, `east_speed`, `climb` | m/s | how fast it is moving; `climb` is positive upwards |
+| `accel_x`, `accel_y`, `accel_z` | g | what the accelerometer says, along the body's axes |
+| `on_ground` | | 1 while the ground holds a free body, 0 in the air and on the joint |
+| `throttle` | 0–1 | the throttle asked for |
 
 ### Rate loops only
 

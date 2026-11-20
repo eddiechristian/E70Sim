@@ -428,18 +428,18 @@ The last test is the one that shows why τ changed, as the weak motor with no I 
 
 The quad program gains a free run:
 
-- **`--free`** takes the joint away.
+- **`--support`** says what holds the body up: `free`, which is now the default, or `joint`.
 - **`--stage 3a`** is new, and becomes what the program does when no stage is given: the free body and the new τ. `--stage 2d` and the earlier ones gain the joint and τ = 1 s in their presets, so the scripts of Stage 2 keep giving their figures. [`drone/sim/README.md`](drone/sim/README.md#running-an-earlier-stage) explains `--stage`.
-- **The run** is 12 s: calibration on the ground until 1 s, a climb at `--takeoff-throttle` (0.76 unless given) until 3 s, then the hover command. The step in angle runs from 5 s to 9 s.
+- **The run** is 12 s: calibration on the ground until 1 s, a climb at `--takeoff-throttle` (0.76 unless given) until 3 s, then the hover command. The step in angle runs from 5 s to 9 s. On the joint the run is the 5 s of Stage 2.
 - **`--mass`** and **`--drag`** set the two new parameters. `--estimator-tau` is there already.
-- **CSV columns:** `x`, `y` and `height` in metres, `vx`, `vy` and `climb` in m/s, the three accelerometer readings, and `on_ground`.
-- **`plot_flight.py`** draws the height, the path seen from above, the speed, the angle with its estimate, and the motors.
-- **`measure_flight.py`** prints the time of take-off, the height and drift over the hover, the largest true angle and the largest error of the estimate during the tilt, and the speed reached.
+- **CSV columns:** `north`, `east` and `height` in metres, `north_speed`, `east_speed` and `climb` in m/s, the three accelerometer readings, `on_ground`, and the `throttle` asked for.
+- **`plot_flight.py`** draws the height, the distance north and east, the three speeds, the two angles with their estimates, and the motors.
+- **`measure_flight.py`** prints the time of take-off, the height and the drift over the ground, the largest true angle and the largest error of the estimate during the tilt, the angle left over after it, and the speed reached.
 - **`./stage3-a.sh`** runs the cases and saves the pictures in `drone/sim/stage3-a/`.
 
 ## What to expect
 
-From a trial with the real controller and the Stage 2 body, with gravity, drag, movement and a ground added outside it for the trial. Nothing is in the repo yet. Mass 1.2 kg, drag 0.4 N per m/s.
+From a trial with the real controller and the Stage 2 body, with gravity, drag, movement and a ground added outside it for the trial, made before any of this item was written. [Results](#results) has the figures of the finished code. Mass 1.2 kg, drag 0.4 N per m/s.
 
 ### Taking off and hovering
 
@@ -494,6 +494,69 @@ The same tilt for other values of drag and τ. The figure is the largest true pi
 A target of 20° with τ = 1 s: the true pitch reaches 43.6°, and the drone reaches the ground at 4.5 m/s.
 
 The picture to look for: the height panel climbing and then easing off without ever turning level; and in the angle panel of a tilt, with τ = 1 s, the estimate sitting on the target while the true angle swings to twice as far. With the longer τ the two lines lie together.
+
+## Results
+
+The free body, the arguments of the quad program and the tests above are written, and `Gains::default()` has the new time constant: **τ = 10 s**. `./stage3-a.sh` in `drone/sim/` saves the pictures in [`drone/sim/stage3-a/`](drone/sim/stage3-a/README.md). Each run is 12 s: calibration on the ground until 1 s, a climb until 3 s, then the hover command, with a tilt from 5 s to 9 s.
+
+### Flying
+
+| Run | Leaves the ground | Height at 5 s | At 12 s | Over the ground at 12 s |
+|---|---|---|---|---|
+| hover | 1.10 s | 6.1 m | 9.6 m, still climbing at 0.12 m/s | where it took off |
+| hover, with noise, delay and a bias the calibration removed | 1.10 s | 6.1 m | 9.6 m | 1.4 m away |
+
+The figures match the trial. The drone takes off level, the hover command does not stop the climb, and with true sensors it stays exactly over the place it left.
+
+### The tilt, and the choice of τ
+
+A target pitch of −10°, with drag at 0.4:
+
+| τ | True pitch reached | Largest error of the estimate | Pitch left after the tilt | With real sensors |
+|---|---|---|---|---|
+| 1 s | −21.6° | 11.7° | 12.0° the other way | −21.9° |
+| 3 s | −15.6° | 5.6° | −5.0° | −15.9° |
+| 5 s | −13.7° | 3.7° | −3.6° | −14.1° |
+| **10 s** | **−12.0°** | **2.0°** | **−2.1°** | **−12.4°** |
+| 20 s | −11.0° | 1.1° | −1.2° | −11.5° |
+| 30 s | −10.7° | 0.7° | −0.9° | −11.2° |
+
+A longer τ is better here without end. What it costs shows in a hover with a gyro bias of 0.1 °/s that the calibration has not removed:
+
+| τ | Tilt after 11 s of flying | Where that tilt is heading | Over the ground after 11 s |
+|---|---|---|---|
+| 1 s | 0.08° | 0.1° | 0.9 m away, at 0.07 m/s |
+| 3 s | 0.37° | 0.3° | 1.7 m, at 0.27 m/s |
+| 5 s | 0.58° | 0.5° | 2.1 m, at 0.36 m/s |
+| **10 s** | **0.81°** | **1°** | **2.3 m, at 0.47 m/s** |
+| 20 s | 0.95° | 2° | 2.5 m, at 0.52 m/s |
+| 30 s | 1.00° | 3° | 2.6 m, at 0.54 m/s |
+
+The tilt heads for bias × τ, as [Stage 2b](Stage2-b.md#what-τ-trades) found. On the joint a degree of error was only a degree. Flying, a degree of tilt is a push of `g × sin 1°`, which settles into a slide of half a metre a second.
+
+A bias of 0.1 °/s is not a pessimistic figure. The calibration averages 1000 readings with noise of 2 °/s, which leaves it about 0.06 °/s out, and the bias itself moves as the chip warms. The run with real sensors shows it: the calibration has removed a bias of 1 °/s, and the drone still ends tilted 0.6° and 0.8° and 1.4 m from where it took off.
+
+**τ = 10 s is the choice.** It holds a 10° tilt to within 2.5° with real sensors, and limits the error from a left-over bias of 0.1 °/s to 1°. At 30 s the tilt is nearly true, but the same bias would lean the drone 3°. At 3 s the hover is steadier, but the drone tilts half as far again as it is asked to.
+
+Neither error goes away at any τ. A hover that stays over one place needs to know where it is, from a camera looking down or from GPS, and that is outside this plan. A pilot corrects a slide of half a metre a second without thinking about it.
+
+### Other runs
+
+| Run | What happens |
+|---|---|
+| the same tilt about roll | the same figures, to the east |
+| no drag | the true pitch reaches −13.6° and is still growing; the speed never settles; the climb never fades, and the drone ends 29 m up |
+| drag 0.8 | −11.2°, and half the speed |
+| pitch −20° | −24.0°; it flies on |
+| pitch −20° with τ = 1 s | −43.6°; it loses its lift and reaches the ground at 9.0 s, coming down at 4.5 m/s |
+
+### What changed from the plan
+
+- **`--support free` or `joint`,** where the plan had `--free`. Free is now what the program does unless told otherwise, so a switch that could only turn it on had nothing to do.
+- **The plot shows the distance north and east against time,** not a path seen from above. Every run in this item moves along one line, and a map of a straight line says nothing.
+- **`Quad::new_free`** makes a free body, standing on the ground. `Quad::new` still makes one on the joint.
+- **`Quad` keeps what the accelerometer feels,** in the world frame, as a private field. The movement step fills it and `accel` turns it into the body frame.
+- **No earlier test had to change for the new τ.** The tests of Stage 2 that depend on it set it themselves, and the quad program's earlier stages get τ = 1 s from `--stage`.
 
 ## Where this goes next
 

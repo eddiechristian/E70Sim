@@ -346,7 +346,7 @@ The control code is the same at every size. Only the physics parameters and the 
 
 ### Stage 3 — Host simulation, hover
 
-- [ ] Full 6DOF: gravity, translation, ground — explained in [`Stage3-a.md`](Stage3-a.md)
+- [x] Full 6DOF: gravity, translation, ground — explained in [`Stage3-a.md`](Stage3-a.md)
 - [ ] Fixed hover throttle, then throttle compensated for tilt — explained in [`Stage3-b.md`](Stage3-b.md)
 - [ ] Arming, motor limits, and a cut-off when tilted past a safe angle; arming is refused until [calibration](#calibration-before-flight) has succeeded — explained in [`Stage3-c.md`](Stage3-c.md)
 - [ ] Fly it by hand with a gamepad (a Logitech F310, already owned): a `drone/sim/` program that runs in real time, reads the sticks and fills `Targets` from them

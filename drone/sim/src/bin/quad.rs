@@ -1,9 +1,12 @@
 //! The quad in the whole loop: sensors, the `Controller` of the flight
 //! crate, four motors and the body, CSV on standard output.
 //!
-//! The run is one second of calibration with the motors off, then a step in
-//! angle on roll or pitch, or a step in rate on yaw. The parts are explained
-//! in `Stage2-a.md`, `Stage2-b.md` and `Stage2-c.md` in the repo root.
+//! The body is free (`Stage3-a.md`): it stands on the ground through one
+//! second of calibration, climbs, gets the hover command, and is then asked
+//! for a step in angle on roll or pitch, or a step in rate on yaw. With
+//! `--support joint` it hangs on the ball joint of Stage 2 for a shorter run
+//! with the same step. The loop is explained in `Stage2-a.md`, `Stage2-b.md`
+//! and `Stage2-c.md` in the repo root.
 //!
 //! A run can also be disturbed (`Stage2-d.md`): a kick, which is a torque on
 //! the body for a short time, and one weak motor.
@@ -29,18 +32,40 @@ use flight::mixer::{MixerInput, mix};
 use flight::pid::Pid;
 use physics::gyro::Gyro;
 use physics::motor::Motor;
-use physics::quad::{G, Inertia, Motors, NO_PUSH, Quad, Torques};
+use physics::quad::{G, Inertia, Motors, NO_PUSH, Quad, Support, Torques};
 use physics::quat::Angles;
 
 // Time
 const DT: f32 = 0.001; // s; one step, 1 kHz
 
-// The run: the calibration takes the first second, with the motors off.
-// Then every target is 0, then `--target` on the chosen axis from STEP_START
-// to STEP_END, then 0 again.
-const STEPS: u32 = 5000; // 5 simulated seconds
-const STEP_START: f32 = 1.5; // s
-const STEP_END: f32 = 3.5; // s
+/// When things happen in a run. The calibration takes the first second of
+/// every run, with the motors off. Then every target is 0, then `--target`
+/// on the chosen axis from `step_start` to `step_end`, then 0 again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Run {
+    steps: u32,       // how long the run is
+    step_start: f32,  // s
+    step_end: f32,    // s
+    climb_until: f32, // s; a free body gets the take-off throttle until here
+}
+
+// On the joint: 5 simulated seconds, as in Stage 2. There is no climb.
+const JOINT_RUN: Run = Run {
+    steps: 5000,
+    step_start: 1.5,
+    step_end: 3.5,
+    climb_until: 0.0,
+};
+
+// Free: 12 simulated seconds. The drone climbs from the end of the
+// calibration until 3 s, then gets the hover command, and has two seconds
+// to settle before the step.
+const FREE_RUN: Run = Run {
+    steps: 12000,
+    step_start: 5.0,
+    step_end: 9.0,
+    climb_until: 3.0,
+};
 
 // The run with `--rate-only`: no calibration, so everything is earlier.
 const RATE_ONLY_STEPS: u32 = 3000; // 3 simulated seconds
@@ -52,7 +77,7 @@ const DEFAULT_ANGLE_TARGET: f32 = 20.0; // °; roll and pitch
 const DEFAULT_RATE_TARGET: f32 = 50.0; // °/s; yaw, and all three with `--rate-only`
 
 // Mixer
-const THROTTLE: f32 = 0.7; // shared by all four motors, 0.0 to 1.0
+const THROTTLE: f32 = 0.7; // on the joint, and with `--rate-only`; 0.0 to 1.0
 
 // PID limits; the outputs are in throttle units.
 const OUT_LIMIT: f32 = 0.3; // each output stays within ±OUT_LIMIT
@@ -89,6 +114,19 @@ enum Stage {
     /// The rate loops have their I terms
     #[value(name = "2d")]
     S2d,
+    /// A free body, with gravity and a ground, and a longer estimator time
+    /// constant
+    #[value(name = "3a")]
+    S3a,
+}
+
+/// What holds the body up, for `--support`.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum SupportArg {
+    /// The ball joint of Stage 2: it turns but goes nowhere
+    Joint,
+    /// Nothing: it flies, falls and stands on the ground
+    Free,
 }
 
 /// The arguments whose defaults have changed from one stage to another,
@@ -102,6 +140,8 @@ struct Preset {
     rate_only: bool,
     ki: f32,
     yaw_ki: f32,
+    support: SupportArg,
+    estimator_tau: f32,
 }
 
 /// What `stage` used.
@@ -112,19 +152,33 @@ fn preset(stage: Stage) -> Preset {
             rate_only: true,
             ki: 0.0,
             yaw_ki: 0.0,
+            support: SupportArg::Joint,
+            estimator_tau: 1.0,
         },
         // Before the rate loops had an I term.
         Stage::S2c => Preset {
             rate_only: false,
             ki: 0.0,
             yaw_ki: 0.0,
+            support: SupportArg::Joint,
+            estimator_tau: 1.0,
         },
-        // These are also the defaults of the arguments below, and a test
-        // checks that they stay the same.
+        // Before the joint was taken away.
         Stage::S2d => Preset {
             rate_only: false,
             ki: 0.003,
             yaw_ki: 0.02,
+            support: SupportArg::Joint,
+            estimator_tau: 1.0,
+        },
+        // These are also the defaults of the arguments below, and a test
+        // checks that they stay the same.
+        Stage::S3a => Preset {
+            rate_only: false,
+            ki: 0.003,
+            yaw_ki: 0.02,
+            support: SupportArg::Free,
+            estimator_tau: 10.0,
         },
     }
 }
@@ -230,6 +284,25 @@ struct Args {
     #[arg(long, default_value_t = 6.0)]
     thrust_coeff: f32,
 
+    /// What holds the body up. Free, the run is 12 s with the step from
+    /// 5 s to 9 s; on the joint it is 5 s with the step from 1.5 s to 3.5 s.
+    /// --rate-only is always on the joint
+    #[arg(long, value_enum, default_value_t = SupportArg::Free)]
+    support: SupportArg,
+
+    /// Mass of a free body, in kg
+    #[arg(long, default_value_t = 1.2)]
+    mass: f32,
+
+    /// Drag on a free body, in newtons per m/s of speed
+    #[arg(long, default_value_t = 0.4)]
+    drag: f32,
+
+    /// Throttle of a free body while it climbs, from the end of the
+    /// calibration until 3 s. After that it gets the hover command
+    #[arg(long, default_value_t = 0.76)]
+    takeoff_throttle: f32,
+
     /// A kick: a torque about roll, in N·m, for a short time. The three
     /// kicks can be given together. Not with --rate-only
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
@@ -277,7 +350,7 @@ struct Args {
     accel_noise: f32,
 
     /// Time constant of the estimator, in seconds
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 10.0)]
     estimator_tau: f32,
 
     /// Seed for the gyro noise; the same seed gives the same run
@@ -308,21 +381,46 @@ where
         if !given("yaw_ki") {
             args.yaw_ki = preset.yaw_ki;
         }
+        if !given("support") {
+            args.support = preset.support;
+        }
+        if !given("estimator_tau") {
+            args.estimator_tau = preset.estimator_tau;
+        }
     }
     args
 }
 
-/// What the controller is asked for at `time` seconds: level, no yaw and
-/// the shared throttle, with `target` on `axis` during the step. For roll
+/// The timing of the run for a body held up by `support`.
+fn run_for(support: SupportArg) -> Run {
+    match support {
+        SupportArg::Joint => JOINT_RUN,
+        SupportArg::Free => FREE_RUN,
+    }
+}
+
+/// The throttle asked for at `time` seconds. On the joint it is `THROTTLE`
+/// throughout. A free body gets `--takeoff-throttle` until the climb is
+/// over and `hover`, the body's hover command, after that.
+fn throttle_at(time: f32, args: &Args, hover: f32) -> f32 {
+    match args.support {
+        SupportArg::Joint => THROTTLE,
+        SupportArg::Free if time < FREE_RUN.climb_until => args.takeoff_throttle,
+        SupportArg::Free => hover,
+    }
+}
+
+/// What the controller is asked for at `time` seconds of `run`: level, no
+/// yaw and `throttle`, with `target` on `axis` during the step. For roll
 /// and pitch the target is an angle in degrees; for yaw it is a rate in °/s.
-fn targets_at(time: f32, axis: Axis, target: f32) -> Targets {
+fn targets_at(time: f32, axis: Axis, target: f32, run: &Run, throttle: f32) -> Targets {
     let mut targets = Targets {
         roll: 0.0,
         pitch: 0.0,
         yaw_rate: 0.0,
-        throttle: THROTTLE,
+        throttle,
     };
-    if (STEP_START..STEP_END).contains(&time) {
+    if (run.step_start..run.step_end).contains(&time) {
         match axis {
             Axis::Roll => targets.roll = target,
             Axis::Pitch => targets.pitch = target,
@@ -508,18 +606,30 @@ fn one_g_long(accel: Accel) -> Accel {
 }
 
 fn main() {
-    let args = parse_args(std::env::args_os());
+    let mut args = parse_args(std::env::args_os());
 
-    let mut quad = Quad::new(
-        ARM_LENGTH,
-        YAW_COEFF,
-        Inertia {
-            ixx: IXX,
-            iyy: IYY,
-            izz: IZZ,
-        },
-        motors(&args),
-    );
+    // The rate-only loop is from before the joint was taken away.
+    if args.rate_only {
+        args.support = SupportArg::Joint;
+    }
+
+    let inertia = Inertia {
+        ixx: IXX,
+        iyy: IYY,
+        izz: IZZ,
+    };
+    let mut quad = match args.support {
+        SupportArg::Joint => Quad::new(ARM_LENGTH, YAW_COEFF, inertia, motors(&args)),
+        // Standing on the ground. A starting angle is then a slope.
+        SupportArg::Free => Quad::new_free(
+            ARM_LENGTH,
+            YAW_COEFF,
+            inertia,
+            motors(&args),
+            args.mass,
+            args.drag,
+        ),
+    };
     quad.set_attitude(Angles {
         roll: args.start_roll.to_radians(),
         pitch: args.start_pitch.to_radians(),
@@ -542,6 +652,13 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
         Axis::Yaw => DEFAULT_RATE_TARGET,
     });
     let mut controller = Controller::new(gains(args));
+    let run = run_for(args.support);
+    // Zero on the joint, which has no mass; `throttle_at` does not use it
+    // there.
+    let hover = match quad.support {
+        Support::Joint => 0.0,
+        Support::Free => quad.hover_command(),
+    };
 
     // With `--no-calibration`: the one accelerometer reading the controller
     // is shown while it calibrates.
@@ -556,15 +673,24 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
          roll_rate,pitch_rate,yaw_rate,\
          roll_measured,pitch_measured,yaw_measured,\
          fl,fr,br,bl,\
-         push_roll,push_pitch,push_yaw"
+         push_roll,push_pitch,push_yaw,\
+         north,east,height,\
+         north_speed,east_speed,climb,\
+         accel_x,accel_y,accel_z,\
+         on_ground,throttle"
     );
 
-    for step in 0..STEPS {
+    for step in 0..run.steps {
         let time = step as f32 * DT;
-        let targets = targets_at(time, args.axis, step_target);
+        let throttle = throttle_at(time, args, hover);
+        let targets = targets_at(time, args.axis, step_target, &run, throttle);
 
-        // 1. Read the sensors.
+        // 1. Read the sensors, and where the body is for the log. On the
+        //    joint it is always at the origin and never on the ground.
         let readings = sensors.read(quad);
+        let position = quad.position();
+        let velocity = quad.velocity();
+        let on_ground = u8::from(quad.on_ground());
         let mut sensor_gyro = GyroRates {
             roll: readings.measured.roll,
             pitch: readings.measured.pitch,
@@ -624,7 +750,11 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
              {:.3},{:.3},{:.3},\
              {:.3},{:.3},{:.3},\
              {:.5},{:.5},{:.5},{:.5},\
-             {:.3},{:.3},{:.3}",
+             {:.3},{:.3},{:.3},\
+             {:.3},{:.3},{:.3},\
+             {:.3},{:.3},{:.3},\
+             {:.4},{:.4},{:.4},\
+             {on_ground},{:.4}",
             targets.roll,
             targets.pitch,
             readings.angle.roll,
@@ -648,8 +778,24 @@ fn run_controller(args: &Args, quad: &mut Quad, sensors: &mut Sensors) {
             push.roll,
             push.pitch,
             push.yaw,
+            position.x,
+            position.y,
+            quad_height(position.z),
+            velocity.x,
+            velocity.y,
+            quad_height(velocity.z),
+            readings.accel.x,
+            readings.accel.y,
+            readings.accel.z,
+            targets.throttle,
         );
     }
+}
+
+/// z points down, so a height or a climb is a z with its sign turned
+/// round. Zero stays a plain zero, not −0.
+fn quad_height(z: f32) -> f32 {
+    if z == 0.0 { 0.0 } else { -z }
 }
 
 /// The loop as it was before Stage 2c: three rate PIDs and the mixer, held
@@ -765,30 +911,41 @@ mod tests {
 
     const AXES: [Axis; 3] = [Axis::Roll, Axis::Pitch, Axis::Yaw];
 
+    // The targets of a run on the joint, where the throttle never changes.
+    fn joint_targets_at(time: f32, axis: Axis, target: f32) -> Targets {
+        targets_at(time, axis, target, &JOINT_RUN, THROTTLE)
+    }
+
     // ---- The controller's targets
 
     #[test]
     fn test_targets_are_level_outside_the_step() {
         for axis in AXES {
-            assert_eq!(targets_at(0.0, axis, 20.0), LEVEL);
-            assert_eq!(targets_at(STEP_START - 0.001, axis, 20.0), LEVEL);
-            assert_eq!(targets_at(STEP_END, axis, 20.0), LEVEL);
-            assert_eq!(targets_at(STEP_END + 1.0, axis, 20.0), LEVEL);
+            assert_eq!(joint_targets_at(0.0, axis, 20.0), LEVEL);
+            assert_eq!(
+                joint_targets_at(JOINT_RUN.step_start - 0.001, axis, 20.0),
+                LEVEL
+            );
+            assert_eq!(joint_targets_at(JOINT_RUN.step_end, axis, 20.0), LEVEL);
+            assert_eq!(
+                joint_targets_at(JOINT_RUN.step_end + 1.0, axis, 20.0),
+                LEVEL
+            );
         }
     }
 
     #[test]
     fn test_only_the_chosen_axis_gets_the_step() {
-        let time = (STEP_START + STEP_END) / 2.0;
+        let time = (JOINT_RUN.step_start + JOINT_RUN.step_end) / 2.0;
         assert_eq!(
-            targets_at(time, Axis::Roll, 20.0),
+            joint_targets_at(time, Axis::Roll, 20.0),
             Targets {
                 roll: 20.0,
                 ..LEVEL
             }
         );
         assert_eq!(
-            targets_at(time, Axis::Pitch, 20.0),
+            joint_targets_at(time, Axis::Pitch, 20.0),
             Targets {
                 pitch: 20.0,
                 ..LEVEL
@@ -796,7 +953,7 @@ mod tests {
         );
         // On yaw the target is a rate.
         assert_eq!(
-            targets_at(time, Axis::Yaw, -30.0),
+            joint_targets_at(time, Axis::Yaw, -30.0),
             Targets {
                 yaw_rate: -30.0,
                 ..LEVEL
@@ -806,14 +963,82 @@ mod tests {
 
     #[test]
     fn test_step_starts_and_ends_on_time() {
-        assert_eq!(targets_at(STEP_START, Axis::Roll, 20.0).roll, 20.0);
-        assert_eq!(targets_at(STEP_END - 0.001, Axis::Roll, 20.0).roll, 20.0);
+        assert_eq!(
+            joint_targets_at(JOINT_RUN.step_start, Axis::Roll, 20.0).roll,
+            20.0
+        );
+        assert_eq!(
+            joint_targets_at(JOINT_RUN.step_end - 0.001, Axis::Roll, 20.0).roll,
+            20.0
+        );
     }
 
     #[test]
     fn test_step_starts_after_the_calibration() {
-        assert!(STEP_START > CALIBRATION_STEPS as f32 * DT);
-        assert!(STEP_END < STEPS as f32 * DT);
+        assert!(JOINT_RUN.step_start > CALIBRATION_STEPS as f32 * DT);
+        assert!(JOINT_RUN.step_end < JOINT_RUN.steps as f32 * DT);
+    }
+
+    // ---- The free run
+
+    #[test]
+    fn test_free_run_is_longer_with_a_later_step() {
+        assert_eq!(run_for(SupportArg::Joint), JOINT_RUN);
+        assert_eq!(run_for(SupportArg::Free), FREE_RUN);
+
+        // The same step, later. The throttle is whatever it is given.
+        let level = Targets {
+            throttle: 0.5,
+            ..LEVEL
+        };
+        let at = |time: f32| targets_at(time, Axis::Pitch, -10.0, &FREE_RUN, 0.5);
+        assert_eq!(at(0.0), level);
+        assert_eq!(at(FREE_RUN.step_start - 0.001), level);
+        assert_eq!(at(FREE_RUN.step_start).pitch, -10.0);
+        assert_eq!(at(FREE_RUN.step_end - 0.001).pitch, -10.0);
+        assert_eq!(at(FREE_RUN.step_end), level);
+    }
+
+    #[test]
+    fn test_free_run_has_time_for_everything() {
+        // The calibration, then the climb, then the step, then the end.
+        let calibrated = CALIBRATION_STEPS as f32 * DT;
+        assert!(FREE_RUN.climb_until > calibrated);
+        const { assert!(FREE_RUN.step_start > FREE_RUN.climb_until) };
+        assert!(FREE_RUN.step_end < FREE_RUN.steps as f32 * DT);
+    }
+
+    #[test]
+    fn test_free_throttle_climbs_then_hovers() {
+        let args = parse_args(["quad"]);
+        assert_eq!(args.support, SupportArg::Free);
+        let hover = 0.7002;
+        assert_eq!(throttle_at(0.0, &args, hover), 0.76);
+        assert_eq!(
+            throttle_at(FREE_RUN.climb_until - 0.001, &args, hover),
+            0.76
+        );
+        assert_eq!(throttle_at(FREE_RUN.climb_until, &args, hover), hover);
+        assert_eq!(throttle_at(11.0, &args, hover), hover);
+
+        let args = parse_args(["quad", "--takeoff-throttle", "0.8"]);
+        assert_eq!(throttle_at(2.0, &args, hover), 0.8);
+    }
+
+    #[test]
+    fn test_joint_throttle_never_changes() {
+        let args = parse_args(["quad", "--support", "joint"]);
+        for time in [0.0, 2.0, 4.9] {
+            assert_eq!(throttle_at(time, &args, 0.0), THROTTLE);
+        }
+    }
+
+    #[test]
+    fn test_height_is_z_turned_round() {
+        assert_eq!(quad_height(-5.0), 5.0);
+        assert_eq!(quad_height(2.0), -2.0);
+        // Not −0, which would print as "-0.000".
+        assert!(quad_height(0.0).is_sign_positive());
     }
 
     #[test]
@@ -828,7 +1053,7 @@ mod tests {
 
     // The stage the program runs as when `--stage` is not given. Change it
     // when a new stage is added.
-    const LATEST: Stage = Stage::S2d;
+    const LATEST: Stage = Stage::S3a;
 
     // The settings a stage's preset covers, as the program ends up with
     // them.
@@ -837,6 +1062,8 @@ mod tests {
             rate_only: args.rate_only,
             ki: args.ki,
             yaw_ki: args.yaw_ki,
+            support: args.support,
+            estimator_tau: args.estimator_tau,
         }
     }
 
@@ -875,25 +1102,55 @@ mod tests {
 
     #[test]
     fn test_stage_2c_has_the_stage_2c_gains() {
-        // The whole controller, with the gains as they were before the
-        // rate loops had an I term.
+        // The whole controller on the joint, with the gains as they were
+        // before the rate loops had an I term.
         let args = parse_args(["quad", "--stage", "2c"]);
         assert!(!args.rate_only);
+        assert_eq!(args.support, SupportArg::Joint);
         assert_eq!(
             gains(&args),
             Gains {
                 rate_ki: 0.0,
                 yaw_ki: 0.0,
+                estimator_time_constant: 1.0,
                 ..Gains::default()
             }
         );
     }
 
     #[test]
-    fn test_stage_2d_has_todays_gains() {
+    fn test_stage_2d_has_the_stage_2d_gains() {
+        // Still on the joint, with the I terms and the estimator's time
+        // constant of 1 s.
         let args = parse_args(["quad", "--stage", "2d"]);
         assert!(!args.rate_only);
+        assert_eq!(args.support, SupportArg::Joint);
+        assert_eq!(
+            gains(&args),
+            Gains {
+                estimator_time_constant: 1.0,
+                ..Gains::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_stage_3a_is_free_with_todays_gains() {
+        let args = parse_args(["quad", "--stage", "3a"]);
+        assert!(!args.rate_only);
+        assert_eq!(args.support, SupportArg::Free);
         assert_eq!(gains(&args), Gains::default());
+    }
+
+    #[test]
+    fn test_support_and_tau_win_over_the_stage() {
+        let args = parse_args(["quad", "--stage", "2d", "--support", "free"]);
+        assert_eq!(args.support, SupportArg::Free);
+        assert_eq!(args.estimator_tau, 1.0);
+
+        let args = parse_args(["quad", "--stage", "3a", "--estimator-tau", "1"]);
+        assert_eq!(args.support, SupportArg::Free);
+        assert_eq!(args.estimator_tau, 1.0);
     }
 
     #[test]
@@ -930,7 +1187,7 @@ mod tests {
     #[test]
     fn test_no_kick_unless_asked_for() {
         let args = parse_args(["quad"]);
-        for step in 0..STEPS {
+        for step in 0..JOINT_RUN.steps {
             assert_eq!(push_at(step, &args), NO_PUSH);
         }
     }
@@ -947,7 +1204,7 @@ mod tests {
         assert_eq!(push_at(2000, &args), kick);
         assert_eq!(push_at(2049, &args), kick);
         assert_eq!(push_at(2050, &args), NO_PUSH);
-        let pushed = (0..STEPS).filter(|&step| push_at(step, &args) == kick);
+        let pushed = (0..JOINT_RUN.steps).filter(|&step| push_at(step, &args) == kick);
         assert_eq!(pushed.count(), 50);
 
         // Moved and made longer: steps 1200 to 1299.
@@ -991,7 +1248,7 @@ mod tests {
     fn test_kick_comes_after_the_calibration() {
         let args = parse_args(["quad"]);
         assert!(args.kick_at > CALIBRATION_STEPS as f32 * DT);
-        assert!(args.kick_at + args.kick_for < STEPS as f32 * DT);
+        assert!(args.kick_at + args.kick_for < JOINT_RUN.steps as f32 * DT);
     }
 
     // The thrust of each motor of `motors` at full speed, in newtons, in
