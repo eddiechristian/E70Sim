@@ -15,6 +15,11 @@
 //! A ghost of the drone, pale and half seen through, stays level where the
 //! drone started, to show how far the drone has been moved and turned.
 //!
+//! B puts the drone on the ball joint of Stage 2, and takes it off again: a
+//! ball on a stand, one and a half times as high as the drone, that holds it
+//! by its centre. There it turns but does not move, and it is drawn without
+//! its legs. `--ball` starts it there.
+//!
 //! Keys: W and S pitch, A and D roll, Q and E yaw. The arrow keys move it
 //! forward, back, left and right, the way its nose points but level, however
 //! it is tilted. Page Up and Page Down move it up and down. R puts it level
@@ -76,6 +81,15 @@ const ARROW_HEAD_RADIUS: f32 = 0.022; // m
 const ARROW_HEAD_LENGTH: f32 = 0.06; // m
 const ARROW_SIDES: usize = 24; // flat sides round the shaft and the head
 
+// The ball joint and its stand
+const BALL_RADIUS: f32 = 0.03; // m
+const BALL_HEIGHT: f32 = 1.5; // the ball's centre off the ground, in heights of the model
+const POLE_RADIUS: f32 = 0.012; // m: wider than an arrow's shaft, which runs down it when level
+const FOOT_RADIUS: f32 = 0.10; // m
+const FOOT_HEIGHT: f32 = 0.01; // m
+const BALL_COLOR: [f32; 3] = [0.95, 0.60, 0.10];
+const STAND_COLOR: [f32; 3] = [0.25, 0.25, 0.28];
+
 // The model drawn when `--model` is not given.
 const DEFAULT_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/x500.stl");
 
@@ -106,6 +120,16 @@ struct Args {
     /// seen from above, so that its nose is forward
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     model_turn: f32,
+
+    /// The legs of the model are whatever is more than this many metres
+    /// below its top. They are taken off on the ball joint. The default
+    /// fits the model in the repo
+    #[arg(long, default_value_t = 0.125)]
+    legs_below: f32,
+
+    /// Start with the drone on the ball joint. B changes it
+    #[arg(long)]
+    ball: bool,
 
     /// Save the first picture to this .png file and stop, in place of
     /// staying open
@@ -343,6 +367,99 @@ fn add_arrow(triangles: &mut Vec<Triangle>, axis: [f32; 3], length: f32, color: 
     }
 }
 
+/// Put the triangles of the legs after all the others, and give how many
+/// the others are. A triangle is of the legs if its middle is more than
+/// `legs_below` metres below the top of the model.
+fn legs_last(triangles: &mut [Triangle], legs_below: f32) -> usize {
+    // Down is positive, so the top is the least.
+    let top = triangles
+        .iter()
+        .flat_map(|t| t.corners)
+        .map(|corner| corner.z)
+        .fold(f32::INFINITY, f32::min);
+    let is_leg = |t: &Triangle| {
+        let [a, b, c] = t.corners;
+        (a.z + b.z + c.z) / 3.0 - top > legs_below
+    };
+    triangles.sort_by_key(is_leg); // keeps the order within each kind
+    triangles.iter().filter(|t| !is_leg(t)).count()
+}
+
+/// Add a cylinder that stands upright, from `top` to `bottom` metres down
+/// the body's z axis, closed at both ends.
+fn add_cylinder(
+    triangles: &mut Vec<Triangle>,
+    top: f32,
+    bottom: f32,
+    radius: f32,
+    color: [f32; 3],
+) {
+    let ring = |down: f32, step: usize| {
+        let angle = std::f32::consts::TAU * step as f32 / ARROW_SIDES as f32;
+        vec3(radius * angle.cos(), radius * angle.sin(), down)
+    };
+    for step in 0..ARROW_SIDES {
+        let (top_a, top_b) = (ring(top, step), ring(top, step + 1));
+        let (bottom_a, bottom_b) = (ring(bottom, step), ring(bottom, step + 1));
+        for corners in [
+            [top_a, top_b, bottom_b],
+            [top_a, bottom_b, bottom_a],
+            [vec3(0.0, 0.0, top), top_a, top_b],
+            [vec3(0.0, 0.0, bottom), bottom_a, bottom_b],
+        ] {
+            triangles.push(Triangle { corners, color });
+        }
+    }
+}
+
+/// Add a ball about the centre.
+fn add_ball(triangles: &mut Vec<Triangle>, radius: f32, color: [f32; 3]) {
+    const ROUND: usize = 24; // steps round the ball
+    const DOWN: usize = 12; // steps from its top to its bottom
+    let point = |round: usize, down: usize| {
+        let across = std::f32::consts::TAU * round as f32 / ROUND as f32;
+        let from_top = std::f32::consts::PI * down as f32 / DOWN as f32;
+        vec3(
+            radius * from_top.sin() * across.cos(),
+            radius * from_top.sin() * across.sin(),
+            -radius * from_top.cos(),
+        )
+    };
+    for down in 0..DOWN {
+        for round in 0..ROUND {
+            let (a, b) = (point(round, down), point(round + 1, down));
+            let (c, d) = (point(round, down + 1), point(round + 1, down + 1));
+            // At the top and at the bottom one of the two is only a line.
+            if down > 0 {
+                triangles.push(Triangle {
+                    corners: [a, b, d],
+                    color,
+                });
+            }
+            if down + 1 < DOWN {
+                triangles.push(Triangle {
+                    corners: [a, d, c],
+                    color,
+                });
+            }
+        }
+    }
+}
+
+/// Add the ball joint and its stand: a ball about the centre, on a pole
+/// that goes `height` metres down to a foot on the ground.
+fn add_stand(triangles: &mut Vec<Triangle>, height: f32) {
+    add_ball(triangles, BALL_RADIUS, BALL_COLOR);
+    add_cylinder(triangles, 0.0, height, POLE_RADIUS, STAND_COLOR);
+    add_cylinder(
+        triangles,
+        height - FOOT_HEIGHT,
+        height,
+        FOOT_RADIUS,
+        STAND_COLOR,
+    );
+}
+
 /// One corner of a triangle as the graphics card gets it.
 #[repr(C)]
 struct Corner {
@@ -401,15 +518,27 @@ struct Drawing {
     ghost_depth: miniquad::Pipeline,
     ghost_color: miniquad::Pipeline,
     bindings: miniquad::Bindings,
-    corners: i32,       // how many: three for each triangle
-    model_corners: i32, // how many of them, from the first, are the model's and not the arrows'
+    // How many corners, three for each triangle, each part has. The parts
+    // are in this order on the card.
+    body: i32,
+    legs: i32,
+    arrows: i32,
+    stand: i32,
+}
+
+/// How many triangles each part of the drawing has, in the order they are
+/// in.
+struct Parts {
+    body: usize,
+    legs: usize,
+    arrows: usize,
+    stand: usize,
 }
 
 impl Drawing {
-    /// Send the triangles to the graphics card. Done once. The first
-    /// `model_triangles` of them are the model, which the ghost is drawn
-    /// from; the rest are the arrows.
-    fn new(triangles: &[Triangle], model_triangles: usize) -> Self {
+    /// Send the triangles to the graphics card. Done once. `parts` says
+    /// which of them are what.
+    fn new(triangles: &[Triangle], parts: Parts) -> Self {
         use miniquad::{
             BlendFactor, BlendState, BlendValue, BufferLayout, BufferSource, BufferType,
             BufferUsage, Comparison, Equation, PipelineParams, ShaderMeta, ShaderSource,
@@ -512,8 +641,10 @@ impl Drawing {
                 index_buffer: order_buffer,
                 images: vec![],
             },
-            corners: corners.len() as i32,
-            model_corners: 3 * model_triangles as i32,
+            body: 3 * parts.body as i32,
+            legs: 3 * parts.legs as i32,
+            arrows: 3 * parts.arrows as i32,
+            stand: 3 * parts.stand as i32,
         }
     }
 
@@ -537,22 +668,35 @@ impl Drawing {
         }
     }
 
-    /// Draw the model, turned by `attitude` and with its centre at `centre`,
-    /// which is along the window's axes, as seen by `camera`.
-    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3) {
+    /// Draw the model and its arrows, turned by `attitude` and with its
+    /// centre at `centre`, which is along the window's axes, as seen by
+    /// `camera`. The legs are drawn if `legs` says so.
+    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3, legs: bool) {
         let tables = Self::tables(camera, attitude, centre, 0.0);
+        if legs {
+            self.send(
+                &[&self.pipeline],
+                &tables,
+                0,
+                self.body + self.legs + self.arrows,
+            );
+        } else {
+            self.send(&[&self.pipeline], &tables, 0, self.body);
+            self.send(
+                &[&self.pipeline],
+                &tables,
+                self.body + self.legs,
+                self.arrows,
+            );
+        }
+    }
 
-        // SAFETY: as in `new`. `flush` has macroquad draw what it was asked
-        // for so far, the ground, before this draws over it.
-        let mut layers = unsafe { mq::get_internal_gl() };
-        layers.flush();
-        let card = layers.quad_context;
-        card.begin_default_pass(miniquad::PassAction::Nothing);
-        card.apply_pipeline(&self.pipeline);
-        card.apply_bindings(&self.bindings);
-        card.apply_uniforms(miniquad::UniformsSource::table(&tables));
-        card.draw(0, self.corners, 1);
-        card.end_render_pass();
+    /// Draw the ball joint and its stand, with the ball's centre at
+    /// `centre`.
+    fn draw_stand(&self, camera: &mq::Camera3D, centre: mq::Vec3) {
+        let tables = Self::tables(camera, &Quat::new(), centre, 0.0);
+        let first = self.body + self.legs + self.arrows;
+        self.send(&[&self.pipeline], &tables, first, self.stand);
     }
 
     /// Draw the ghost: the model without the arrows, level, with its centre
@@ -563,18 +707,30 @@ impl Drawing {
     /// away the nearest of the ghost is at each dot of the screen. The
     /// second time colours only that nearest surface. Drawn once, the
     /// inside of the ghost would show through its outside.
-    fn draw_ghost(&self, camera: &mq::Camera3D, centre: mq::Vec3) {
+    fn draw_ghost(&self, camera: &mq::Camera3D, centre: mq::Vec3, legs: bool) {
         let tables = Self::tables(camera, &Quat::new(), centre, 1.0);
+        let corners = if legs {
+            self.body + self.legs
+        } else {
+            self.body
+        };
+        self.send(&[&self.ghost_depth, &self.ghost_color], &tables, 0, corners);
+    }
 
-        // SAFETY: as in `new`. Nothing is waiting in macroquad: `draw` has
-        // just flushed it.
-        let card = unsafe { mq::get_internal_gl() }.quad_context;
+    /// Have the graphics card draw `count` corners from `first` on, once
+    /// with each of `pipelines`.
+    fn send(&self, pipelines: &[&miniquad::Pipeline], tables: &Tables, first: i32, count: i32) {
+        // SAFETY: as in `new`. `flush` has macroquad draw what it was asked
+        // for so far, the ground, before this draws over it.
+        let mut layers = unsafe { mq::get_internal_gl() };
+        layers.flush();
+        let card = layers.quad_context;
         card.begin_default_pass(miniquad::PassAction::Nothing);
-        for pipeline in [&self.ghost_depth, &self.ghost_color] {
+        for pipeline in pipelines {
             card.apply_pipeline(pipeline);
             card.apply_bindings(&self.bindings);
-            card.apply_uniforms(miniquad::UniformsSource::table(&tables));
-            card.draw(0, self.model_corners, 1);
+            card.apply_uniforms(miniquad::UniformsSource::table(tables));
+            card.draw(first, count, 1);
         }
         card.end_render_pass();
     }
@@ -600,7 +756,7 @@ fn window() -> mq::Conf {
 async fn main() {
     let args = Args::parse();
 
-    let triangles = match load_model(
+    let mut triangles = match load_model(
         &args.model,
         args.model_scale,
         args.model_up,
@@ -628,16 +784,39 @@ async fn main() {
         + 0.05;
 
     let count = triangles.len();
+    let body = legs_last(&mut triangles, args.legs_below);
+
+    // How high the ball of the ball joint is: the height of the model, legs
+    // and all, times `BALL_HEIGHT`.
+    let (top, bottom) = triangles
+        .iter()
+        .flat_map(|t| t.corners)
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(top, bottom), c| {
+            (top.min(c.z), bottom.max(c.z))
+        });
+    let ball_height = BALL_HEIGHT * (bottom - top);
 
     // The body's three axes as arrows. They are part of the drawing, so
     // they turn with the drone. Each reaches as far as the farthest corner,
     // which keeps the tip of one that points down off the ground.
-    let mut triangles = triangles;
     for (axis, color) in AXES {
         add_arrow(&mut triangles, axis, height - 0.05, color);
     }
-    let drawing = Drawing::new(&triangles, count);
+    let with_arrows = triangles.len();
+    add_stand(&mut triangles, ball_height);
+    let drawing = Drawing::new(
+        &triangles,
+        Parts {
+            body,
+            legs: count - body,
+            arrows: with_arrows - count,
+            stand: triangles.len() - with_arrows,
+        },
+    );
     drop(triangles); // the graphics card has them now
+
+    // On the ball joint the drone turns but does not move, and has no legs.
+    let mut on_ball = args.ball;
 
     let mut attitude = Quat::new();
 
@@ -662,6 +841,10 @@ async fn main() {
             position = vec3(0.0, 0.0, 0.0);
             turned = false;
         }
+        if mq::is_key_pressed(mq::KeyCode::B) {
+            on_ball = !on_ball;
+            position = vec3(0.0, 0.0, 0.0); // the ball is where the drone started
+        }
         let rates = Rates {
             roll: TURN_RATE * key_pair(mq::KeyCode::D, mq::KeyCode::A),
             pitch: TURN_RATE * key_pair(mq::KeyCode::S, mq::KeyCode::W),
@@ -676,9 +859,10 @@ async fn main() {
         // over the ground that is drawn, and no lower than it started: there
         // it clears the ground at any attitude.
         let (sin, cos) = attitude.angles().yaw.sin_cos();
-        let forward = MOVE_SPEED * dt * key_pair(mq::KeyCode::Up, mq::KeyCode::Down);
-        let right = MOVE_SPEED * dt * key_pair(mq::KeyCode::Right, mq::KeyCode::Left);
-        let up = MOVE_SPEED * dt * key_pair(mq::KeyCode::PageUp, mq::KeyCode::PageDown);
+        let speed = if on_ball { 0.0 } else { MOVE_SPEED }; // the ball holds it
+        let forward = speed * dt * key_pair(mq::KeyCode::Up, mq::KeyCode::Down);
+        let right = speed * dt * key_pair(mq::KeyCode::Right, mq::KeyCode::Left);
+        let up = speed * dt * key_pair(mq::KeyCode::PageUp, mq::KeyCode::PageDown);
         position.x = (position.x + forward * cos - right * sin).clamp(-FARTHEST, FARTHEST);
         position.y = (position.y + forward * sin + right * cos).clamp(-FARTHEST, FARTHEST);
         position.z = (position.z - up).clamp(-HIGHEST, 0.0);
@@ -701,7 +885,8 @@ async fn main() {
         // The camera's place along the world's axes. With `camera_round` at
         // zero it is south of the drone, looking north along its back.
         let level = camera_distance * camera_up.cos();
-        let target = to_window(position) + mq::vec3(0.0, height, 0.0);
+        let start = mq::vec3(0.0, if on_ball { ball_height } else { height }, 0.0);
+        let target = to_window(position) + start;
         let camera = to_window(vec3(
             -level * camera_round.cos(),
             level * camera_round.sin(),
@@ -719,14 +904,17 @@ async fn main() {
 
         // The ground: lines 0.1 m apart.
         mq::draw_grid(GROUND_LINES, GROUND_SPACING, mq::BLACK, mq::GRAY);
-        drawing.draw(&camera, &attitude, target);
+        if on_ball {
+            drawing.draw_stand(&camera, start);
+        }
+        drawing.draw(&camera, &attitude, target, !on_ball);
 
         // The ghost, where the drone started. It is left out while the
         // drone is still exactly there, where it would only make the drone
         // pale.
         let moved = position.x != 0.0 || position.y != 0.0 || position.z != 0.0;
         if moved || turned {
-            drawing.draw_ghost(&camera, mq::vec3(0.0, height, 0.0));
+            drawing.draw_ghost(&camera, start, !on_ball);
         }
 
         // Text, on the flat screen again.
@@ -748,6 +936,14 @@ async fn main() {
             ),
             "W S pitch   A D roll   Q E yaw   R level, and back to the start".into(),
             "arrows: forward, back, left, right   Page Up, Page Down: up, down".into(),
+            format!(
+                "B: {}",
+                if on_ball {
+                    "take it off the ball joint"
+                } else {
+                    "put it on the ball joint of Stage 2"
+                }
+            ),
             "drag: camera   wheel: nearer, farther".into(),
             "axes: red forward, green right, blue down".into(),
             format!("{} pictures a second", mq::get_fps()),
@@ -792,6 +988,41 @@ mod tests {
             }
             assert!((farthest - 0.3).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn the_legs_of_the_model_in_the_repo_are_found() {
+        let mut triangles = load_model(Path::new(DEFAULT_MODEL), 1.0, Up::Z, 0.0).unwrap();
+        let lowest = |triangles: &[Triangle]| {
+            triangles
+                .iter()
+                .flat_map(|t| t.corners)
+                .map(|c| c.z)
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let all = triangles.len();
+        let with_legs = lowest(&triangles);
+        let body = legs_last(&mut triangles, 0.125);
+        assert_eq!(triangles.len(), all);
+        // The legs are a fifth or so of the triangles, and are the lower
+        // half of the model: without them it ends 0.15 m higher or more.
+        assert!((all / 10..all / 3).contains(&(all - body)));
+        assert!(with_legs - lowest(&triangles[..body]) > 0.15);
+    }
+
+    #[test]
+    fn the_stand_runs_from_the_ball_down_to_the_ground() {
+        let mut triangles = Vec::new();
+        add_stand(&mut triangles, 0.4);
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for corner in triangles.iter().flat_map(|t| t.corners) {
+            top = top.min(corner.z);
+            bottom = bottom.max(corner.z);
+            assert!(corner.x.hypot(corner.y) <= FOOT_RADIUS + 1e-6);
+        }
+        assert!((top + BALL_RADIUS).abs() < 1e-6);
+        assert!((bottom - 0.4).abs() < 1e-6);
     }
 
     #[test]
