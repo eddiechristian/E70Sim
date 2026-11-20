@@ -428,14 +428,40 @@ mod tests {
         // Set to roll 30°: `angles()` gives roll 30°, pitch 0°, yaw 0°, and
         // the accelerometer reads (0, −4.903, −8.493), as in
         // `test_accel_rolled`.
-        todo!()
+        let mut quad = quad();
+        quad.set_attitude(Angles {
+            roll: 30f32.to_radians(),
+            pitch: 0.0,
+            yaw: 0.0,
+        });
+        let angles = quad.angles();
+        assert!((angles.roll.to_degrees() - 30.0).abs() < 0.01);
+        assert!(angles.pitch.to_degrees().abs() < 0.01);
+        assert!(angles.yaw.to_degrees().abs() < 0.01);
+        assert_accel(quad.accel(), 0.0, -4.903, -8.493);
     }
 
     #[test]
     fn test_set_attitude_stays() {
         // Set to roll 20° and pitch −10°, then equal commands for 1 s: the
         // angles do not change and the rates stay 0.
-        todo!()
+        let mut quad = quad();
+        quad.set_attitude(Angles {
+            roll: 20f32.to_radians(),
+            pitch: -10f32.to_radians(),
+            yaw: 0.0,
+        });
+        run(&mut quad, 0.7, 0.7, 0.7, 0.7, 1.0);
+
+        let angles = quad.angles();
+        assert!((angles.roll.to_degrees() - 20.0).abs() < 0.01);
+        assert!((angles.pitch.to_degrees() + 10.0).abs() < 0.01);
+        assert!(angles.yaw.to_degrees().abs() < 0.01);
+
+        let rates = quad.rates();
+        assert_eq!(rates.roll, 0.0);
+        assert_eq!(rates.pitch, 0.0);
+        assert_eq!(rates.yaw, 0.0);
     }
 
     #[test]

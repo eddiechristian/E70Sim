@@ -447,7 +447,15 @@ mod tests {
         // `set_attitude` with roll 10°, then one update with a level
         // reading and zero rates: the estimate is still close to 10°, not
         // the reading's 0°. The first-reading rule did not apply.
-        todo!()
+        let mut estimator = Estimator::new(1.0);
+        estimator.set_attitude(Attitude {
+            roll: 10.0,
+            pitch: 0.0,
+        });
+        let attitude = estimator.update(ZERO_RATES, LEVEL, DT);
+        // One step of 1 ms with a time constant of 1 s moves the estimate
+        // a thousandth of the way to the reading: 10° becomes 9.99°.
+        assert_attitude(attitude, 9.99, 0.0);
     }
 
     // `dt` of 0, negative or NaN: panics in debug, one test per value.

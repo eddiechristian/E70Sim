@@ -48,9 +48,16 @@ impl Quat {
     ///    x = sr × cp × cy − cr × sp × sy
     ///    y = cr × sp × cy + sr × cp × sy
     ///    z = cr × cp × sy − sr × sp × cy
-    #[allow(unused_variables)] // remove once written
     pub fn from_angles(angles: Angles) -> Self {
-        todo!()
+        let (sr, cr) = (angles.roll * 0.5).sin_cos();
+        let (sp, cp) = (angles.pitch * 0.5).sin_cos();
+        let (sy, cy) = (angles.yaw * 0.5).sin_cos();
+        Self {
+            w: cr * cp * cy + sr * sp * sy,
+            x: sr * cp * cy - cr * sp * sy,
+            y: cr * sp * cy + sr * cp * sy,
+            z: cr * cp * sy - sr * sp * cy,
+        }
     }
 
     /// Turns the attitude by the three body rates over `dt` seconds, then
@@ -210,35 +217,72 @@ mod tests {
 
     // ---- From three angles
 
+    // The attitude with the given three angles, in degrees.
+    fn from_degrees(roll: f32, pitch: f32, yaw: f32) -> Quat {
+        Quat::from_angles(Angles {
+            roll: roll.to_radians(),
+            pitch: pitch.to_radians(),
+            yaw: yaw.to_radians(),
+        })
+    }
+
     #[test]
     fn test_from_angles_level() {
         // All three angles 0: (1, 0, 0, 0), the same as `Quat::new()`.
-        todo!()
+        let quat = from_degrees(0.0, 0.0, 0.0);
+        assert_eq!((quat.w, quat.x, quat.y, quat.z), (1.0, 0.0, 0.0, 0.0));
     }
 
     #[test]
     fn test_from_angles_one_axis() {
         // Roll 30° alone, pitch 30° alone, yaw 30° alone: `angles()` gives
         // each one back, with the other two 0.
-        todo!()
+        assert_angles(&from_degrees(30.0, 0.0, 0.0), 30.0, 0.0, 0.0);
+        assert_angles(&from_degrees(0.0, 30.0, 0.0), 0.0, 30.0, 0.0);
+        assert_angles(&from_degrees(0.0, 0.0, 30.0), 0.0, 0.0, 30.0);
     }
 
     #[test]
     fn test_from_angles_all_three() {
         // Roll 20°, pitch −10°, yaw 45°: `angles()` gives all three back.
-        todo!()
+        assert_angles(&from_degrees(20.0, -10.0, 45.0), 20.0, -10.0, 45.0);
     }
 
     #[test]
     fn test_from_angles_matches_turning() {
         // Roll 30° from angles is the same four numbers as a new quaternion
         // turned at 30 °/s about roll for 1 s.
-        todo!()
+        let set = from_degrees(30.0, 0.0, 0.0);
+        let mut turned = Quat::new();
+        spin(&mut turned, 30.0, 0.0, 0.0, 1.0);
+        for (name, set, turned) in [
+            ("w", set.w, turned.w),
+            ("x", set.x, turned.x),
+            ("y", set.y, turned.y),
+            ("z", set.z, turned.z),
+        ] {
+            assert!(
+                (set - turned).abs() < 1e-4,
+                "{name}: {set} from angles, {turned} from turning"
+            );
+        }
     }
 
     #[test]
     fn test_from_angles_has_length_one() {
         // Any three angles: the length is 1.
-        todo!()
+        for (roll, pitch, yaw) in [
+            (0.0, 0.0, 0.0),
+            (20.0, -10.0, 45.0),
+            (-170.0, 80.0, -135.0),
+            (90.0, 90.0, 90.0),
+            (123.0, -45.0, 300.0),
+        ] {
+            let length = from_degrees(roll, pitch, yaw).length();
+            assert!(
+                (length - 1.0).abs() < 1e-6,
+                "roll {roll}°, pitch {pitch}°, yaw {yaw}°: length {length}"
+            );
+        }
     }
 }

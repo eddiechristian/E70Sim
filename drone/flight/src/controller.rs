@@ -9,9 +9,7 @@
 use crate::calibration::Calibration;
 use crate::calibration::CalibrationStatus;
 use crate::estimator::{Accel, Attitude, Estimator, GyroRates};
-use crate::mixer::MotorCommands;
-#[allow(unused_imports)] // remove once written
-use crate::mixer::{MixerInput, mix};
+use crate::mixer::{MixerInput, MotorCommands, mix};
 use crate::pid::Pid;
 
 /// The angle loops run once in this many steps: 250 Hz when the step is
@@ -117,7 +115,6 @@ fn rate_pid(kp: f32, ki: f32, kd: f32, gains: &Gains) -> Pid {
     pid
 }
 
-#[allow(dead_code)] // remove once `update` is written
 pub struct Controller {
     // Parts
     calibration: Calibration,
@@ -186,7 +183,6 @@ impl Controller {
     ///
     /// A bad `dt` is passed through: the PIDs and the estimator guard
     /// against it themselves.
-    #[allow(unused_variables)] // remove once written
     pub fn update(
         &mut self,
         gyro: GyroRates,
@@ -197,7 +193,7 @@ impl Controller {
         if self.state == State::Calibrating {
             match self.calibration.update(gyro, accel) {
                 // Nothing to do: the calibration starts its own new window.
-                CalibrationStatus::Collecting => {},
+                CalibrationStatus::Collecting => {}
                 CalibrationStatus::Failed(reason) => self.last_failure = Some(reason),
                 CalibrationStatus::Done(result) => {
                     self.gyro_bias = result.gyro_bias;
@@ -208,14 +204,44 @@ impl Controller {
             }
             return MOTORS_OFF;
         }
-        // Flying
-        let adj_gyro_roll = gyro.roll - self.gyro_bias.roll;
-        let adj_gyro_pitch = gyro.pitch - self.gyro_bias.pitch;
-        let adj_gyro_yaw = gyro.yaw - self.gyro_bias.yaw;
-        let gyro = GyroRates { roll: adj_gyro_roll, pitch: adj_gyro_pitch, yaw: adj_gyro_yaw };
-        
-        self.attitude= Some(self.estimator.update(gyro, accel, dt));
-        
+        // Flying. From here on `gyro` is the reading with the bias removed.
+        let gyro = GyroRates {
+            roll: gyro.roll - self.gyro_bias.roll,
+            pitch: gyro.pitch - self.gyro_bias.pitch,
+            yaw: gyro.yaw - self.gyro_bias.yaw,
+        };
+
+        let attitude = self.estimator.update(gyro, accel, dt);
+        self.attitude = Some(attitude);
+
+        // The angle loops, on every fourth step. In between, the rate
+        // targets keep their last values.
+        if self.step.is_multiple_of(ANGLE_LOOP_DIVIDER) {
+            let angle_dt = dt * ANGLE_LOOP_DIVIDER as f32;
+            self.roll_rate_target =
+                self.roll_angle_pid
+                    .update(targets.roll, attitude.roll, angle_dt);
+            self.pitch_rate_target =
+                self.pitch_angle_pid
+                    .update(targets.pitch, attitude.pitch, angle_dt);
+        }
+        self.step += 1;
+
+        // The rate loops, on every step.
+        let roll = self
+            .roll_rate_pid
+            .update(self.roll_rate_target, gyro.roll, dt);
+        let pitch = self
+            .pitch_rate_pid
+            .update(self.pitch_rate_target, gyro.pitch, dt);
+        let yaw = self.yaw_rate_pid.update(targets.yaw_rate, gyro.yaw, dt);
+
+        mix(MixerInput {
+            throttle: targets.throttle,
+            roll,
+            pitch,
+            yaw,
+        })
     }
 
     pub fn state(&self) -> State {
@@ -271,15 +297,14 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)] // remove once the tests are written
     use super::*;
-    #[allow(unused_imports)] // remove once the tests are written
     use crate::calibration::CALIBRATION_STEPS;
 
-    #[allow(dead_code)] // remove once the tests are written
     const DT: f32 = 0.001;
 
-    #[allow(dead_code)] // remove once the tests are written
+    // Motor commands are compared in throttle units.
+    const TOLERANCE: f32 = 1e-5;
+
     const LEVEL: Accel = Accel {
         x: 0.0,
         y: 0.0,
@@ -287,7 +312,6 @@ mod tests {
     };
 
     // Level, no yaw, throttle 0.7.
-    #[allow(dead_code)] // remove once the tests are written
     const LEVEL_TARGETS: Targets = Targets {
         roll: 0.0,
         pitch: 0.0,
@@ -297,7 +321,6 @@ mod tests {
 
     // The reading, in g, of a still accelerometer at the given roll and
     // pitch in degrees. The same as in the estimator's tests.
-    #[allow(dead_code)] // remove once the tests are written
     fn reading_at(roll: f32, pitch: f32) -> Accel {
         let (phi, theta) = (roll.to_radians(), pitch.to_radians());
         Accel {
@@ -307,20 +330,57 @@ mod tests {
         }
     }
 
+    // A controller that has just finished calibrating, with the same gyro
+    // and accelerometer reading on every step. The next update is the
+    // first one flown.
+    fn calibrated(gyro: GyroRates, accel: Accel) -> Controller {
+        let mut controller = Controller::new(Gains::default());
+        for _ in 0..CALIBRATION_STEPS {
+            controller.update(gyro, accel, LEVEL_TARGETS, DT);
+        }
+        assert_eq!(controller.state(), State::Flying);
+        controller
+    }
+
+    fn assert_commands(commands: MotorCommands, fl: f32, fr: f32, br: f32, bl: f32) {
+        let near = |actual: f32, expected: f32| (actual - expected).abs() < TOLERANCE;
+        assert!(
+            near(commands.fl, fl)
+                && near(commands.fr, fr)
+                && near(commands.br, br)
+                && near(commands.bl, bl),
+            "got {commands:?}, expected fl {fl}, fr {fr}, br {br}, bl {bl}"
+        );
+    }
+
+    fn assert_same(a: MotorCommands, b: MotorCommands) {
+        assert_commands(a, b.fl, b.fr, b.br, b.bl);
+    }
+
     // "More power" in the comments below means a larger motor command.
 
     #[test]
     fn test_motors_off_while_calibrating() {
         // The first 1000 updates, level, throttle 0.7: all four commands 0,
         // and the state is `Calibrating` until the last of them.
-        todo!()
+        let mut controller = Controller::new(Gains::default());
+        for _ in 0..CALIBRATION_STEPS {
+            assert_eq!(controller.state(), State::Calibrating);
+            assert_eq!(controller.attitude(), None);
+            let commands = controller.update(ZERO_RATES, LEVEL, LEVEL_TARGETS, DT);
+            assert_eq!(commands, MOTORS_OFF);
+        }
+        assert_eq!(controller.state(), State::Flying);
     }
 
     #[test]
     fn test_flying_after_calibrating() {
         // The 1001st update, level, targets zero, throttle 0.7: the state is
         // `Flying` and all four commands are 0.7.
-        todo!()
+        let mut controller = calibrated(ZERO_RATES, LEVEL);
+        let commands = controller.update(ZERO_RATES, LEVEL, LEVEL_TARGETS, DT);
+        assert_eq!(controller.state(), State::Flying);
+        assert_commands(commands, 0.7, 0.7, 0.7, 0.7);
     }
 
     #[test]
@@ -328,7 +388,14 @@ mod tests {
         // Calibrated at 10° of roll, zero rates, targets level: the right
         // motors (fr, br) get more power than the left ones (fl, bl), to
         // lift the right side.
-        todo!()
+        //
+        // The angle loop asks for 6 × (0 − 10) = −60 °/s, and the rate loop
+        // answers 0.0014 × −60 = −0.084.
+        let accel = reading_at(10.0, 0.0);
+        let mut controller = calibrated(ZERO_RATES, accel);
+        let commands = controller.update(ZERO_RATES, accel, LEVEL_TARGETS, DT);
+        assert!((controller.roll_rate_target() + 60.0).abs() < 0.01);
+        assert_commands(commands, 0.616, 0.784, 0.784, 0.616);
     }
 
     #[test]
@@ -336,28 +403,66 @@ mod tests {
         // Calibrated at 10° of pitch, zero rates, targets level: the back
         // motors (br, bl) get more power than the front ones (fl, fr), to
         // lift the tail and bring the nose down.
-        todo!()
+        let accel = reading_at(0.0, 10.0);
+        let mut controller = calibrated(ZERO_RATES, accel);
+        let commands = controller.update(ZERO_RATES, accel, LEVEL_TARGETS, DT);
+        assert!((controller.pitch_rate_target() + 60.0).abs() < 0.01);
+        assert_commands(commands, 0.616, 0.616, 0.784, 0.784);
     }
 
     #[test]
     fn test_target_right_drone_level() {
         // Level readings, target roll 10°: the left motors get more power
         // than the right ones, to push the right side down.
-        todo!()
+        let mut controller = calibrated(ZERO_RATES, LEVEL);
+        let targets = Targets {
+            roll: 10.0,
+            ..LEVEL_TARGETS
+        };
+        let commands = controller.update(ZERO_RATES, LEVEL, targets, DT);
+        assert!((controller.roll_rate_target() - 60.0).abs() < 0.01);
+        assert_commands(commands, 0.784, 0.616, 0.616, 0.784);
     }
 
     #[test]
     fn test_yaw_untouched_by_tilt() {
         // Readings for 10° of roll: no yaw part, so `fl + br` equals
         // `fr + bl`.
-        todo!()
+        let accel = reading_at(10.0, 0.0);
+        let mut controller = calibrated(ZERO_RATES, accel);
+        let commands = controller.update(ZERO_RATES, accel, LEVEL_TARGETS, DT);
+        assert_ne!(commands.fl, commands.fr); // the tilt did do something
+        let cw = commands.fl + commands.br;
+        let ccw = commands.fr + commands.bl;
+        assert!((cw - ccw).abs() < TOLERANCE, "cw {cw}, ccw {ccw}");
     }
 
     #[test]
     fn test_rate_limit() {
         // Readings for 80° of roll give the same commands as readings for
         // 60°: both ask for the rate limit.
-        todo!()
+        //
+        // The rate loop answers 0.0014 × −200 = −0.28, which is inside its
+        // own limit of 0.3, so it is the rate limit that is tested.
+        let mut commands = [MOTORS_OFF; 2];
+        for (i, roll) in [60.0, 80.0].into_iter().enumerate() {
+            let accel = reading_at(roll, 0.0);
+            let mut controller = calibrated(ZERO_RATES, accel);
+            commands[i] = controller.update(ZERO_RATES, accel, LEVEL_TARGETS, DT);
+            assert_eq!(controller.roll_rate_target(), -200.0);
+        }
+        assert_same(commands[0], commands[1]);
+        assert_commands(commands[0], 0.42, 0.98, 0.98, 0.42);
+
+        // The other way: level, with a target of 80° of roll.
+        let mut controller = calibrated(ZERO_RATES, LEVEL);
+        let targets = Targets {
+            roll: 80.0,
+            ..LEVEL_TARGETS
+        };
+        let other_way = controller.update(ZERO_RATES, LEVEL, targets, DT);
+        assert_eq!(controller.roll_rate_target(), 200.0);
+        assert_commands(other_way, 0.98, 0.42, 0.42, 0.98);
     }
 
     #[test]
@@ -365,7 +470,30 @@ mod tests {
         // Calibrate with a gyro reading of 1 °/s on each axis, then give the
         // same reading while flying: the same commands as a controller that
         // saw no bias at all.
-        todo!()
+        let biased_reading = GyroRates {
+            roll: 1.0,
+            pitch: 1.0,
+            yaw: 1.0,
+        };
+        let mut biased = calibrated(biased_reading, LEVEL);
+        let mut clean = calibrated(ZERO_RATES, LEVEL);
+        assert!((biased.gyro_bias().roll - 1.0).abs() < 1e-3);
+        assert!((biased.gyro_bias().pitch - 1.0).abs() < 1e-3);
+        assert!((biased.gyro_bias().yaw - 1.0).abs() < 1e-3);
+
+        // A target that makes the loops work, so that the commands are not
+        // simply the throttle.
+        let targets = Targets {
+            roll: 10.0,
+            pitch: -5.0,
+            yaw_rate: 20.0,
+            throttle: 0.6,
+        };
+        for _ in 0..20 {
+            let with_bias = biased.update(biased_reading, LEVEL, targets, DT);
+            let without = clean.update(ZERO_RATES, LEVEL, targets, DT);
+            assert_same(with_bias, without);
+        }
     }
 
     #[test]
@@ -373,13 +501,49 @@ mod tests {
         // Change the target roll between two steps that are not a fourth
         // step: `roll_rate_target()` and the commands do not change until
         // the next fourth step.
-        todo!()
+        let mut controller = calibrated(ZERO_RATES, LEVEL);
+        let tilted = Targets {
+            roll: 10.0,
+            ..LEVEL_TARGETS
+        };
+
+        // Step 0: the angle loops run, with a level target.
+        let first = controller.update(ZERO_RATES, LEVEL, LEVEL_TARGETS, DT);
+        assert_eq!(controller.roll_rate_target(), 0.0);
+
+        // Steps 1, 2 and 3: the new target is not looked at yet.
+        for _ in 1..ANGLE_LOOP_DIVIDER {
+            let commands = controller.update(ZERO_RATES, LEVEL, tilted, DT);
+            assert_eq!(controller.roll_rate_target(), 0.0);
+            assert_same(commands, first);
+        }
+
+        // Step 4: the angle loops run again.
+        let commands = controller.update(ZERO_RATES, LEVEL, tilted, DT);
+        assert!((controller.roll_rate_target() - 60.0).abs() < 0.01);
+        assert!(commands.fl > first.fl + 0.05);
     }
 
     #[test]
     fn test_reset() {
         // Fly, then `reset()`: `Calibrating` again, `attitude()` is `None`,
         // and the next update returns all four motors off.
-        todo!()
+        let biased_reading = GyroRates {
+            roll: 1.0,
+            pitch: 0.0,
+            yaw: 0.0,
+        };
+        let mut controller = calibrated(biased_reading, reading_at(10.0, 0.0));
+        controller.update(biased_reading, LEVEL, LEVEL_TARGETS, DT);
+        assert!(controller.attitude().is_some());
+
+        controller.reset();
+        assert_eq!(controller.state(), State::Calibrating);
+        assert_eq!(controller.attitude(), None);
+        assert_eq!(controller.gyro_bias(), ZERO_RATES);
+        assert_eq!(controller.roll_rate_target(), 0.0);
+        let commands = controller.update(ZERO_RATES, LEVEL, LEVEL_TARGETS, DT);
+        assert_eq!(commands, MOTORS_OFF);
+        assert_eq!(controller.state(), State::Calibrating);
     }
 }
