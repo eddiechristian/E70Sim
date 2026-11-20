@@ -12,6 +12,9 @@
 //! The body's axes are drawn as three arrows from its centre: red forward,
 //! green right and blue down.
 //!
+//! A ghost of the drone, pale and half seen through, stays level where the
+//! drone started, to show how far the drone has been moved and turned.
+//!
 //! Keys: W and S pitch, A and D roll, Q and E yaw. The arrow keys move it
 //! forward, back, left and right, the way its nose points but level, however
 //! it is tilted. Page Up and Page Down move it up and down. R puts it level
@@ -353,6 +356,7 @@ struct Corner {
 struct Tables {
     camera: mq::Mat4, // from the window's axes to the screen
     place: mq::Mat4,  // from the body's axes to the window's
+    ghost: f32,       // 0 for the drone, 1 for its ghost
 }
 
 // The two small programs the graphics card runs. The first runs for each
@@ -363,41 +367,53 @@ struct Tables {
 // triangle is its outside is not looked at; a model file may have that
 // either way round. The second program runs for each dot of the screen and
 // gives it the colour.
+//
+// The ghost is the same triangles with `Ghost` at 1: most of the way to one
+// pale colour, and letting 65% of what is behind it through.
 const CORNER_PROGRAM: &str = r#"#version 100
 attribute vec3 in_position;
 attribute vec3 in_facing;
 attribute vec4 in_color;
 uniform mat4 Camera;
 uniform mat4 Place;
-varying lowp vec3 color;
+uniform float Ghost;
+varying lowp vec4 color;
 void main() {
     gl_Position = Camera * Place * vec4(in_position, 1.0);
     vec3 facing = normalize((Place * vec4(in_facing, 0.0)).xyz);
     vec3 towards_lamp = normalize(vec3(0.4, 1.0, 0.5));
     float light = 0.35 + 0.65 * abs(dot(facing, towards_lamp));
-    color = in_color.rgb / 255.0 * light;
+    vec3 lit = in_color.rgb / 255.0 * light;
+    vec3 pale = vec3(0.80, 0.90, 1.00) * light;
+    color = vec4(mix(lit, pale, 0.8 * Ghost), 1.0 - 0.65 * Ghost);
 }"#;
 
 const DOT_PROGRAM: &str = r#"#version 100
-varying lowp vec3 color;
+varying lowp vec4 color;
 void main() {
-    gl_FragColor = vec4(color, 1.0);
+    gl_FragColor = color;
 }"#;
 
 /// The model, as it sits on the graphics card.
 struct Drawing {
     pipeline: miniquad::Pipeline,
+    // The two steps the ghost is drawn in: see `draw_ghost`.
+    ghost_depth: miniquad::Pipeline,
+    ghost_color: miniquad::Pipeline,
     bindings: miniquad::Bindings,
-    corners: i32, // how many: three for each triangle
+    corners: i32,       // how many: three for each triangle
+    model_corners: i32, // how many of them, from the first, are the model's and not the arrows'
 }
 
 impl Drawing {
-    /// Send the triangles to the graphics card. Done once.
-    fn new(triangles: &[Triangle]) -> Self {
+    /// Send the triangles to the graphics card. Done once. The first
+    /// `model_triangles` of them are the model, which the ghost is drawn
+    /// from; the rest are the arrows.
+    fn new(triangles: &[Triangle], model_triangles: usize) -> Self {
         use miniquad::{
-            BufferLayout, BufferSource, BufferType, BufferUsage, Comparison, PipelineParams,
-            ShaderMeta, ShaderSource, UniformBlockLayout, UniformDesc, UniformType,
-            VertexAttribute, VertexFormat,
+            BlendFactor, BlendState, BlendValue, BufferLayout, BufferSource, BufferType,
+            BufferUsage, Comparison, Equation, PipelineParams, ShaderMeta, ShaderSource,
+            UniformBlockLayout, UniformDesc, UniformType, VertexAttribute, VertexFormat,
         };
 
         let mut corners = Vec::with_capacity(triangles.len() * 3);
@@ -445,48 +461,71 @@ impl Drawing {
                         uniforms: vec![
                             UniformDesc::new("Camera", UniformType::Mat4),
                             UniformDesc::new("Place", UniformType::Mat4),
+                            UniformDesc::new("Ghost", UniformType::Float1),
                         ],
                     },
                 },
             )
             .expect("the graphics card did not take the two programs");
-        let pipeline = card.new_pipeline(
-            &[BufferLayout::default()],
-            // In the order of `Corner`.
-            &[
-                VertexAttribute::new("in_position", VertexFormat::Float3),
-                VertexAttribute::new("in_facing", VertexFormat::Float3),
-                VertexAttribute::new("in_color", VertexFormat::Byte4),
-            ],
-            shader,
-            PipelineParams {
+        let mut pipeline = |params: PipelineParams| {
+            card.new_pipeline(
+                &[BufferLayout::default()],
+                // In the order of `Corner`.
+                &[
+                    VertexAttribute::new("in_position", VertexFormat::Float3),
+                    VertexAttribute::new("in_facing", VertexFormat::Float3),
+                    VertexAttribute::new("in_color", VertexFormat::Byte4),
+                ],
+                shader,
+                params,
+            )
+        };
+
+        Self {
+            pipeline: pipeline(PipelineParams {
                 // A triangle behind another is hidden by it.
                 depth_test: Comparison::LessOrEqual,
                 depth_write: true,
                 ..Default::default()
-            },
-        );
-
-        Self {
-            pipeline,
+            }),
+            // No colour, only how far away each dot of the ghost is.
+            ghost_depth: pipeline(PipelineParams {
+                depth_test: Comparison::LessOrEqual,
+                depth_write: true,
+                color_write: (false, false, false, false),
+                ..Default::default()
+            }),
+            // The colour, mixed with what is behind by how far the ghost
+            // lets it through.
+            ghost_color: pipeline(PipelineParams {
+                depth_test: Comparison::LessOrEqual,
+                depth_write: false,
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+                )),
+                ..Default::default()
+            }),
             bindings: miniquad::Bindings {
                 vertex_buffers: vec![corner_buffer],
                 index_buffer: order_buffer,
                 images: vec![],
             },
             corners: corners.len() as i32,
+            model_corners: 3 * model_triangles as i32,
         }
     }
 
-    /// Draw the model, turned by `attitude` and with its centre at `centre`,
-    /// which is along the window's axes, as seen by `camera`.
-    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3) {
+    /// What the graphics card is told: the camera, and the body's axes and
+    /// centre along the window's axes.
+    fn tables(camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3, ghost: f32) -> Tables {
         // Where the body's three axes point in the window, and where its
         // centre is. These are the four columns of the table.
         let forward = to_window(attitude.to_world(vec3(1.0, 0.0, 0.0)));
         let right = to_window(attitude.to_world(vec3(0.0, 1.0, 0.0)));
         let down = to_window(attitude.to_world(vec3(0.0, 0.0, 1.0)));
-        let tables = Tables {
+        Tables {
             camera: camera.matrix(),
             place: mq::Mat4::from_cols(
                 forward.extend(0.0),
@@ -494,7 +533,14 @@ impl Drawing {
                 down.extend(0.0),
                 centre.extend(1.0),
             ),
-        };
+            ghost,
+        }
+    }
+
+    /// Draw the model, turned by `attitude` and with its centre at `centre`,
+    /// which is along the window's axes, as seen by `camera`.
+    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3) {
+        let tables = Self::tables(camera, attitude, centre, 0.0);
 
         // SAFETY: as in `new`. `flush` has macroquad draw what it was asked
         // for so far, the ground, before this draws over it.
@@ -506,6 +552,30 @@ impl Drawing {
         card.apply_bindings(&self.bindings);
         card.apply_uniforms(miniquad::UniformsSource::table(&tables));
         card.draw(0, self.corners, 1);
+        card.end_render_pass();
+    }
+
+    /// Draw the ghost: the model without the arrows, level, with its centre
+    /// at `centre`. It has to be drawn after the drone, so that the drone
+    /// shows through it.
+    ///
+    /// It is drawn twice. The first time leaves no colour, only how far
+    /// away the nearest of the ghost is at each dot of the screen. The
+    /// second time colours only that nearest surface. Drawn once, the
+    /// inside of the ghost would show through its outside.
+    fn draw_ghost(&self, camera: &mq::Camera3D, centre: mq::Vec3) {
+        let tables = Self::tables(camera, &Quat::new(), centre, 1.0);
+
+        // SAFETY: as in `new`. Nothing is waiting in macroquad: `draw` has
+        // just flushed it.
+        let card = unsafe { mq::get_internal_gl() }.quad_context;
+        card.begin_default_pass(miniquad::PassAction::Nothing);
+        for pipeline in [&self.ghost_depth, &self.ghost_color] {
+            card.apply_pipeline(pipeline);
+            card.apply_bindings(&self.bindings);
+            card.apply_uniforms(miniquad::UniformsSource::table(&tables));
+            card.draw(0, self.model_corners, 1);
+        }
         card.end_render_pass();
     }
 }
@@ -566,7 +636,7 @@ async fn main() {
     for (axis, color) in AXES {
         add_arrow(&mut triangles, axis, height - 0.05, color);
     }
-    let drawing = Drawing::new(&triangles);
+    let drawing = Drawing::new(&triangles, count);
     drop(triangles); // the graphics card has them now
 
     let mut attitude = Quat::new();
@@ -574,6 +644,7 @@ async fn main() {
     // Where the drone's centre is from where it started, along the world's
     // axes: north, east and down, in metres.
     let mut position = vec3(0.0, 0.0, 0.0);
+    let mut turned = false; // since the start, or since R
 
     // Where the camera is: round the drone by `camera_round`, from behind it
     // towards its right, and above level by `camera_up`, both in radians.
@@ -589,12 +660,14 @@ async fn main() {
         if mq::is_key_pressed(mq::KeyCode::R) {
             attitude = Quat::new();
             position = vec3(0.0, 0.0, 0.0);
+            turned = false;
         }
         let rates = Rates {
             roll: TURN_RATE * key_pair(mq::KeyCode::D, mq::KeyCode::A),
             pitch: TURN_RATE * key_pair(mq::KeyCode::S, mq::KeyCode::W),
             yaw: TURN_RATE * key_pair(mq::KeyCode::E, mq::KeyCode::Q),
         };
+        turned |= rates.roll != 0.0 || rates.pitch != 0.0 || rates.yaw != 0.0;
         attitude.update(rates, dt);
         attitude.normalise();
 
@@ -647,6 +720,14 @@ async fn main() {
         // The ground: lines 0.1 m apart.
         mq::draw_grid(GROUND_LINES, GROUND_SPACING, mq::BLACK, mq::GRAY);
         drawing.draw(&camera, &attitude, target);
+
+        // The ghost, where the drone started. It is left out while the
+        // drone is still exactly there, where it would only make the drone
+        // pale.
+        let moved = position.x != 0.0 || position.y != 0.0 || position.z != 0.0;
+        if moved || turned {
+            drawing.draw_ghost(&camera, mq::vec3(0.0, height, 0.0));
+        }
 
         // Text, on the flat screen again.
         mq::set_default_camera();
