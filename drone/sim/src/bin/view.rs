@@ -12,9 +12,11 @@
 //! The body's axes are drawn as three arrows from its centre: red forward,
 //! green right and blue down.
 //!
-//! Keys: W and S pitch, A and D roll, Q and E yaw, R puts it level again.
-//! Drag with the left mouse button to move the camera round the drone, and
-//! turn the wheel to move it in and out.
+//! Keys: W and S pitch, A and D roll, Q and E yaw. The arrow keys move it
+//! forward, back, left and right, the way its nose points but level, however
+//! it is tilted. Page Up and Page Down move it up and down. R puts it level
+//! again, back where it started. Drag with the left mouse button to move the
+//! camera round the drone, and turn the wheel to move it in and out.
 //!
 //! Run with `cargo run --release --bin view`, or
 //! `cargo run --release --bin view -- --model frame.stl`.
@@ -39,6 +41,13 @@ use physics::vec3::Vec3;
 
 // Turning by hand
 const TURN_RATE: f32 = 1.5; // rad/s while a key is held
+
+// Moving by hand
+const MOVE_SPEED: f32 = 0.5; // m/s while a key is held
+const GROUND_SPACING: f32 = 0.1; // m between the lines of the ground
+const GROUND_LINES: u32 = 100; // across the ground, so it is 10 m square
+const FARTHEST: f32 = 0.5 * GROUND_LINES as f32 * GROUND_SPACING; // m from the middle, each way
+const HIGHEST: f32 = 5.0; // m above where it starts
 
 // The camera
 const CAMERA_START_DISTANCE: f32 = 1.0; // m from the drone
@@ -469,9 +478,9 @@ impl Drawing {
         }
     }
 
-    /// Draw the model, turned by `attitude` and lifted `height` metres off
-    /// the ground, as seen by `camera`.
-    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, height: f32) {
+    /// Draw the model, turned by `attitude` and with its centre at `centre`,
+    /// which is along the window's axes, as seen by `camera`.
+    fn draw(&self, camera: &mq::Camera3D, attitude: &Quat, centre: mq::Vec3) {
         // Where the body's three axes point in the window, and where its
         // centre is. These are the four columns of the table.
         let forward = to_window(attitude.to_world(vec3(1.0, 0.0, 0.0)));
@@ -483,7 +492,7 @@ impl Drawing {
                 forward.extend(0.0),
                 right.extend(0.0),
                 down.extend(0.0),
-                mq::vec4(0.0, height, 0.0, 1.0),
+                centre.extend(1.0),
             ),
         };
 
@@ -562,6 +571,10 @@ async fn main() {
 
     let mut attitude = Quat::new();
 
+    // Where the drone's centre is from where it started, along the world's
+    // axes: north, east and down, in metres.
+    let mut position = vec3(0.0, 0.0, 0.0);
+
     // Where the camera is: round the drone by `camera_round`, from behind it
     // towards its right, and above level by `camera_up`, both in radians.
     let mut camera_round: f32 = 0.6;
@@ -575,6 +588,7 @@ async fn main() {
         // Turn the drone. The rates are the body's, as a gyro would read.
         if mq::is_key_pressed(mq::KeyCode::R) {
             attitude = Quat::new();
+            position = vec3(0.0, 0.0, 0.0);
         }
         let rates = Rates {
             roll: TURN_RATE * key_pair(mq::KeyCode::D, mq::KeyCode::A),
@@ -584,7 +598,19 @@ async fn main() {
         attitude.update(rates, dt);
         attitude.normalise();
 
-        // Move the camera.
+        // Move the drone. Forward is the way its nose points on the ground,
+        // which is its yaw, so a tilted drone still moves level. It stays
+        // over the ground that is drawn, and no lower than it started: there
+        // it clears the ground at any attitude.
+        let (sin, cos) = attitude.angles().yaw.sin_cos();
+        let forward = MOVE_SPEED * dt * key_pair(mq::KeyCode::Up, mq::KeyCode::Down);
+        let right = MOVE_SPEED * dt * key_pair(mq::KeyCode::Right, mq::KeyCode::Left);
+        let up = MOVE_SPEED * dt * key_pair(mq::KeyCode::PageUp, mq::KeyCode::PageDown);
+        position.x = (position.x + forward * cos - right * sin).clamp(-FARTHEST, FARTHEST);
+        position.y = (position.y + forward * sin + right * cos).clamp(-FARTHEST, FARTHEST);
+        position.z = (position.z - up).clamp(-HIGHEST, 0.0);
+
+        // Move the camera. It looks at the drone, and so follows it.
         let mouse = mq::mouse_position();
         if mq::is_mouse_button_down(mq::MouseButton::Left) {
             camera_round -= DRAG_SPEED * (mouse.0 - mouse_before.0);
@@ -602,7 +628,7 @@ async fn main() {
         // The camera's place along the world's axes. With `camera_round` at
         // zero it is south of the drone, looking north along its back.
         let level = camera_distance * camera_up.cos();
-        let target = mq::vec3(0.0, height, 0.0);
+        let target = to_window(position) + mq::vec3(0.0, height, 0.0);
         let camera = to_window(vec3(
             -level * camera_round.cos(),
             level * camera_round.sin(),
@@ -619,8 +645,8 @@ async fn main() {
         mq::set_camera(&camera);
 
         // The ground: lines 0.1 m apart.
-        mq::draw_grid(40, 0.1, mq::BLACK, mq::GRAY);
-        drawing.draw(&camera, &attitude, height);
+        mq::draw_grid(GROUND_LINES, GROUND_SPACING, mq::BLACK, mq::GRAY);
+        drawing.draw(&camera, &attitude, target);
 
         // Text, on the flat screen again.
         mq::set_default_camera();
@@ -633,8 +659,15 @@ async fn main() {
                 angles.pitch.to_degrees(),
                 angles.yaw.to_degrees(),
             ),
-            "W S pitch   A D roll   Q E yaw   R level   drag: camera   wheel: nearer, farther"
-                .into(),
+            format!(
+                "north {:6.2}   east {:6.2}   up {:6.2}   metres",
+                position.x,
+                position.y,
+                0.0 - position.z, // not `-`, which gives -0.00 at the start
+            ),
+            "W S pitch   A D roll   Q E yaw   R level, and back to the start".into(),
+            "arrows: forward, back, left, right   Page Up, Page Down: up, down".into(),
+            "drag: camera   wheel: nearer, farther".into(),
             "axes: red forward, green right, blue down".into(),
             format!("{} pictures a second", mq::get_fps()),
         ];
