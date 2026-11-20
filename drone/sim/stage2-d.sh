@@ -13,11 +13,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo build --quiet --bin quad
 
-# name, then the arguments of the run
+# name, then the arguments of the run. Every run has --stage 2d as well, so
+# that a later stage that changes a default does not change these runs.
 run_case() {
     name=$1
     shift
-    cargo run --quiet --bin quad -- "$@" > "$tmp/$name.csv"
+    cargo run --quiet --bin quad -- --stage 2d "$@" > "$tmp/$name.csv"
     python3 plot_angles.py "$tmp/$name.csv" "stage2-d/$name.png" --title "$name:  $*"
 }
 

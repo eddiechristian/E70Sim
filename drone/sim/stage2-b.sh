@@ -13,15 +13,13 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo build --quiet --bin quad
 
-# These runs are from before the rate loops had an I term (Stage2-d.md).
-NO_I="--ki 0 --yaw-ki 0"
-
-# name, then the arguments of the run. Every run has --rate-only as well:
-# these cases are from before the angle loops and the calibration.
+# name, then the arguments of the run. Every run has --stage 2b as well, which
+# runs the program as it was at this stage: rate loops only, with no I term,
+# from before the angle loops and the calibration.
 run_case() {
     name=$1
     shift
-    cargo run --quiet --bin quad -- --rate-only $NO_I "$@" > "$tmp/$name.csv"
+    cargo run --quiet --bin quad -- --stage 2b "$@" > "$tmp/$name.csv"
     python3 plot_estimator.py "$tmp/$name.csv" "stage2-b/$name.png" --title "$name:  $*"
 }
 

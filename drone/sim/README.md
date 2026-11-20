@@ -144,6 +144,7 @@ cargo run --bin quad -- --help
 
 | Argument | Meaning | Default |
 |---|---|---|
+| `--stage` | run as the program ran at that stage: `2a`, `2b`, `2c` or `2d`; see [Running an earlier stage](#running-an-earlier-stage) | the latest |
 | `--axis` | which axis gets the step: `roll`, `pitch` or `yaw` | `roll` |
 | `--target` | the step: an angle in degrees for roll and pitch, a rate in °/s for yaw | 20, or 50 for yaw |
 | `--angle-kp` | angle loop gain for roll and pitch, in °/s per degree | 6 |
@@ -174,7 +175,7 @@ Where the default rate gains come from:
 
 - **Roll and pitch** use the gains chosen in `Stage1-d.md` (`--kp 0.002 --kd 0.00004`), divided by √2. One unit of PID output turns the quad √2 times harder than it turned the seesaw: four motors at 0.14 m from the axis, against two motors at 0.2 m.
 - **Yaw** needs a much larger gain, because the same command turns the body about 16 times more slowly. Even so, a 50 °/s yaw step drives the output to its limit for a moment.
-- **The two `Ki` values** were chosen in [`Stage2-d.md`](../../Stage2-d.md#results), to hold the drone level with one weak motor. The Stage 2a, 2b and 2c scripts pass `--ki 0 --yaw-ki 0`, so that they still make the pictures of those stages.
+- **The two `Ki` values** were chosen in [`Stage2-d.md`](../../Stage2-d.md#results), to hold the drone level with one weak motor. Stages 2a, 2b and 2c had none; `--stage` gives those stages back.
 
 `plot_angles.py` draws six panels: the angle and the rate of roll, the same for pitch, the yaw rate, then the four motor commands. The calibration is shaded. It takes the same two optional arguments as `plot.py`: the file to read and a picture to save.
 
@@ -185,6 +186,35 @@ Where the default rate gains come from:
 ```
 
 This runs ten cases (a step on each axis, the real sensors with and without calibration, a tilted start, two other angle gains and two 45° steps), prints their figures and saves numbered pictures into `stage2-c/`. [`stage2-c/README.md`](stage2-c/README.md) lists them.
+
+### Running an earlier stage
+
+The program changes from stage to stage: new loops arrive and defaults move. `--stage` runs it as it ran at one of them, by setting every argument that has changed since to what it was then.
+
+```
+cargo run --bin quad -- --stage 2a > quad.csv
+cargo run --bin quad -- --stage 2c --axis pitch > quad.csv
+cargo run --bin quad -- --stage 2c --ki 0.001 > quad.csv
+```
+
+| Stage | What the program was | What `--stage` sets |
+|---|---|---|
+| `2a` | three rate loops and the mixer | `--rate-only`, `--ki 0`, `--yaw-ki 0` |
+| `2b` | the same, with the estimator watching | the same as `2a` |
+| `2c` | the whole controller, with no I term in the rate loops | `--ki 0`, `--yaw-ki 0` |
+| `2d` | the rate loops have their I terms | nothing: it is today's program |
+
+- **Without `--stage` the program runs as the latest stage.**
+- **An argument given as well wins over the stage,** whichever comes first. The third line above is Stage 2c with a small `Ki`.
+- **Each stage's script passes its own stage,** so `./stage2-a.sh` to `./stage2-d.sh` keep giving the figures of their stage when a later one changes a default.
+- **The output is the same as it was at that stage,** but for columns added to the CSV since. The scripts read columns by name, so new ones do not disturb them.
+- **Plot a `2a` or `2b` run with `plot_quad.py` or `plot_estimator.py`,** as for `--rate-only`.
+
+Stage 1 is the seesaw, which is the other program: plain `cargo run`, with `./run_cases.sh` and `./stage1-d.sh`. It has not changed since Stage 1 and needs no `--stage`.
+
+When a new stage changes a default, the argument gets a field in `Preset` in `src/bin/quad.rs`, every stage gets its value for it, and the new stage gets a name. The tests there check each stage's preset.
+
+For the code itself as it was at a stage, and not only its behaviour, check out that stage's commit.
 
 ### Disturbances
 

@@ -13,14 +13,13 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cargo build --quiet --bin quad
 
-# These runs are from before the rate loops had an I term (Stage2-d.md).
-NO_I="--ki 0 --yaw-ki 0"
-
-# name, then the arguments of the run
+# name, then the arguments of the run. Every run has --stage 2c as well,
+# which runs the program as it was at this stage: before the rate loops had
+# an I term (Stage2-d.md).
 run_case() {
     name=$1
     shift
-    cargo run --quiet --bin quad -- $NO_I "$@" > "$tmp/$name.csv"
+    cargo run --quiet --bin quad -- --stage 2c "$@" > "$tmp/$name.csv"
     python3 plot_angles.py "$tmp/$name.csv" "stage2-c/$name.png" --title "$name:  $*"
 }
 

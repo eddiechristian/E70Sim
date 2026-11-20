@@ -10,13 +10,18 @@
 //!
 //! With `--rate-only` the program runs as it did before Stage 2c: three rate
 //! PIDs and the mixer, no angle loops and no calibration, with the estimator
-//! only watching. The Stage 2a and 2b scripts use it.
+//! only watching.
+//!
+//! `--stage` runs the program as it ran at an earlier stage: `--stage 2c`
+//! sets every argument that has changed since Stage 2c back to what it was
+//! then. Each stage's script passes its own.
 //!
 //! Run with `cargo run --bin quad > quad.csv`, then plot with
 //! `python3 plot_angles.py`. `cargo run --bin quad -- --help` lists the
 //! arguments.
 
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use flight::calibration::CALIBRATION_STEPS;
 use flight::controller::{Controller, Gains, State, Targets};
 use flight::estimator::{Accel, Estimator, GyroRates};
@@ -69,6 +74,61 @@ enum Axis {
     Yaw,
 }
 
+/// A stage of `drone.md` that this program has run, for `--stage`.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum Stage {
+    /// Three rate loops and the mixer
+    #[value(name = "2a")]
+    S2a,
+    /// The same, with the estimator watching
+    #[value(name = "2b")]
+    S2b,
+    /// The whole controller, with no I term in the rate loops
+    #[value(name = "2c")]
+    S2c,
+    /// The rate loops have their I terms
+    #[value(name = "2d")]
+    S2d,
+}
+
+/// The arguments whose defaults have changed from one stage to another,
+/// with the value each had at one stage.
+///
+/// When a later stage changes the default of another argument, that
+/// argument gets a field here, and every stage gets its value for it. The
+/// earlier stages then keep running as they did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Preset {
+    rate_only: bool,
+    ki: f32,
+    yaw_ki: f32,
+}
+
+/// What `stage` used.
+fn preset(stage: Stage) -> Preset {
+    match stage {
+        // Before the angle loops and the calibration.
+        Stage::S2a | Stage::S2b => Preset {
+            rate_only: true,
+            ki: 0.0,
+            yaw_ki: 0.0,
+        },
+        // Before the rate loops had an I term.
+        Stage::S2c => Preset {
+            rate_only: false,
+            ki: 0.0,
+            yaw_ki: 0.0,
+        },
+        // These are also the defaults of the arguments below, and a test
+        // checks that they stay the same.
+        Stage::S2d => Preset {
+            rate_only: false,
+            ki: 0.003,
+            yaw_ki: 0.02,
+        },
+    }
+}
+
 /// One of the four motors, to pick the weak one.
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Corner {
@@ -94,6 +154,12 @@ struct PerAxis {
 /// The quad in the whole loop. Writes CSV to standard output.
 #[derive(Parser)]
 struct Args {
+    /// Run as the program ran at this stage: sets the arguments that have
+    /// changed since to what they were then. Arguments given as well win
+    /// over it [default: the latest stage]
+    #[arg(long, value_enum)]
+    stage: Option<Stage>,
+
     /// Which axis gets the step
     #[arg(long, value_enum, default_value_t = Axis::Roll)]
     axis: Axis,
@@ -217,6 +283,33 @@ struct Args {
     /// Seed for the gyro noise; the same seed gives the same run
     #[arg(long, default_value_t = 1)]
     seed: u64,
+}
+
+/// Reads the arguments from `from`, the program's name first, and applies
+/// `--stage`. An argument given on the command line keeps its value; the
+/// stage sets only the ones left alone.
+fn parse_args<I, T>(from: I) -> Args
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Args::command().get_matches_from(from);
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+
+    if let Some(stage) = args.stage {
+        let given = |name: &str| matches.value_source(name) == Some(ValueSource::CommandLine);
+        let preset = preset(stage);
+        if !given("rate_only") {
+            args.rate_only = preset.rate_only;
+        }
+        if !given("ki") {
+            args.ki = preset.ki;
+        }
+        if !given("yaw_ki") {
+            args.yaw_ki = preset.yaw_ki;
+        }
+    }
+    args
 }
 
 /// What the controller is asked for at `time` seconds: level, no yaw and
@@ -415,7 +508,7 @@ fn one_g_long(accel: Accel) -> Accel {
 }
 
 fn main() {
-    let args = Args::parse();
+    let args = parse_args(std::env::args_os());
 
     let mut quad = Quad::new(
         ARM_LENGTH,
@@ -727,15 +820,116 @@ mod tests {
     fn test_default_gains_are_the_flight_crates() {
         // The arguments' defaults are written out a second time above, for
         // `--help`. They must stay the same as `Gains::default()`.
-        let args = Args::parse_from(["quad"]);
+        let args = parse_args(["quad"]);
         assert_eq!(gains(&args), Gains::default());
+    }
+
+    // ---- `--stage`
+
+    // The stage the program runs as when `--stage` is not given. Change it
+    // when a new stage is added.
+    const LATEST: Stage = Stage::S2d;
+
+    // The settings a stage's preset covers, as the program ends up with
+    // them.
+    fn settings(args: &Args) -> Preset {
+        Preset {
+            rate_only: args.rate_only,
+            ki: args.ki,
+            yaw_ki: args.yaw_ki,
+        }
+    }
+
+    #[test]
+    fn test_no_stage_is_the_latest_stage() {
+        // The arguments' own defaults are the latest stage's preset.
+        let args = parse_args(["quad"]);
+        assert_eq!(args.stage, None);
+        assert_eq!(settings(&args), preset(LATEST));
+    }
+
+    #[test]
+    fn test_each_stage_gets_its_preset() {
+        for &stage in Stage::value_variants() {
+            let name = stage.to_possible_value().unwrap();
+            let args = parse_args(["quad", "--stage", name.get_name()]);
+            assert_eq!(args.stage, Some(stage));
+            assert_eq!(
+                settings(&args),
+                preset(stage),
+                "--stage {}",
+                name.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage_2a_and_2b_are_rate_only_with_no_i() {
+        for name in ["2a", "2b"] {
+            let args = parse_args(["quad", "--stage", name]);
+            assert!(args.rate_only);
+            assert_eq!(args.ki, 0.0);
+            assert_eq!(args.yaw_ki, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_stage_2c_has_the_stage_2c_gains() {
+        // The whole controller, with the gains as they were before the
+        // rate loops had an I term.
+        let args = parse_args(["quad", "--stage", "2c"]);
+        assert!(!args.rate_only);
+        assert_eq!(
+            gains(&args),
+            Gains {
+                rate_ki: 0.0,
+                yaw_ki: 0.0,
+                ..Gains::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_stage_2d_has_todays_gains() {
+        let args = parse_args(["quad", "--stage", "2d"]);
+        assert!(!args.rate_only);
+        assert_eq!(gains(&args), Gains::default());
+    }
+
+    #[test]
+    fn test_an_argument_wins_over_the_stage() {
+        // Whichever comes first on the command line.
+        for line in [
+            ["quad", "--stage", "2c", "--ki", "0.01"],
+            ["quad", "--ki", "0.01", "--stage", "2c"],
+        ] {
+            let args = parse_args(line);
+            assert_eq!(args.ki, 0.01);
+            // The stage still sets what was not given.
+            assert_eq!(args.yaw_ki, 0.0);
+        }
+
+        // An argument given with its own default value still counts.
+        let args = parse_args(["quad", "--stage", "2c", "--ki", "0.003"]);
+        assert_eq!(args.ki, 0.003);
+
+        let args = parse_args(["quad", "--stage", "2c", "--rate-only"]);
+        assert!(args.rate_only);
+    }
+
+    #[test]
+    fn test_a_stage_leaves_the_other_arguments_alone() {
+        let args = parse_args(["quad", "--stage", "2a", "--axis", "yaw", "--noise", "2"]);
+        assert_eq!(args.axis, Axis::Yaw);
+        assert_eq!(args.noise, 2.0);
+        assert_eq!(args.kp, 0.0014);
     }
 
     // ---- The kick and the weak motor
 
     #[test]
     fn test_no_kick_unless_asked_for() {
-        let args = Args::parse_from(["quad"]);
+        let args = parse_args(["quad"]);
         for step in 0..STEPS {
             assert_eq!(push_at(step, &args), NO_PUSH);
         }
@@ -744,7 +938,7 @@ mod tests {
     #[test]
     fn test_kick_starts_and_ends_on_time() {
         // The defaults: from 2.0 s for 0.05 s, which is steps 2000 to 2049.
-        let args = Args::parse_from(["quad", "--kick-roll", "0.3"]);
+        let args = parse_args(["quad", "--kick-roll", "0.3"]);
         let kick = Torques {
             roll: 0.3,
             ..NO_PUSH
@@ -757,7 +951,7 @@ mod tests {
         assert_eq!(pushed.count(), 50);
 
         // Moved and made longer: steps 1200 to 1299.
-        let args = Args::parse_from([
+        let args = parse_args([
             "quad",
             "--kick-roll",
             "0.3",
@@ -774,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_kicks_can_be_given_together() {
-        let args = Args::parse_from([
+        let args = parse_args([
             "quad",
             "--kick-roll",
             "0.3",
@@ -795,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_kick_comes_after_the_calibration() {
-        let args = Args::parse_from(["quad"]);
+        let args = parse_args(["quad"]);
         assert!(args.kick_at > CALIBRATION_STEPS as f32 * DT);
         assert!(args.kick_at + args.kick_for < STEPS as f32 * DT);
     }
@@ -831,17 +1025,17 @@ mod tests {
 
     #[test]
     fn test_four_good_motors_unless_asked_for() {
-        let args = Args::parse_from(["quad"]);
+        let args = parse_args(["quad"]);
         assert_thrusts(full_thrusts(&mut motors(&args)), [6.0; 4]);
     }
 
     #[test]
     fn test_only_the_chosen_motor_is_weak() {
         // 10% weak unless `--weak-by` says otherwise: 5.4 N against 6.0 N.
-        let args = Args::parse_from(["quad", "--weak-motor", "fr"]);
+        let args = parse_args(["quad", "--weak-motor", "fr"]);
         assert_thrusts(full_thrusts(&mut motors(&args)), [6.0, 5.4, 6.0, 6.0]);
 
-        let args = Args::parse_from(["quad", "--weak-motor", "bl", "--weak-by", "20"]);
+        let args = parse_args(["quad", "--weak-motor", "bl", "--weak-by", "20"]);
         assert_thrusts(full_thrusts(&mut motors(&args)), [6.0, 6.0, 6.0, 4.8]);
     }
 
