@@ -9,6 +9,9 @@
 //! is turned with the same `Quat` the physics uses. `to_window` is the one
 //! place where those axes become the window's.
 //!
+//! The body's axes are drawn as three arrows from its centre: red forward,
+//! green right and blue down.
+//!
 //! Keys: W and S pitch, A and D roll, Q and E yaw, R puts it level again.
 //! Drag with the left mouse button to move the camera round the drone, and
 //! turn the wheel to move it in and out.
@@ -47,6 +50,19 @@ const ZOOM_STEP: f32 = 1.1; // each notch of the wheel changes the distance by t
 // The colour of a model file that gives none, as red, green and blue from
 // 0 to 1.
 const PLAIN: [f32; 3] = [0.60, 0.62, 0.66];
+
+// The body's axes as they are drawn, each an arrow from the centre: x,
+// forward, in red; y, right, in green; z, down, in blue. Each is the axis,
+// along the body's axes, and the colour.
+const AXES: [([f32; 3], [f32; 3]); 3] = [
+    ([1.0, 0.0, 0.0], [0.90, 0.10, 0.10]),
+    ([0.0, 1.0, 0.0], [0.10, 0.75, 0.15]),
+    ([0.0, 0.0, 1.0], [0.10, 0.30, 0.95]),
+];
+const ARROW_SHAFT_RADIUS: f32 = 0.008; // m
+const ARROW_HEAD_RADIUS: f32 = 0.022; // m
+const ARROW_HEAD_LENGTH: f32 = 0.06; // m
+const ARROW_SIDES: usize = 24; // flat sides round the shaft and the head
 
 // The model drawn when `--model` is not given.
 const DEFAULT_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/x500.stl");
@@ -274,6 +290,47 @@ fn load_model(path: &Path, scale: f32, up: Up, turn_degrees: f32) -> Result<Vec<
     Ok(triangles)
 }
 
+/// Add an arrow to the triangles: a cylinder from the centre along `axis`,
+/// which has to be one of the body's three, with a cone on its end. The tip
+/// of the cone is `length` metres from the centre.
+fn add_arrow(triangles: &mut Vec<Triangle>, axis: [f32; 3], length: f32, color: [f32; 3]) {
+    // The other two axes, which the circles of the arrow are drawn in.
+    let [x, y, z] = axis;
+    let along = mq::vec3(x, y, z);
+    let side_a = mq::vec3(z, x, y);
+    let side_b = mq::vec3(y, z, x);
+
+    // A point of the circle of `radius` that is `far` metres along the axis.
+    let ring = |far: f32, radius: f32, step: usize| {
+        let angle = std::f32::consts::TAU * step as f32 / ARROW_SIDES as f32;
+        far * along + radius * (angle.cos() * side_a + angle.sin() * side_b)
+    };
+    let mut add = |a: mq::Vec3, b: mq::Vec3, c: mq::Vec3| {
+        triangles.push(Triangle {
+            corners: [a, b, c].map(|p| vec3(p.x, p.y, p.z)),
+            color,
+        });
+    };
+
+    let neck = length - ARROW_HEAD_LENGTH; // where the shaft meets the head
+    let tip = length * along;
+    for step in 0..ARROW_SIDES {
+        let next = step + 1;
+        // The side of the shaft: a strip of two triangles.
+        let near_a = ring(0.0, ARROW_SHAFT_RADIUS, step);
+        let near_b = ring(0.0, ARROW_SHAFT_RADIUS, next);
+        let far_a = ring(neck, ARROW_SHAFT_RADIUS, step);
+        let far_b = ring(neck, ARROW_SHAFT_RADIUS, next);
+        add(near_a, near_b, far_b);
+        add(near_a, far_b, far_a);
+        // The head: its flat back, and its side up to the tip.
+        let head_a = ring(neck, ARROW_HEAD_RADIUS, step);
+        let head_b = ring(neck, ARROW_HEAD_RADIUS, next);
+        add(neck * along, head_a, head_b);
+        add(head_a, head_b, tip);
+    }
+}
+
 /// One corner of a triangle as the graphics card gets it.
 #[repr(C)]
 struct Corner {
@@ -492,6 +549,14 @@ async fn main() {
         + 0.05;
 
     let count = triangles.len();
+
+    // The body's three axes as arrows. They are part of the drawing, so
+    // they turn with the drone. Each reaches as far as the farthest corner,
+    // which keeps the tip of one that points down off the ground.
+    let mut triangles = triangles;
+    for (axis, color) in AXES {
+        add_arrow(&mut triangles, axis, height - 0.05, color);
+    }
     let drawing = Drawing::new(&triangles);
     drop(triangles); // the graphics card has them now
 
@@ -570,6 +635,7 @@ async fn main() {
             ),
             "W S pitch   A D roll   Q E yaw   R level   drag: camera   wheel: nearer, farther"
                 .into(),
+            "axes: red forward, green right, blue down".into(),
             format!("{} pictures a second", mq::get_fps()),
         ];
         for (row, line) in lines.iter().enumerate() {
@@ -594,6 +660,24 @@ mod tests {
         assert_eq!(to_window(vec3(1.0, 0.0, 0.0)), mq::vec3(0.0, 0.0, -1.0));
         assert_eq!(to_window(vec3(0.0, 1.0, 0.0)), mq::vec3(1.0, 0.0, 0.0));
         assert_eq!(to_window(vec3(0.0, 0.0, 1.0)), mq::vec3(0.0, -1.0, 0.0));
+    }
+
+    #[test]
+    fn an_arrow_runs_from_the_centre_to_its_tip_along_its_axis() {
+        for (axis, color) in AXES {
+            let mut triangles = Vec::new();
+            add_arrow(&mut triangles, axis, 0.3, color);
+            assert_eq!(triangles.len(), 4 * ARROW_SIDES);
+            let mut farthest: f32 = 0.0;
+            for corner in triangles.iter().flat_map(|t| t.corners) {
+                let along = corner.x * axis[0] + corner.y * axis[1] + corner.z * axis[2];
+                let off = (corner.length().powi(2) - along * along).max(0.0).sqrt();
+                assert!((-1e-6..=0.3 + 1e-6).contains(&along));
+                assert!(off <= ARROW_HEAD_RADIUS + 1e-5);
+                farthest = farthest.max(along);
+            }
+            assert!((farthest - 0.3).abs() < 1e-6);
+        }
     }
 
     #[test]
