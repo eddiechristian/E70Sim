@@ -356,7 +356,9 @@ The control code is the same at every size. Only the physics parameters and the 
   - Reading it: the `gilrs` crate, in the `sim` crate only. The `flight` crate stays as it is and sees only `Targets`. Set the switch on the back of the pad to X
   - Needs a run that keeps pace with the clock, and a live view in place of the CSV and plot: a window that draws the drone in 3D and turns it with the body's quaternion
   - Pacing: the window draws 60 pictures a second, and the simulation runs the steps that fit in between, about 17 of 1 ms each. No sleeping for 1 ms at a time
-  - Drawing: the `macroquad` crate, in the `sim` crate only. Start with a drone made of boxes: two arms, four motors, and a mark for the nose. A model file of the real frame can replace the boxes later
+  - Drawing: the `macroquad` crate, in the `sim` crate only. The drone is a model file, [`drone/sim/models/x500.stl`](drone/sim/models/README.md): the 500 mm quad of the PX4 simulator, close in size to the Mark4. A model of the real frame can replace it later, with `--model`
+  - The drawing is written, on its own, as the `view` program: `cargo run --bin view` in `drone/sim/` draws the model and turns it with the keys. The gamepad program takes its drawing from there
+  - The model goes to the graphics card once and the card turns it, through `miniquad`, the layer under `macroquad`. `macroquad`'s own `draw_mesh` sends every triangle again for each picture, which is too slow for a model of this size
   - The body's axes are x forward, y right, z down; the window's are y up. One conversion, in one place
   - On screen as text: the state, the four targets and the four motor commands
   - `--stage` works here as in the quad program, so any earlier stage can be flown by hand and watched. The presets move out of `src/bin/quad.rs` into a place both programs share
