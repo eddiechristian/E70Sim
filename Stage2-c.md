@@ -381,6 +381,6 @@ The picture to look for: the angle rising smoothly to its target with no bump at
 
 ## Where this goes next
 
-- The last Stage 2 item is the disturbance tests: a kick, a 30° start and one weak motor. A weak motor is a steady torque, which the rate loops have no I term to cancel yet; that test is likely to be where `Ki` earns its place.
+- The last Stage 2 item is the disturbance tests: a kick, a 30° start and one weak motor, explained in [`Stage2-d.md`](Stage2-d.md). A weak motor is a steady torque, which the rate loops have no I term to cancel yet; that test is likely to be where `Ki` earns its place.
 - Stage 3 adds gravity and movement. The throttle then decides whether the drone climbs, and a tilt makes it slide sideways, so "level" starts to mean "not drifting".
 - Stage 3 also turns the simple calibration into arming: disarmed, calibrating, armed, and a cut-off when the tilt passes a safe angle.

@@ -342,7 +342,7 @@ The control code is the same at every size. Only the physics parameters and the 
 - [x] Three-axis rigid body with four motors and the X mixer — explained in [`Stage2-a.md`](Stage2-a.md)
 - [x] Complementary filter; compare its angles with the true angles from the physics — introduced in [The estimator](#the-estimator), explained in full in [`Stage2-b.md`](Stage2-b.md)
 - [x] Angle loop around the rate loop on roll and pitch; rate loop on yaw; a simple start-up calibration first (see [Calibration before flight](#calibration-before-flight)) — explained in [`Stage2-c.md`](Stage2-c.md)
-- [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor
+- [ ] Disturbance tests: recovers to level after a kick, from a 30° start, and with one weak motor — explained in [`Stage2-d.md`](Stage2-d.md)
 
 ### Stage 3 — Host simulation, hover
 
@@ -380,6 +380,6 @@ The control code is the same at every size. Only the physics parameters and the 
 ### Later
 
 - SPI peripheral model and an SPI path for the ICM-42688
-- Altitude hold (needs a barometer or range sensor)
+- Altitude hold, with a lidar rangefinder and a barometer fused together. [`altitude.md`](altitude.md) has the design and suggested parts
 - Receiver input for stick commands on the real drone. The gamepad is wired USB and stays with the simulation; the firmware fills the same `Targets` from the receiver's channels
 - Choosing real parts (see [Hardware options and budget](#hardware-options-and-budget)) and replacing the guessed physics parameters

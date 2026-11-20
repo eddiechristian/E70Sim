@@ -58,6 +58,15 @@ Listings disagree a little (424, 427 and 473 mm for the wheelbase; 227 and 235 g
 | LiPo bag, arming plug or smoke stopper | | $20–30 | rough figure |
 | Jumper leads or a small adapter board, gyro to Xplained board | | a few dollars | for the bench; soldered or locking for flight |
 
+Optional, for height above the ground ([`altitude.md`](altitude.md) explains the choice and the wiring):
+
+| Item | Qty | Cost | Notes |
+|---|---|---|---|
+| Barometer: Adafruit BMP390 breakout (product 4816) | 1 | about $11 | DigiKey; I2C, on the gyro's bus |
+| Lidar: Benewake TF-Luna | 1 | about $13–25 | rcdrone.top lists it from $13.41; needs 5 V, signals are 3.3 V |
+
+These are not in the total below.
+
 ### Total
 
 | | Cost |
