@@ -185,13 +185,13 @@ impl Controller {
     /// against it themselves.
     pub fn update(
         &mut self,
-        gyro: GyroRates,
-        accel: Accel,
+        sensor_gyro: GyroRates,
+        sensor_accel: Accel,
         targets: Targets,
         dt: f32,
     ) -> MotorCommands {
         if self.state == State::Calibrating {
-            match self.calibration.update(gyro, accel) {
+            match self.calibration.update(sensor_gyro, sensor_accel) {
                 // Nothing to do: the calibration starts its own new window.
                 CalibrationStatus::Collecting => {}
                 CalibrationStatus::Failed(reason) => self.last_failure = Some(reason),
@@ -204,14 +204,15 @@ impl Controller {
             }
             return MOTORS_OFF;
         }
-        // Flying. From here on `gyro` is the reading with the bias removed.
-        let gyro = GyroRates {
-            roll: gyro.roll - self.gyro_bias.roll,
-            pitch: gyro.pitch - self.gyro_bias.pitch,
-            yaw: gyro.yaw - self.gyro_bias.yaw,
+        // Flying. The loops and the estimator use the gyro reading with the
+        // bias removed, never `sensor_gyro`.
+        let gyro_minus_bias = GyroRates {
+            roll: sensor_gyro.roll - self.gyro_bias.roll,
+            pitch: sensor_gyro.pitch - self.gyro_bias.pitch,
+            yaw: sensor_gyro.yaw - self.gyro_bias.yaw,
         };
 
-        let attitude = self.estimator.update(gyro, accel, dt);
+        let attitude = self.estimator.update(gyro_minus_bias, sensor_accel, dt);
         self.attitude = Some(attitude);
 
         // The angle loops, on every fourth step. In between, the rate
@@ -230,11 +231,13 @@ impl Controller {
         // The rate loops, on every step.
         let roll = self
             .roll_rate_pid
-            .update(self.roll_rate_target, gyro.roll, dt);
+            .update(self.roll_rate_target, gyro_minus_bias.roll, dt);
         let pitch = self
             .pitch_rate_pid
-            .update(self.pitch_rate_target, gyro.pitch, dt);
-        let yaw = self.yaw_rate_pid.update(targets.yaw_rate, gyro.yaw, dt);
+            .update(self.pitch_rate_target, gyro_minus_bias.pitch, dt);
+        let yaw = self
+            .yaw_rate_pid
+            .update(targets.yaw_rate, gyro_minus_bias.yaw, dt);
 
         mix(MixerInput {
             throttle: targets.throttle,

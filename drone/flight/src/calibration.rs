@@ -93,28 +93,28 @@ impl Calibration {
     /// 6. A check failed: return `Failed`. Otherwise return `Done`, with the
     ///    three gyro averages as `gyro_bias` and `angles_from_accel` of the
     ///    accelerometer averages as `attitude`.
-    pub fn update(&mut self, gyro: GyroRates, accel: Accel) -> CalibrationStatus {
+    pub fn update(&mut self, sensor_gyro: GyroRates, sensor_accel: Accel) -> CalibrationStatus {
         // 1. Sums, and the smallest and largest reading of each gyro axis.
-        self.gyro_sum.roll += gyro.roll;
-        self.gyro_sum.pitch += gyro.pitch;
-        self.gyro_sum.yaw += gyro.yaw;
+        self.gyro_sum.roll += sensor_gyro.roll;
+        self.gyro_sum.pitch += sensor_gyro.pitch;
+        self.gyro_sum.yaw += sensor_gyro.yaw;
 
-        self.accel_sum.x += accel.x;
-        self.accel_sum.y += accel.y;
-        self.accel_sum.z += accel.z;
+        self.accel_sum.x += sensor_accel.x;
+        self.accel_sum.y += sensor_accel.y;
+        self.accel_sum.z += sensor_accel.z;
 
         if self.count == 0 {
             // The first reading of a window sets both.
-            self.gyro_min = gyro;
-            self.gyro_max = gyro;
+            self.gyro_min = sensor_gyro;
+            self.gyro_max = sensor_gyro;
         } else {
-            self.gyro_min.roll = self.gyro_min.roll.min(gyro.roll);
-            self.gyro_min.pitch = self.gyro_min.pitch.min(gyro.pitch);
-            self.gyro_min.yaw = self.gyro_min.yaw.min(gyro.yaw);
+            self.gyro_min.roll = self.gyro_min.roll.min(sensor_gyro.roll);
+            self.gyro_min.pitch = self.gyro_min.pitch.min(sensor_gyro.pitch);
+            self.gyro_min.yaw = self.gyro_min.yaw.min(sensor_gyro.yaw);
 
-            self.gyro_max.roll = self.gyro_max.roll.max(gyro.roll);
-            self.gyro_max.pitch = self.gyro_max.pitch.max(gyro.pitch);
-            self.gyro_max.yaw = self.gyro_max.yaw.max(gyro.yaw);
+            self.gyro_max.roll = self.gyro_max.roll.max(sensor_gyro.roll);
+            self.gyro_max.pitch = self.gyro_max.pitch.max(sensor_gyro.pitch);
+            self.gyro_max.yaw = self.gyro_max.yaw.max(sensor_gyro.yaw);
         }
 
         // 2. Count the reading.

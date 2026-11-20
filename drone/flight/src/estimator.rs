@@ -88,9 +88,9 @@ impl Estimator {
     ///
     /// A `dt` that is not a positive number is a bug in the caller: the
     /// estimate is returned unchanged, with a `debug_assert!`, as in `Pid`.
-    pub fn update(&mut self, gyro: GyroRates, accel: Accel, dt: f32) -> Attitude {
+    pub fn update(&mut self, gyro_minus_bias: GyroRates, sensor_accel: Accel, dt: f32) -> Attitude {
         // 1. The accelerometer's angles.
-        let from_accel = angles_from_accel(accel);
+        let from_accel = angles_from_accel(sensor_accel);
 
         // A bad dt is treated as "no time passed". Also catches NaN.
         if !(dt > 0.0) {
@@ -113,9 +113,9 @@ impl Estimator {
             .clamp(-PITCH_LIMIT_FOR_TAN, PITCH_LIMIT_FOR_TAN)
             .to_radians();
         let (sin_phi, cos_phi) = (libm::sinf(phi), libm::cosf(phi));
-        let roll_change =
-            gyro.roll + (gyro.pitch * sin_phi + gyro.yaw * cos_phi) * libm::tanf(theta);
-        let pitch_change = gyro.pitch * cos_phi - gyro.yaw * sin_phi;
+        let roll_change = gyro_minus_bias.roll
+            + (gyro_minus_bias.pitch * sin_phi + gyro_minus_bias.yaw * cos_phi) * libm::tanf(theta);
+        let pitch_change = gyro_minus_bias.pitch * cos_phi - gyro_minus_bias.yaw * sin_phi;
 
         // 4. Blend the gyro's prediction with the accelerometer's answer.
         let alpha = self.time_constant / (self.time_constant + dt);
